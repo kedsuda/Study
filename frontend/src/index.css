@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600&family=Sarabun:wght@300;400;500;600;700&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -7,18 +7,20 @@
 :root {
   color-scheme: light;
   /* Thai Sarabun New is used when installed; Sarabun is the web-font fallback. */
-  --font-body: 'TH Sarabun New', 'Sarabun', 'Leelawadee UI', Tahoma, sans-serif;
-  --font-display: 'TH Sarabun New', 'Sarabun', 'Leelawadee UI', Tahoma, sans-serif;
-  --bg: #f4f7fb;
-  --text: #0f172a;
-  /* Text color for "accent/gradient" surfaces in light theme. */
-  --on-accent: #0f172a;
-  --on-accent-rgb: 15, 23, 42;
-  --muted: #64748b;
+  --font-body: 'Kanit', 'Sarabun', 'Leelawadee UI', Tahoma, sans-serif;
+  --font-display: 'Kanit', 'Sarabun', 'Leelawadee UI', Tahoma, sans-serif;
+  --bg: #fbfbfd;
+  --text: #1d1d1f;
+  /* Text color for "accent/gradient" surfaces in light theme.
+     Every shipped accent is saturated enough to need white ink; custom accents
+     get this recomputed at runtime via getContrastColor. */
+  --on-accent: #ffffff;
+  --on-accent-rgb: 255, 255, 255;
+  --muted: #86868b;
   --surface: #ffffff;
   --surface-2: #f8fafc;
   --surface-3: #eef2f7;
-  --border: rgba(15, 23, 42, 0.08);
+  --border: rgba(0, 0, 0, 0.08);
   --accent: #2563eb;
   --accent-ink: #1d4ed8;
   --accent-strong: #2563eb;
@@ -36,7 +38,9 @@
   --schedule-cell: #ffffff;
   --schedule-cell-muted: #f8fafc;
   --schedule-day: #f1f5f9;
-  --shadow-soft: 0 8px 30px rgba(15, 23, 42, 0.06);
+  --shadow-soft: 0 4px 24px rgba(0, 0, 0, 0.04);
+  --shadow-float: 0 8px 32px rgba(0, 0, 0, 0.08);
+  --glass-bg: rgba(255, 255, 255, 0.85);
   --shadow-glow: 0 18px 44px rgba(var(--accent-rgb), 0.18), 0 10px 24px rgba(15, 23, 42, 0.1);
   --ring-soft: 0 0 0 6px rgba(var(--accent-rgb), 0.16);
 }
@@ -1641,4 +1645,31 @@ a:hover {
     padding: 0.32rem 0.8rem;
     font-size: 0.7rem;
   }
+}
+
+/* Apple-style minimal scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.15) transparent;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 10px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.glass-effect {
+  background: var(--glass-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.3);
 }

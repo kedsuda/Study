@@ -1873,10 +1873,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       <div
         className={`doc-summary-page relative overflow-hidden bg-transparent font-sans ${embedded ? 'pb-0' : 'min-h-screen pb-[7.5rem] md:pb-16'}`}
         style={{
-          ['--accent' as string]: '#ec3d93',
-          ['--accent-rgb' as string]: '236, 61, 147',
-          ['--accent-ink' as string]: '#c32675',
-          ['--doc-accent-soft' as string]: 'rgba(236, 61, 147, 0.10)',
+          ['--doc-accent-soft' as string]: 'rgba(var(--accent-rgb), 0.10)',
         }}
       >
       {/* Print View */}

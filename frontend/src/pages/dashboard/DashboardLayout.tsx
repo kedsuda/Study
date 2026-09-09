@@ -115,17 +115,6 @@ const browserNotifyEnabledStorageKey = 'slt::browser-notify-enabled';
 const seenNotificationKeysStoragePrefix = 'slt::seen-notification-keys::user:';
 const FONT_SCALE_MIN = 0.8;
 const FONT_SCALE_MAX = 1.3;
-const sidebarDarkPalette = [
-  '59, 130, 246',  // blue
-  '34, 197, 94',   // green
-  '249, 115, 22',  // orange
-  '236, 72, 153',  // pink
-  '168, 85, 247',  // purple
-  '234, 179, 8',   // yellow
-  '6, 182, 212',   // cyan
-  '99, 102, 241',  // indigo
-] as const;
-
 type IconName =
   | 'overview'
   | 'subjects'
@@ -1354,24 +1343,25 @@ export const DashboardLayout = () => {
   };
   return (
     <div
-      className={`relative min-h-screen overflow-x-hidden ${
+      className={`relative min-h-screen overflow-x-clip ${
         theme === 'dark' ? 'text-slate-100' : 'text-slate-900'
       }`}
-      style={{ background: theme === 'dark' ? 'var(--bg-gradient)' : isLearningStatsPage ? '#ffffff' : '#f8fafc' }}
+      style={{ background: theme === 'dark' ? 'var(--bg-gradient)' : isLearningStatsPage ? '#ffffff' : '#fbfbfd' }}
     >
       <div className="relative flex min-h-screen w-full flex-col md:flex-row">
         <aside
-          className={`hidden h-screen w-[184px] shrink-0 flex-col gap-4 overflow-y-auto border-r pb-5 md:flex ${
+          className={`sticky top-0 hidden h-screen max-h-screen w-[264px] shrink-0 flex-col gap-0 overflow-hidden border-r pb-5 backdrop-blur-xl md:flex ${
             theme === 'dark'
               ? 'border-white/10 bg-slate-950/70 text-white'
-              : 'border-slate-200 bg-white text-slate-800'
+              : 'border-[color:var(--border)] bg-white/80 text-slate-700'
           }`}
+          style={theme === 'dark' ? undefined : { boxShadow: '2px 0 12px rgba(0,0,0,0.02)' }}
         >
             <div
-              className={`sticky top-0 z-20 px-6 py-5 ${
+              className={`sticky top-0 z-20 flex h-[72px] items-center px-6 ${
                 theme === 'dark'
                   ? 'border-b border-white/10 bg-slate-950/95'
-                  : 'border-b border-slate-100 bg-white/95'
+                  : 'border-b border-[color:var(--border)] bg-white/70'
               } backdrop-blur`}
             >
               <Link to="/" className="flex items-center gap-3 text-lg font-semibold">
@@ -1382,10 +1372,10 @@ export const DashboardLayout = () => {
                     event.stopPropagation();
                     setLogoPreviewOpen(true);
                   }}
-	                  className={`flex h-11 w-11 items-center justify-center rounded-xl border transition ${
+	                  className={`flex h-10 w-10 items-center justify-center overflow-hidden rounded-2xl border transition ${
 	                    theme === 'dark'
-	                      ? 'border-white/10 bg-slate-950/40 hover:border-white/20 hover:bg-slate-900/60'
-	                      : 'border-slate-200 text-[color:var(--accent)] hover:bg-[color:rgba(var(--accent-rgb),0.14)]'
+	                      ? 'border-white/10 bg-slate-950/40 hover:bg-slate-900/60'
+	                      : 'border-slate-100 bg-gradient-to-br from-white to-slate-50 shadow-sm'
 	                  }`}
 	                  style={
 	                    theme === 'dark'
@@ -1397,78 +1387,37 @@ export const DashboardLayout = () => {
                   <img
                     src={logoUrl}
                     alt="Smart Room"
-                    className="h-11 w-11 rounded-xl object-cover"
+                    className="h-full w-full rounded-2xl object-cover p-1"
                     onError={handleLogoImageError}
                   />
                 </button>
-                <span className={theme === 'dark' ? 'text-white' : 'text-slate-900'}>Smart Room</span>
+                <span className={`text-[17px] font-semibold tracking-tight ${theme === 'dark' ? 'text-white' : 'text-[color:var(--text)]'}`}>Smart Room</span>
               </Link>
           </div>
-          <nav className="mt-1 space-y-1.5 px-3">
-            {navItems.map((item, index) => {
-              const itemAccentRgb = sidebarDarkPalette[index % sidebarDarkPalette.length];
+          <nav className="flex-1 space-y-1.5 overflow-y-auto px-3 py-5">
+            {navItems.map(item => {
               return (
                 <NavLink
                   key={item.to}
                   to={item.to}
                     className={({ isActive }) =>
-                      `group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition ${
+                      `group flex items-center gap-3 rounded-2xl px-4 py-2.5 text-[15px] transition-all duration-200 ${
                         theme === 'dark'
                           ? isActive
-                            ? 'text-white shadow-soft'
-                            : 'text-white/85 hover:text-white'
+                            ? 'font-medium text-white'
+                            : 'text-white/70 hover:bg-white/10 hover:text-white'
                           : isActive
-                            ? 'text-[color:var(--accent)] shadow-sm'
-                            : 'text-slate-500 hover:bg-[color:rgba(var(--accent-rgb),0.06)] hover:text-[color:var(--accent)]'
+                            ? 'font-medium text-[color:var(--accent)]'
+                            : 'text-[color:var(--muted)] hover:bg-[color:var(--surface-3)] hover:text-[color:var(--text)]'
                       }`
                     }
-                    style={({ isActive }) => {
-                      if (theme === 'dark') {
-                        return isActive
-                          ? {
-                              background:
-                                `linear-gradient(135deg, rgba(${itemAccentRgb}, 0.34), rgba(${itemAccentRgb}, 0.14))`,
-                              boxShadow: `0 12px 28px rgba(${itemAccentRgb}, 0.26)`,
-                              border: `1px solid rgba(${itemAccentRgb}, 0.62)`,
-                            }
-                          : {
-                              background: `rgba(${itemAccentRgb}, 0.08)`,
-                              border: `1px solid rgba(${itemAccentRgb}, 0.24)`,
-                            };
-                      }
-                      return isActive ? { backgroundColor: 'rgba(var(--accent-rgb), 0.10)' } : undefined;
-                    }}
+                    style={({ isActive }) =>
+                      isActive ? { backgroundColor: 'rgba(var(--accent-rgb), 0.12)' } : undefined
+                    }
                   >
                   {({ isActive }) => (
                     <>
-                      <span
-                        className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition ${
-                          theme === 'dark'
-                            ? isActive
-                              ? 'bg-slate-900/45 text-white shadow-[0_10px_22px_rgba(0,0,0,0.26)]'
-                              : 'bg-transparent text-white/90'
-                            : isActive
-                              ? 'border text-[color:var(--accent)]'
-                              : 'border border-slate-200 bg-slate-50 text-slate-500'
-                        }`}
-                        style={
-                          theme === 'dark'
-                            ? isActive
-                              ? {
-                                  borderColor: `rgba(${itemAccentRgb}, 0.98)`,
-                                  boxShadow: `0 0 0 1px rgba(${itemAccentRgb}, 0.5), 0 10px 22px rgba(${itemAccentRgb}, 0.30)`,
-                                }
-                              : {
-                                  borderColor: `rgba(${itemAccentRgb}, 0.62)`,
-                                }
-                            : isActive
-                              ? {
-                                borderColor: 'rgba(var(--accent-rgb), 0.14)',
-                                backgroundColor: 'rgba(var(--accent-rgb), 0.10)'
-                              }
-                            : undefined
-                        }
-                      >
+                      <span className="relative flex h-[22px] w-[22px] shrink-0 items-center justify-center">
                         <MobileIcon
                           name={item.to === '/ai-assistant' ? 'overview' : item.icon}
                           active={isActive}
@@ -1477,12 +1426,12 @@ export const DashboardLayout = () => {
                         />
                       </span>
 	                      <span
-	                        className="text-[0.96rem]"
+	                        className="truncate"
 	                        style={
 	                          theme === 'dark'
                               ? isActive
-                                ? { color: '#ffffff', textShadow: '0 1px 2px rgba(0,0,0,0.45)' }
-                                : { color: 'rgba(255,255,255,0.96)', textShadow: '0 1px 1px rgba(0,0,0,0.35)' }
+                                ? { color: '#ffffff' }
+                                : { color: 'rgba(255,255,255,0.82)' }
 	                            : theme === 'light' && isActive
 	                              ? { color: 'var(--accent)' }
 	                              : undefined
@@ -1503,35 +1452,25 @@ export const DashboardLayout = () => {
                   key={item.to}
                   to={item.to}
                   className={({ isActive }) =>
-                    `group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold transition ${
+                    `group flex items-center gap-3 rounded-full px-3 py-2.5 text-sm font-medium transition ${
                       theme === 'dark'
                         ? isActive
-                          ? 'bg-white/20 text-white shadow-[0_10px_24px_rgba(0,0,0,0.24)]'
-                          : 'text-white/90 hover:bg-white/10 hover:text-white'
+                          ? 'bg-white/15 text-white'
+                          : 'text-white/70 hover:bg-white/10 hover:text-white'
                         : isActive
-                          ? 'bg-slate-100 text-slate-950 shadow-sm'
-                          : 'text-slate-600 hover:bg-slate-50 hover:text-slate-950'
+                          ? 'bg-[color:rgba(var(--accent-rgb),0.12)] text-[color:var(--accent)]'
+                          : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'
                     }`
                   }
                 >
                   {({ isActive }) => (
                     <>
-                      <span
-                        className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border transition ${
-                          theme === 'dark'
-                            ? isActive
-                              ? 'border-white/80 bg-slate-950/30 text-white'
-                              : 'border-white/15 bg-slate-950/25 text-white/85 group-hover:border-white/30'
-                            : isActive
-                              ? 'border-[color:rgba(var(--accent-rgb),0.18)] bg-white text-[color:var(--accent)]'
-                              : 'border-slate-200 bg-white text-slate-500 group-hover:text-[color:var(--accent)]'
-                        }`}
-                      >
+                      <span className="flex h-6 w-6 shrink-0 items-center justify-center">
                         <MobileIcon
                           name={item.icon}
                           active={isActive}
-                          accent={theme === 'dark' ? '#ec4899' : activeAccentTheme.accent}
-                          className="h-6 w-6"
+                          accent={theme === 'dark' ? '#ffffff' : activeAccentTheme.accent}
+                          className="h-5 w-5"
                         />
                       </span>
                       <span className="truncate">{item.label}</span>
@@ -1542,14 +1481,14 @@ export const DashboardLayout = () => {
             </nav>
             <Link
               to="/profile"
-              className={`flex items-center gap-3 rounded-2xl border px-3 py-3 transition ${
+              className={`flex items-center gap-3 rounded-2xl px-3 py-3 transition ${
                   theme === 'dark'
-                    ? 'border-white/10 bg-slate-950/40 hover:bg-slate-900/60'
-                    : 'border-slate-100 bg-white shadow-sm hover:bg-white'
+                    ? 'bg-slate-950/40 hover:bg-slate-900/60'
+                    : 'hover:bg-slate-100'
               }`}
             >
               <span
-                className={`flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-full ${
+                className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full ${
                   theme === 'dark' ? 'bg-slate-900/60' : 'bg-slate-100'
                 }`}
               >
@@ -1568,7 +1507,7 @@ export const DashboardLayout = () => {
                 )}
               </span>
               <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-semibold">{user?.name ?? 'ผู้ใช้งาน'}</span>
+                <span className="block truncate text-sm font-medium">{user?.name ?? 'ผู้ใช้งาน'}</span>
                 <span className={`block truncate text-xs ${theme === 'dark' ? 'text-white/55' : 'text-slate-500'}`}>
                   {user?.email ?? 'ดูโปรไฟล์'}
                 </span>
@@ -1578,7 +1517,7 @@ export const DashboardLayout = () => {
               <button
                 type="button"
                 onClick={logout}
-                className="flex w-full items-center justify-center gap-2.5 rounded-[1.25rem] border border-rose-400/50 bg-rose-600 px-4 py-4 text-sm font-bold text-white shadow-[0_14px_30px_rgba(225,29,72,0.24)] transition hover:bg-rose-700"
+                className="flex w-full items-center justify-center gap-2 rounded-full bg-rose-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-rose-700"
                 style={{ color: '#ffffff', WebkitTextFillColor: '#ffffff' }}
               >
                 <LogOut size={18} />
@@ -1589,7 +1528,7 @@ export const DashboardLayout = () => {
         </aside>
 
         <div
-          className={`mobile-app-shell relative flex-1 px-0 pb-0 pt-0 ${isAiPage ? 'sm:px-0' : 'sm:px-6'}`}
+          className={`mobile-app-shell relative flex-1 px-0 pb-0 pt-0 ${isAiPage ? 'sm:px-0 md:h-screen md:overflow-hidden' : 'sm:px-6'}`}
           style={{
             paddingBottom: 'env(safe-area-inset-bottom, 0px)',
             paddingTop: 'env(safe-area-inset-top, 0px)'
@@ -2187,9 +2126,15 @@ export const DashboardLayout = () => {
               </div>
             </div>
 
-          <main className={`relative z-10 ${isAiPage ? 'mt-0 sm:mt-2' : 'mt-0 sm:mt-6'}`}>
-            <div className={`mx-auto w-full max-w-7xl px-0 ${isAiPage ? 'pb-[calc(122px+env(safe-area-inset-bottom,0px))] sm:px-0' : 'pb-[calc(122px+env(safe-area-inset-bottom,0px))] sm:px-6'}`}>
-              <div>
+          <main className={`relative z-10 ${isAiPage ? 'mt-0 md:h-screen' : 'mt-0 sm:mt-6'}`}>
+            <div
+              className={
+                isAiPage
+                  ? 'w-full px-0 pb-[calc(122px+env(safe-area-inset-bottom,0px))] md:h-full md:pb-0'
+                  : 'mx-auto w-full max-w-7xl px-0 pb-[calc(122px+env(safe-area-inset-bottom,0px))] sm:px-6'
+              }
+            >
+              <div className={isAiPage ? 'md:h-full' : undefined}>
                 <Outlet />
               </div>
             </div>

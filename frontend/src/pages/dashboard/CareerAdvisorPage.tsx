@@ -10,7 +10,6 @@ import { useAuth } from '../../context/AuthContext';
 import { useDefaultSemesterSelection, useSemesterOptions } from '../../hooks/useSemesterOptions';
 import { filterBySemester, toNumberOrNull } from '../../utils/semester';
 import { emitSubjectsUpdated, subscribeSubjectsUpdated } from '../../utils/subjectSync';
-import robotImage from '../../img/robot.png';
 
 // --- Types ---
 type ApiRecommendation = { id?: number; career: string; skills: string; subjects: string; score: number; reason?: string | null; created_at?: string | null; analysis_provider?: string | null; analysis_generated_at?: string | null; analysis_run_id?: string | null; };
@@ -61,6 +60,10 @@ const formatAssistantPromptWeekday = (date: Date) =>
   date.toLocaleDateString('th-TH', { weekday: 'long' });
 const formatAssistantPromptTime = (date: Date) =>
   date.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', hour12: false });
+const ASSISTANT_INPUT_MAX_HEIGHT = 160;
+
+const isEmptyChatRoom = (room: ChatRoomMeta) => !room.last_message?.trim();
+
 const formatChatMessageTime = (value?: string | null) => {
   if (!value) return '';
   const normalized = value.includes('T') ? value : value.replace(' ', 'T');
@@ -126,7 +129,6 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
   const [lastUserPrompt, setLastUserPrompt] = useState('');
   const [assistantMessage, setAssistantMessage] = useState('พร้อมเพิ่มตารางเรียนค่ะ พิมพ์ชื่อวิชา วันที่ เวลา ห้อง และภาคเรียนได้เลย');
   const [isThinking, setIsThinking] = useState(false);
-  const [assistantToolsOpen, setAssistantToolsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [chatRooms, setChatRooms] = useState<ChatRoomMeta[]>([]);
   const [activeChatRoomId, setActiveChatRoomId] = useState('default');
@@ -147,6 +149,9 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
   const attachmentTrayRef = useRef<HTMLDivElement | null>(null);
   const semesterMenuRef = useRef<HTMLDivElement | null>(null);
   const assistantInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const homeScrollRef = useRef<HTMLDivElement | null>(null);
+  const historyScrollRef = useRef<HTMLDivElement | null>(null);
+  const historyInputRef = useRef<HTMLTextAreaElement | null>(null);
   const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const speechRecognitionCtorRef = useRef<any>(null);
   const speechTranscriptBaseRef = useRef('');
@@ -323,25 +328,70 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    window.localStorage.setItem(chatRoomStorageKey, JSON.stringify(chatRooms));
+    const worthKeeping = chatRooms.filter(room => !isEmptyChatRoom(room));
+    window.localStorage.setItem(chatRoomStorageKey, JSON.stringify(worthKeeping));
   }, [chatRoomStorageKey, chatRooms]);
 
-  const upsertChatRoomMeta = (roomId: string, patch: Partial<Pick<ChatRoomMeta, 'title' | 'last_message' | 'updated_at'>>) => {
+  const upsertChatRoomMeta = (
+    roomId: string,
+    patch: Partial<Pick<ChatRoomMeta, 'title' | 'last_message' | 'updated_at'>>,
+    options?: { touch?: boolean }
+  ) => {
+    const touch = options?.touch ?? true;
     setChatRooms(prev => {
       const nowIso = patch.updated_at ?? new Date().toISOString();
       const next = [...prev];
       const index = next.findIndex(room => room.id === roomId);
       const cleanTitle = patch.title?.trim();
-      const cleanPatch = { ...(cleanTitle ? { title: cleanTitle } : {}), ...(patch.last_message !== undefined ? { last_message: patch.last_message } : {}), updated_at: nowIso };
-      if (index >= 0) { next[index] = { ...next[index], ...cleanPatch }; } else { next.push({ id: roomId, title: cleanTitle || `แชท ${prev.length + 1}`, updated_at: nowIso, last_message: patch.last_message }); }
+      if (index >= 0) {
+        const keptTimestamp = touch ? nowIso : next[index].updated_at;
+        next[index] = {
+          ...next[index],
+          ...(cleanTitle ? { title: cleanTitle } : {}),
+          ...(patch.last_message !== undefined ? { last_message: patch.last_message } : {}),
+          updated_at: keptTimestamp,
+        };
+      } else {
+        next.push({ id: roomId, title: cleanTitle || `แชท ${prev.length + 1}`, updated_at: nowIso, last_message: patch.last_message });
+      }
       return next.slice().sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
     });
   };
   const canSendChat = inputText.trim().length > 0 && !isThinking && hasAuthToken;
 
+  useEffect(() => {
+    if (!historyOpen) return;
+    const container = historyScrollRef.current;
+    if (!container) return;
+    container.scrollTop = container.scrollHeight;
+  }, [historyOpen, activeChatRoomId, chatMessages, chatLoading]);
+
+  useEffect(() => {
+    if (!historyOpen || typeof window === 'undefined') return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setHistoryOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [historyOpen]);
+
+  useEffect(() => {
+    [assistantInputRef.current, historyInputRef.current].forEach(field => {
+      if (!field) return;
+      field.style.height = 'auto';
+      field.style.height = `${Math.min(field.scrollHeight, ASSISTANT_INPUT_MAX_HEIGHT)}px`;
+    });
+  }, [inputText, historyOpen]);
+
+  useEffect(() => {
+    if (mode !== 'home') return;
+    const container = homeScrollRef.current;
+    if (!container) return;
+    container.scrollTop = container.scrollHeight;
+  }, [chatMessages, isThinking, mode]);
+
   const appendAssistantTemplate = (template: string) => {
     setInputText(previous => previous.trim() ? `${previous}\n${template}` : template);
-    setAssistantToolsOpen(false);
     if (typeof window !== 'undefined') {
       window.requestAnimationFrame(() => {
         const input = assistantInputRef.current;
@@ -370,7 +420,7 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
   const quickActions = [
     { id: 'study-digest', label: 'สรุปการเรียน', to: '/study-digest', iconClassName: 'text-white', tileStyle: { backgroundColor: '#059669' }, icon: (<svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#ffffff" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M5 5h14" /><path d="M5 12h14" /><path d="M5 19h9" /><path d="M18 17v4" /><path d="M16 19h4" /></svg>) }
   ];
-  const storageAction = { id: 'study-storage', label: 'กระเป๋าเก็บไฟล์', to: '/study-storage', iconClassName: 'text-white', tileStyle: { background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)', boxShadow: '0 10px 22px rgba(99,102,241,0.24)' }, icon: (<svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#ffffff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" /><path d="M10 12h4" /></svg>) };
+  const storageAction = { id: 'study-storage', label: 'กระเป๋าเก็บไฟล์', to: '/study-storage', iconClassName: 'text-white', tileStyle: { background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)' }, icon: (<svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#ffffff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" /><path d="M10 12h4" /></svg>) };
   const quickActionItems = [...quickActions, storageAction];
   const [smartMenuOffset, setSmartMenuOffset] = useState({ x: 0, y: 0 });
   const [isDraggingSmartMenu, setIsDraggingSmartMenu] = useState(false);
@@ -488,7 +538,7 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
           setChatMessages([]);
           setLastUserPrompt('');
           setAssistantMessage('เครื่องมือเพิ่มตารางเรียนพร้อมใช้งานค่ะ พิมพ์เพิ่มวิชาพร้อมวัน วันที่ เวลา ห้อง และภาคเรียนได้เลย หรือพิมพ์หลายวิชาแยกคนละบรรทัดค่ะ');
-          upsertChatRoomMeta(activeChatRoomId, { last_message: 'เริ่มแชทใหม่' });
+          upsertChatRoomMeta(activeChatRoomId, { last_message: '' });
         } catch (err) {
           console.error(err);
           setChatError(normalizeAssistantErrorMessage(err, 'ลบประวัติการสนทนาไม่สำเร็จ'));
@@ -549,10 +599,35 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
 
  
 
+  const resetChatComposerState = () => {
+    setChatMessages([]);
+    setInputText('');
+    setLastUserPrompt('');
+    setAttachedFileName('');
+    setAssistantMessage('เริ่มแชทใหม่แล้วค่ะ พิมพ์รูปแบบเพิ่มตารางเรียน หรือพิมพ์หลายวิชาแยกคนละบรรทัดได้เลย');
+    setChatError(null);
+  };
+
   const createNewChatRoom = () => {
+    const activeRoom = chatRooms.find(room => room.id === activeChatRoomId);
+
+    // Already sitting in a blank room - reuse it instead of stacking up more.
+    if (activeRoom && isEmptyChatRoom(activeRoom) && chatMessages.length === 0) {
+      resetChatComposerState();
+      return;
+    }
+
     const roomId = `room-${Date.now()}`;
-    const room: ChatRoomMeta = { id: roomId, title: `แชทใหม่ ${chatRooms.length + 1}`, updated_at: new Date().toISOString(), last_message: '' };
-    setChatRooms(prev => [room, ...prev]); setActiveChatRoomId(roomId); setChatMessages([]); setInputText(''); setLastUserPrompt(''); setAttachedFileName(''); setAssistantMessage('เริ่มแชทใหม่แล้วค่ะ พิมพ์รูปแบบเพิ่มตารางเรียน หรือพิมพ์หลายวิชาแยกคนละบรรทัดได้เลย'); setChatError(null);
+    setChatRooms(prev => {
+      const used = prev.filter(room => !isEmptyChatRoom(room) || room.id === activeChatRoomId);
+      const stillUsed = used.filter(room => !isEmptyChatRoom(room));
+      return [
+        { id: roomId, title: `แชทใหม่ ${stillUsed.length + 1}`, updated_at: new Date().toISOString(), last_message: '' },
+        ...stillUsed,
+      ];
+    });
+    setActiveChatRoomId(roomId);
+    resetChatComposerState();
   };
 
   const startVoiceInput = () => {
@@ -626,7 +701,11 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
         const firstUserMessage = messages.find(message => message.sender_type === 'user' && message.message?.trim());
         const latestUserMessage = [...messages].reverse().find(message => message.sender_type === 'user' && message.message?.trim());
         setLastUserPrompt(latestUserMessage?.message?.trim() ?? '');
-        upsertChatRoomMeta(activeChatRoomId, { title: firstUserMessage?.message?.trim()?.slice(0, 28), last_message: latestMessage?.message?.trim() || '' });
+        upsertChatRoomMeta(
+          activeChatRoomId,
+          { title: firstUserMessage?.message?.trim()?.slice(0, 28), last_message: latestMessage?.message?.trim() || '' },
+          { touch: false }
+        );
         const latestAssistant = [...messages].reverse().find(message => message.sender_type === 'assistant');
         if (latestAssistant?.message?.trim()) { setAssistantMessage(normalizeAssistantFallback(latestAssistant.message)); } else { setAssistantMessage('พร้อมเพิ่มตารางเรียนค่ะ พิมพ์ชื่อวิชา วัน วันที่ เวลา ห้อง และภาคเรียนได้เลย'); }
       } catch (err) {
@@ -647,147 +726,76 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
   if (mode === 'home') {
     return (
       <div
-        className="smart-home-root relative h-[calc(100dvh-15.75rem)] min-h-0 overflow-hidden lg:h-[calc(100dvh-15rem)]"
+        className="smart-home-root relative flex h-[calc(100dvh-13rem)] min-h-[520px] flex-col overflow-hidden md:h-full"
       >
         <style>{`
-          @keyframes floatCenter { 0%, 100% { transform: translateX(calc(-50% + var(--robot-shift-x, 0px))) translateY(-8px); } 50% { transform: translateX(calc(-50% + var(--robot-shift-x, 0px))) translateY(-28px); } }
-          @keyframes assistantRobotShadow { 0%, 100% { transform: scaleX(1); opacity: .28; } 50% { transform: scaleX(.76); opacity: .1; } }
           @keyframes save-wiggle { 0%, 100% { transform: translateY(0) rotate(0deg) scale(1); } 10% { transform: translateY(-3px) rotate(-2.4deg) scale(1.02); } 20% { transform: translateY(2px) rotate(2.4deg) scale(1.04); } 30% { transform: translateY(-2px) rotate(-1.8deg) scale(1.02); } 40% { transform: translateY(1px) rotate(1.2deg) scale(1.01); } 50%, 90% { transform: translateY(0) rotate(0deg) scale(1); } }
-          @keyframes bubblePulse { 0%, 100% { box-shadow: 0 18px 48px rgba(15, 23, 42, 0.06); } 50% { box-shadow: 0 22px 52px rgba(15, 23, 42, 0.1); } }
-          @keyframes orbitSpin { from { transform: translate(-50%, -50%) rotate(0deg); } to { transform: translate(-50%, -50%) rotate(360deg); } }
-          @keyframes softGlow { 0%, 100% { opacity: .72; transform: scale(1); } 50% { opacity: 1; transform: scale(1.06); } }
-          .schedule-chat-card { min-height: 0; }
-          .schedule-guide::-webkit-scrollbar { width: 6px; }
-          .schedule-guide::-webkit-scrollbar-thumb { background: rgba(var(--accent-rgb), .2); border-radius: 99px; }
-          @media (max-width: 480px) and (max-height: 820px) { .smart-home-stack { gap: 0.55rem; padding-top: 1rem; } .smart-home-bubble { border-radius: 1.35rem; padding: 1rem 1.1rem; } .smart-home-actions { gap: 0.45rem; } .smart-home-actions button { padding: 0.55rem 0.72rem; font-size: 10px; } .smart-home-label { font-size: 9px; letter-spacing: 0.18em; } .smart-home-message { max-height: 5.1rem; } .smart-home-message p { font-size: 13px; line-height: 1.55; } .smart-home-robot-section { padding-top: 0; } .smart-home-robot { height: clamp(150px, 31vh, 220px); width: clamp(150px, 31vh, 220px); } .smart-home-composer { padding-bottom: 0; } .smart-home-input-shell { min-height: 108px; border-radius: 2.2rem; padding: 1rem 1.1rem; } .smart-home-input-shell textarea { min-height: 64px; font-size: 16px; line-height: 1.65; } .smart-home-input-shell .smart-home-tool-button { height: 2.75rem; width: 2.75rem; margin-right: 0.65rem; } .smart-home-input-shell .smart-home-mic-button { height: 2.75rem; width: 2.75rem; margin-left: 0.65rem; } .smart-home-send { height: 84px; width: 84px; } }
-          @media (max-width: 380px) and (max-height: 760px) { .smart-home-message { max-height: 4.25rem; } .smart-home-robot { height: clamp(118px, 24vh, 170px); width: clamp(118px, 24vh, 170px); } }
-          /* Keep the assistant dashboard in one viewport on phones and tablets. */
-           @media (max-width: 1023px) {
-             .smart-home-stack { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: .55rem; padding-top: .6rem; }
-             .smart-home-stack > * { min-height: 0; }
-             /* Keep the robot centered on mobile, including when the desktop
-                layout styles are still present in an emulated viewport. */
-             .smart-home-robot-anchor { --robot-shift-x: 0px; left: 50%; }
-             .smart-home-robot-shadow { left: 50%; }
-             .schedule-guide { overflow-y: auto; overflow-x: hidden; padding: .8rem 1rem; border-radius: 1.35rem; scrollbar-width: thin; }
-            .schedule-guide > div { height: auto; min-height: 100%; }
-            .schedule-assistant-message { font-size: 16px; line-height: 1.65rem; }
-            .schedule-helper-text { font-size: 13px; line-height: 1.5rem; }
-            .schedule-examples { margin-top: .8rem; padding: .85rem 1rem; font-size: 12px; line-height: 1.55rem; }
-            .schedule-examples p { line-height: 1.55rem; }
-            .smart-home-robot-section { padding-top: 0; }
-            .smart-home-robot-section > div { height: 100%; }
-            .smart-home-robot { height: min(100%, 178px); width: min(100%, 178px); }
-            .smart-home-composer { padding-bottom: 0; }
-            .smart-home-composer .mb-3.flex.items-center.justify-start { margin-bottom: .4rem; gap: .4rem; }
-            .smart-home-composer .mb-2\\.5 { margin-bottom: .4rem; gap: .35rem; }
-            .smart-home-composer .mb-2\\.5 button { min-height: 62px; padding: .45rem .2rem; border-radius: 1rem; }
-            .smart-home-composer .mb-2\\.5 button > span:first-child { height: 2rem; width: 2rem; border-radius: .7rem; }
-            .smart-home-composer .mb-2\\.5 button > span:last-child { font-size: 11px; }
-            .smart-home-input-shell { min-height: 78px; padding: .5rem .7rem; border-radius: 1.4rem; }
-            .smart-home-input-shell textarea { min-height: 48px; max-height: 48px; padding: .2rem 0; font-size: 12px; line-height: 1.25rem; }
-            .smart-home-input-shell .smart-home-tool-button, .smart-home-input-shell .smart-home-mic-button { height: 2.2rem; width: 2.2rem; margin-left: .25rem; margin-right: .25rem; }
-            .smart-home-send { height: 48px; width: 48px; }
-            .smart-home-send svg { height: 1.3rem; width: 1.3rem; }
+          .smart-home-root { -webkit-font-smoothing: antialiased; }
+          .smart-home-scroll { scrollbar-gutter: stable; scroll-behavior: smooth; overscroll-behavior-y: contain; }
+          @keyframes welcomeIn { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+          .smart-home-welcome { animation: welcomeIn .5s cubic-bezier(0.22, 1, 0.36, 1) both; }
+          .smart-home-root button, .smart-home-root a, .smart-home-root summary {
+            transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
           }
-          @media (max-width: 480px), (max-height: 720px) {
-            .smart-home-stack { grid-template-rows: auto minmax(0, 1fr) auto; gap: .35rem; padding-top: .35rem; }
-            .smart-home-stack > .flex:first-of-type { padding-bottom: .35rem; }
-            .smart-home-stack > .flex:first-of-type .h-11 { height: 2rem; width: 2rem; }
-            .smart-home-stack > .flex:first-of-type .h-11 svg { height: 1.1rem; width: 1.1rem; }
-            .smart-home-stack > .flex:first-of-type p:first-child { font-size: 12px; }
-            .smart-home-stack > .flex:first-of-type p:last-child { font-size: 9px; }
-            .smart-home-stack > .flex:first-of-type button { padding: .4rem .55rem; font-size: 10px; }
-            .smart-home-stack > .flex:first-of-type button svg { display: none; }
-            .schedule-guide { padding: .65rem .8rem; }
-            .schedule-guide > div > :first-child { display: none; }
-            .schedule-assistant-message { font-size: 14px; line-height: 1.4rem; }
-            .schedule-helper-text { font-size: 12px; line-height: 1.4rem; }
-            .schedule-examples { font-size: 11px; line-height: 1.4rem; }
-            .schedule-examples p { line-height: 1.4rem; }
-            .smart-home-composer .mb-3.flex.items-center.justify-start { display: none; }
-            .smart-home-composer .mb-2\\.5 { display: none; }
+          .smart-home-root .schedule-guide { transition: box-shadow .4s cubic-bezier(0.22, 1, 0.36, 1); }
+          @media (prefers-reduced-motion: reduce) {
+            .smart-home-welcome { animation: none; }
+            .smart-home-scroll { scroll-behavior: auto; }
           }
-          /* Desktop: keep a clear buffer above the floating bottom navigation while
-             preserving a balanced guide, robot, and composer layout. */
-          @media (min-width: 1024px) {
-            .smart-home-stack {
-              grid-template-rows: auto minmax(120px, 1fr) auto;
-              gap: .65rem;
-              padding-top: .6rem;
-            }
-            .schedule-guide { overflow-y: auto; overflow-x: hidden; padding: 1rem 1.25rem; scrollbar-width: thin; }
-            .schedule-assistant-message { font-size: 15px; line-height: 1.55rem; }
-            .schedule-helper-text { font-size: 12px; line-height: 1.4rem; }
-            .schedule-examples { margin-top: .75rem; padding: .8rem 1rem; font-size: 12px; line-height: 1.45rem; }
-            .schedule-examples p { line-height: 1.45rem; }
-            .smart-home-robot-section { padding-top: 0; }
-            .smart-home-robot-section > div { height: 100%; }
-            .smart-home-robot { height: min(100%, 200px); width: min(100%, 200px); }
-            /* Place the assistant in the open area beside the composer controls. */
-            .smart-home-robot-anchor { --robot-shift-x: 100px; bottom: -20px; }
-            .smart-home-robot-shadow { left: calc(50% + 100px); bottom: -19px; }
-            .smart-home-composer { padding-bottom: 0; }
-            .smart-home-composer .mb-3 { margin-bottom: .55rem; }
-            .smart-home-composer .mb-2\\.5 { margin-bottom: .55rem; }
-            .smart-home-composer .mb-2\\.5 button { min-height: 62px; padding-top: .45rem; padding-bottom: .45rem; }
-            .smart-home-composer .mb-2\\.5 button > span:first-child { height: 2rem; width: 2rem; border-radius: .7rem; }
-            .smart-home-input-shell { min-height: 84px; padding: .65rem 1rem; border-radius: 1.5rem; }
-            .smart-home-input-shell textarea { min-height: 50px; max-height: 56px; font-size: 14px; line-height: 1.35rem; }
-            .smart-home-input-shell .smart-home-tool-button, .smart-home-input-shell .smart-home-mic-button { height: 2.5rem; width: 2.5rem; margin-left: .5rem; margin-right: .5rem; }
-            .smart-home-send { height: 56px; width: 56px; }
+          .smart-home-input-shell { transition: box-shadow .3s ease, border-color .3s ease; }
+          .smart-home-input-shell:focus-within { box-shadow: 0 0 0 4px rgba(var(--accent-rgb), 0.15) !important; border-color: var(--accent) !important; }
+          @media (max-width: 640px) {
+            .schedule-assistant-message { font-size: 15px; line-height: 1.7rem; }
+            .schedule-helper-text { font-size: 12px; }
+            .schedule-examples { font-size: 12px; line-height: 1.55rem; }
           }
-          /* iPad/tablet: keep the robot centered even when the desktop layout
-             breakpoint is active in landscape orientation. */
-          @media (min-width: 1024px) and (max-width: 1366px) {
-            .smart-home-robot-anchor { --robot-shift-x: 0px; left: 50%; }
-            .smart-home-robot-shadow { left: 50%; }
+          @media (min-width: 641px) {
+            .schedule-assistant-message { font-size: 15px; line-height: 1.75rem; }
+            .schedule-helper-text { font-size: 12px; }
+            .schedule-examples { font-size: 12.5px; line-height: 1.6rem; }
           }
         `}</style>
-        <div className="absolute inset-0" style={{ background: 'linear-gradient(180deg, #ffffff 0%, #ffffff 48%, #f7fbff 100%)' }} />
-        <div className="absolute inset-x-0 bottom-0 h-[52%]" style={{ backgroundImage: 'linear-gradient(to right, rgba(59,130,246,0.055) 1px, transparent 1px), linear-gradient(to bottom, rgba(59,130,246,0.055) 1px, transparent 1px)', backgroundSize: '2rem 2rem', opacity: 0.92 }} />
-        {!lowFxMode ? <div className="absolute left-6 top-16 h-44 w-44 rounded-full blur-3xl" style={{ background: 'rgba(var(--accent-rgb),0.12)' }} /> : null}
-        {!lowFxMode ? <div className="absolute right-4 top-24 h-56 w-56 rounded-full blur-3xl" style={{ background: 'rgba(var(--accent-rgb),0.10)' }} /> : null}
-        {!lowFxMode ? <div className="absolute inset-x-0 top-[38%] mx-auto h-52 w-52 rounded-full blur-[88px]" style={{ background: 'rgba(var(--accent-rgb),0.18)', animation: 'softGlow 4.8s ease-in-out infinite' }} /> : null}
+        <div className="absolute inset-0" style={{ background: 'var(--bg)' }} />
+        <div className="absolute inset-0" style={{ backgroundImage: 'radial-gradient(rgba(0,0,0,0.03) 1px, transparent 1px)', backgroundSize: '32px 32px' }} />
 
         {historyOpen && typeof document !== 'undefined' ? createPortal(
           <div
             className="fixed inset-0 z-[9999] flex items-stretch justify-center bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.92),_rgba(236,238,255,0.94)_42%,_rgba(225,230,255,0.88)_100%)] backdrop-blur-md md:items-center md:p-4"
-            style={{ background: `radial-gradient(circle at top, ${activeTheme.accentSoft} 0%, rgba(255,255,255,0.92) 30%, ${activeTheme.surface2} 100%)` }}
+            style={{ background: 'rgba(0,0,0,0.28)' }}
             onClick={() => setHistoryOpen(false)}
             role="dialog"
             aria-modal="true"
             aria-label="ประวัติการสนทนา"
           >
             <div
-              className="flex h-[100dvh] w-full max-w-[1440px] flex-col overflow-hidden border border-white/70 bg-[linear-gradient(135deg,rgba(255,255,255,0.98)_0%,rgba(247,248,255,0.95)_46%,rgba(238,243,255,0.98)_100%)] md:h-auto md:max-h-[92dvh] md:min-h-[76vh] md:flex-row md:rounded-[2.5rem]"
-              style={{ background: `linear-gradient(135deg, ${activeTheme.surface} 0%, ${activeTheme.surface2} 46%, ${activeTheme.surface} 100%)`, boxShadow: `0 28px 90px rgba(${activeTheme.accentRgb}, 0.18)` }}
+              className="flex h-[100dvh] w-full max-w-[1440px] flex-col overflow-hidden border border-black/5 md:h-[88dvh] md:flex-row md:rounded-[2rem]"
+              style={{ background: 'var(--surface)', boxShadow: '0 24px 80px rgba(0,0,0,0.18)' }}
               onClick={event => event.stopPropagation()}
             >
-              <aside className="w-full border-b md:max-w-[360px] md:border-b-0 md:border-r" style={{ borderColor: 'rgba(255,255,255,0.65)', background: 'linear-gradient(180deg, rgba(249,250,255,0.95) 0%, rgba(242,245,255,0.92) 100%)' }}>
+              <aside className="w-full border-b md:max-w-[340px] md:border-b-0 md:border-r" style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}>
                 <div className="flex h-full flex-col px-5 pb-5 pt-[max(1.35rem,env(safe-area-inset-top))] md:px-6 md:pt-6">
                   <div className="mb-4 flex items-center justify-between">
-                    <p className="text-[18px] font-black tracking-[-0.02em] text-slate-900">แชทของฉัน <span className="ml-1 text-violet-500">✦</span></p>
-                    <button type="button" onClick={() => setHistoryOpen(false)} className="grid h-10 w-10 place-items-center rounded-full border border-white/80 bg-white text-slate-500 shadow-[0_10px_24px_rgba(15,23,42,0.08)] transition hover:-translate-y-0.5 hover:text-slate-900" style={{ boxShadow: '0 10px 24px rgba(79, 70, 229, 0.10)' }} aria-label="ปิดล็อบบี้">
+                    <p className="text-[18px] font-semibold tracking-tight text-[color:var(--text)]">แชทของฉัน</p>
+                    <button type="button" onClick={() => setHistoryOpen(false)} className="grid h-9 w-9 place-items-center rounded-full border border-black/5 bg-white text-[color:var(--muted)] transition hover:text-[color:var(--text)]" style={{ boxShadow: 'var(--shadow-soft)' }} aria-label="ปิดล็อบบี้">
                       <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
                     </button>
                   </div>
-                  <button type="button" onClick={createNewChatRoom} className="mb-4 inline-flex w-full items-center justify-center gap-2 rounded-full px-4 py-3 text-[14px] font-semibold text-white transition hover:brightness-110" style={{ border: `1px solid rgba(${activeTheme.accentRgb}, 0.28)`, background: `linear-gradient(135deg, ${activeTheme.accent} 0%, ${activeTheme.accentStrong} 100%)`, boxShadow: `0 14px 28px rgba(${activeTheme.accentRgb}, 0.28)` }}>
+                  <button type="button" onClick={createNewChatRoom} className="mb-4 inline-flex w-full items-center justify-center gap-2 rounded-full px-4 py-3 text-[14px] font-medium transition active:scale-95" style={{ background: 'var(--accent)', color: '#ffffff', boxShadow: '0 4px 14px rgba(var(--accent-rgb),0.25)' }}>
                     <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg> เริ่มแชทใหม่
                   </button>
-                  <div className="mb-4 flex items-center gap-2 rounded-full border border-white/80 bg-white px-4 py-3 shadow-[0_10px_24px_rgba(15,23,42,0.05)]">
+                  <div className="mb-4 flex items-center gap-2 rounded-full border border-black/5 bg-white px-4 py-2.5" style={{ boxShadow: 'var(--shadow-soft)' }}>
                     <svg viewBox="0 0 24 24" className="h-4 w-4 text-slate-400" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" /></svg>
                     <input value={chatRoomSearch} onChange={event => setChatRoomSearch(event.target.value)} placeholder="ค้นหาแชท" className="w-full bg-transparent text-sm text-slate-700 outline-none placeholder:text-slate-400" />
                   </div>
                   <div className="mb-3 flex items-center justify-between px-1">
-                    <span className="text-[11px] font-bold uppercase tracking-[0.18em] text-violet-500">{filteredChatRooms.length} หัวข้อ</span>
-                    {chatRoomSearch ? (<button type="button" onClick={() => setChatRoomSearch('')} className="text-[11px] font-semibold text-slate-500 transition hover:text-violet-600">ล้างค้นหา</button>) : null}
+                    <span className="text-[11px] font-medium text-[color:var(--muted)]">{filteredChatRooms.length} หัวข้อ</span>
+                    {chatRoomSearch ? (<button type="button" onClick={() => setChatRoomSearch('')} className="text-[11px] font-medium text-[color:var(--muted)] transition hover:text-[color:var(--accent)]">ล้างค้นหา</button>) : null}
                   </div>
                   <div className="-mx-1 flex snap-x snap-mandatory gap-2 overflow-x-auto overscroll-x-contain px-1 pb-2 pr-4 md:mx-0 md:block md:max-h-[calc(92dvh-16rem)] md:space-y-2 md:overflow-y-auto md:overscroll-contain md:px-0 md:pb-0 md:pr-1">
                     {filteredChatRooms.map(room => (
-                      <div key={room.id} className={`group flex min-w-[min(78vw,18rem)] snap-start items-center gap-3 rounded-[1.35rem] border p-3 transition md:min-w-0 ${room.id === activeChatRoomId ? 'border-violet-300 shadow-[0_16px_36px_rgba(99,102,241,0.16)]' : 'border-transparent hover:border-white hover:shadow-[0_14px_30px_rgba(15,23,42,0.06)]'}`} style={{ background: room.id === activeChatRoomId ? 'linear-gradient(135deg, rgba(255,255,255,0.98) 0%, rgba(244,240,255,0.98) 100%)' : 'rgba(255,255,255,0.80)' }}>
+                      <div key={room.id} className={`group flex min-w-[min(78vw,18rem)] snap-start items-center gap-3 rounded-2xl border p-3 transition md:min-w-0 ${room.id === activeChatRoomId ? 'border-[color:rgba(var(--accent-rgb),0.35)]' : 'border-black/5 hover:bg-white'}`} style={{ background: room.id === activeChatRoomId ? 'rgba(var(--accent-rgb),0.08)' : 'var(--surface)' }}>
                         <button type="button" onClick={() => { setActiveChatRoomId(room.id); setChatError(null); }} className="min-w-0 flex-1 px-1.5 py-1.5 text-left">
-                          <p className="truncate text-[14px] font-bold text-slate-900">{room.title || 'แชทไม่มีชื่อ'}</p>
+                          <p className="truncate text-[14px] font-medium text-[color:var(--text)]">{room.title || 'แชทไม่มีชื่อ'}</p>
                           <p className="mt-1 truncate text-[12px] text-slate-500">{room.last_message || 'ยังไม่มีข้อความ'}</p>
                         </button>
                         <button type="button" onClick={(event) => { event.stopPropagation(); void deleteChatRoom(room.id); }} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-500 md:h-8 md:w-8 md:bg-white/70 md:opacity-100" aria-label={`ลบหัวข้อ ${room.title || 'แชทไม่มีชื่อ'}`} title="ลบหัวข้อแชท">
@@ -798,64 +806,72 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                     {filteredChatRooms.length === 0 ? (<div className="w-full shrink-0 rounded-[1.25rem] border border-dashed border-white/80 bg-white/70 px-3 py-6 text-center text-xs text-slate-500 shadow-[0_10px_24px_rgba(15,23,42,0.04)]">ไม่พบหัวข้อแชท</div>) : null}
                   </div>
 
-                  <div className="mt-auto hidden rounded-[1.6rem] border border-white/80 bg-[linear-gradient(135deg,rgba(111,133,255,0.08),rgba(186,115,255,0.10))] p-4 shadow-[0_16px_34px_rgba(79,70,229,0.08)] md:block">
+                  <div className="mt-auto hidden rounded-2xl border border-black/5 p-4 md:block" style={{ background: 'var(--surface-2)' }}>
                     <div className="flex items-center gap-3">
-                      <div className="grid h-12 w-12 place-items-center rounded-2xl bg-[linear-gradient(135deg,#8b5cf6,#5b8cff)] text-white shadow-[0_10px_24px_rgba(91,140,255,0.22)]">
+                      <div className="grid h-12 w-12 place-items-center rounded-2xl" style={{ background: 'var(--accent)', color: '#ffffff' }}>
                         <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z" /><path d="M8 9h8M8 13h5" /></svg>
                       </div>
                       <div className="min-w-0">
-                        <p className="text-[13px] font-bold text-slate-900">เริ่มการสนทนาใหม่</p>
+                        <p className="text-[13px] font-medium text-[color:var(--text)]">เริ่มการสนทนาใหม่</p>
                         <p className="mt-1 text-[12px] leading-5 text-slate-500">พิมพ์ข้อความแล้วให้ผู้ช่วยช่วยคิดต่อได้เลย</p>
                       </div>
-                      <button type="button" onClick={createNewChatRoom} className="ml-auto rounded-full border border-violet-200 bg-white px-3 py-2 text-[12px] font-semibold text-violet-600 transition hover:bg-violet-50">เริ่ม</button>
+                      <button type="button" onClick={createNewChatRoom} className="ml-auto rounded-full border border-black/5 bg-white px-3 py-2 text-[12px] font-medium text-[color:var(--accent)] transition hover:bg-slate-50">เริ่ม</button>
                     </div>
                   </div>
                 </div>
               </aside>
 
               <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-                <div className="flex items-center justify-between border-b border-white/70 px-5 py-4 md:px-7 md:py-5" style={{ background: `linear-gradient(90deg, rgba(255,255,255,0.72), ${activeTheme.accentSoft})` }}>
-                  <div>
-                    <p className="text-[11px] font-bold uppercase tracking-[0.28em] text-violet-500">Chat History</p>
-                    <h3 className="mt-1 text-lg font-black tracking-[-0.02em] text-slate-900 md:text-[28px]">{chatRooms.find(room => room.id === activeChatRoomId)?.title ?? 'ประวัติการสนทนา'}</h3>
+                <div className="flex shrink-0 items-center gap-4 border-b px-5 py-4 md:px-7 md:py-5" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-[color:var(--muted)]">Chat History</p>
+                    <h3 className="mt-1 truncate text-lg font-semibold tracking-tight text-[color:var(--text)] md:text-[22px]">{chatRooms.find(room => room.id === activeChatRoomId)?.title ?? 'ประวัติการสนทนา'}</h3>
+                    <p className="mt-0.5 text-[12px] text-[color:var(--muted)]">{chatMessages.length > 0 ? `${chatMessages.length} ข้อความ` : 'ยังไม่มีข้อความ'}</p>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => setHistoryOpen(false)}
+                    className="grid h-10 w-10 shrink-0 place-items-center rounded-full border border-black/5 bg-white text-[color:var(--muted)] transition hover:bg-slate-50 hover:text-[color:var(--text)]"
+                    style={{ boxShadow: 'var(--shadow-soft)' }}
+                    aria-label="ปิดประวัติการสนทนา"
+                    title="ปิด"
+                  >
+                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+                  </button>
                 </div>
 
-                <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6 md:px-8 md:py-8" style={{ scrollbarGutter: 'stable' }}>
+                <div ref={historyScrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-6 md:px-8 md:py-8" style={{ scrollbarGutter: 'stable' }}>
                   {chatLoading ? (
-                    <div className="rounded-2xl border border-white/80 bg-white/80 px-4 py-4 text-[13px] text-slate-500 shadow-[0_10px_24px_rgba(15,23,42,0.05)]">กำลังโหลดประวัติการคุย...</div>
+                    <div className="rounded-2xl border border-black/5 bg-white px-4 py-4 text-[13px] text-[color:var(--muted)]" style={{ boxShadow: 'var(--shadow-soft)' }}>กำลังโหลดประวัติการคุย...</div>
                   ) : chatMessages.length === 0 ? (
-                    <div className="mx-auto mt-8 max-w-md rounded-[2rem] border border-white/80 bg-[linear-gradient(180deg,rgba(255,255,255,0.98),rgba(245,247,255,0.92))] px-6 py-10 text-center shadow-[0_22px_54px_rgba(79,70,229,0.10)]">
-                      <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-[1.4rem] bg-[linear-gradient(135deg,rgba(91,140,255,0.12),rgba(139,92,246,0.12))] text-violet-500"><svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z" /></svg></div>
-                      <p className="mt-4 text-[18px] font-black tracking-[-0.02em] text-slate-900">เริ่มบทสนทนาใหม่</p>
-                    <p className="mt-2 text-sm leading-6 text-slate-500">เพิ่มหลายวิชาได้ในข้อความเดียว: พิมพ์แยกบรรทัดหรือใช้รายการเลขลำดับ แล้วกด Shift + Enter เพื่อขึ้นบรรทัดใหม่</p>
+                    <div className="mx-auto mt-8 max-w-md rounded-3xl border border-black/5 bg-white px-6 py-10 text-center" style={{ boxShadow: 'var(--shadow-float)' }}>
+                      <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl text-[color:var(--accent)]" style={{ background: 'rgba(var(--accent-rgb),0.12)' }}><svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z" /></svg></div>
+                      <p className="mt-4 text-[18px] font-semibold tracking-tight text-[color:var(--text)]">เริ่มบทสนทนาใหม่</p>
+                    <p className="mt-2 text-sm leading-6 text-[color:var(--muted)]">เพิ่มหลายวิชาได้ในข้อความเดียว: พิมพ์แยกบรรทัดหรือใช้รายการเลขลำดับ แล้วกด Shift + Enter เพื่อขึ้นบรรทัดใหม่</p>
                     </div>
                   ) : (
                     <div className="mx-auto max-w-4xl space-y-5">
                       {chatMessages.slice(-40).map(message => {
                         const isAssistant = message.sender_type === 'assistant';
                         return (
-                          <div key={message.id} className={`group flex items-end gap-3 ${isAssistant ? 'justify-start' : 'justify-end'}`}>
-                            {isAssistant ? (<div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[linear-gradient(135deg,#5b8cff,#8b5cf6)] text-[11px] font-black text-white shadow-[0_10px_22px_rgba(91,140,255,0.24)]">AI</div>) : null}
-                            <div className={`max-w-[84%] md:max-w-[72%] ${isAssistant ? '' : 'text-right'}`}>
-                              <div className={`relative rounded-[1.55rem] px-4 py-3 text-left ${isAssistant ? 'rounded-bl-md border border-white/80 bg-white text-slate-800 shadow-[0_14px_30px_rgba(15,23,42,0.06)]' : 'rounded-br-md bg-[linear-gradient(135deg,#5b8cff,#8b5cf6)] text-white shadow-[0_16px_34px_rgba(91,140,255,0.22)]'}`}>
-                                {!isAssistant ? (<p className="mb-1 text-[11px] font-black">ผู้ใช้:</p>) : null}
+                          <div key={message.id} className={`group flex items-start gap-3 ${isAssistant ? 'justify-start' : 'justify-end'}`}>
+                            {isAssistant ? (<div className="mt-1 grid h-8 w-8 shrink-0 place-items-center rounded-full text-[11px] font-medium" style={{ background: 'var(--accent)', color: '#ffffff' }}>AI</div>) : null}
+                            <div className="max-w-[85%] md:max-w-[68%]">
+                              <div className={`relative w-fit min-w-[5rem] rounded-2xl px-4 py-2.5 text-left ${isAssistant ? 'rounded-bl-md border border-black/5 bg-white text-[color:var(--text)] shadow-[var(--shadow-soft)]' : 'ml-auto rounded-br-md'}`} style={isAssistant ? undefined : { background: 'var(--accent)' }}>
                                 <p className="whitespace-pre-wrap break-words text-[14px] leading-7 md:text-[15px]">{isAssistant ? normalizeAssistantFallback(message.message) : message.message}</p>
-                              </div>
-                              <div className={`mt-1.5 flex items-center px-1 ${isAssistant ? 'justify-start' : 'justify-end'}`}>
-                                <span className="text-[10px] text-[color:var(--muted)]">{formatChatMessageTime(message.created_at)}</span>
+                                <p className="mt-1.5 text-[10px]" style={isAssistant ? { color: 'var(--muted)' } : { color: 'rgba(255,255,255,0.75)' }}>{formatChatMessageTime(message.created_at)}</p>
                               </div>
                             </div>
                           </div>
                         );
                       })}
                       {isThinking ? (
-                        <div className="flex items-end gap-3">
-                          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[linear-gradient(135deg,#5b8cff,#8b5cf6)] text-[11px] font-black text-white shadow-[0_10px_22px_rgba(91,140,255,0.24)]">AI</div>
-                          <div className="flex items-center gap-1.5 rounded-[1.5rem] rounded-bl-md border border-white/80 bg-white px-4 py-4 shadow-[0_14px_30px_rgba(15,23,42,0.06)]">
-                            <span className="h-2 w-2 animate-bounce rounded-full bg-violet-500 [animation-delay:-0.2s]" />
-                            <span className="h-2 w-2 animate-bounce rounded-full bg-sky-500 [animation-delay:-0.1s]" />
-                            <span className="h-2 w-2 animate-bounce rounded-full bg-indigo-500" />
+                        <div className="flex items-start gap-3">
+                          <div className="mt-1 grid h-8 w-8 shrink-0 place-items-center rounded-full text-[11px] font-medium" style={{ background: 'var(--accent)', color: '#ffffff' }}>AI</div>
+                          <div className="flex items-center gap-1.5 rounded-3xl rounded-bl-lg border border-black/5 bg-white px-4 py-4 shadow-[var(--shadow-soft)]">
+                            <span className="h-2 w-2 animate-bounce rounded-full bg-[color:var(--accent)] opacity-40 [animation-delay:-0.2s]" />
+                            <span className="h-2 w-2 animate-bounce rounded-full bg-[color:var(--accent)] opacity-70 [animation-delay:-0.1s]" />
+                            <span className="h-2 w-2 animate-bounce rounded-full bg-[color:var(--accent)]" />
                           </div>
                         </div>
                       ) : null}
@@ -863,16 +879,16 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                   )}
                 </div>
 
-                <div className="shrink-0 border-t border-white/70 px-3 pb-[max(0.9rem,env(safe-area-inset-bottom))] pt-3 md:px-6 md:pb-5 md:pt-4" style={{ background: 'rgba(255,255,255,0.72)' }}>
+                <div className="shrink-0 border-t px-3 pb-[max(0.9rem,env(safe-area-inset-bottom))] pt-3 md:px-6 md:pb-5 md:pt-4" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
                   {chatError ? (<p className="mx-auto mb-2 max-w-4xl rounded-xl border border-rose-100 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-600">{chatError}</p>) : null}
                   <form onSubmit={handleAssistantSubmit} className="mx-auto flex max-w-4xl items-end gap-2">
                     <div className="flex min-h-[56px] flex-1 items-end rounded-[2rem] border border-white/80 bg-white px-4 py-2 shadow-[0_16px_34px_rgba(15,23,42,0.06)] transition focus-within:border-violet-300 focus-within:ring-4 focus-within:ring-violet-100">
-                      <textarea value={inputText} onChange={event => setInputText(event.target.value)} placeholder={`เช่น ${currentAssistantPromptExample}`} disabled={isThinking} rows={1} className="max-h-28 min-h-[36px] flex-1 resize-none bg-transparent py-2 text-[15px] text-slate-800 outline-none placeholder:text-slate-400" onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitAssistantPrompt(inputText); } }} />
-                      <button type="button" onClick={isListening ? stopVoiceInput : startVoiceInput} disabled={!voiceInputSupported || isThinking} className={`mb-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition disabled:opacity-40 ${isListening ? 'bg-rose-500/10 text-rose-500' : 'text-slate-400 hover:bg-slate-100 hover:text-violet-500'}`} aria-label={isListening ? 'หยุดฟังเสียง' : 'พูดเป็นข้อความ'}>
+                      <textarea ref={historyInputRef} value={inputText} onChange={event => setInputText(event.target.value)} placeholder={`เช่น ${currentAssistantPromptExample}`} disabled={isThinking} rows={1} style={{ maxHeight: `${ASSISTANT_INPUT_MAX_HEIGHT}px` }} className="min-h-[28px] flex-1 resize-none overflow-y-auto bg-transparent py-2 text-[15px] leading-7 text-[color:var(--text)] outline-none placeholder:text-[color:var(--muted)]" onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitAssistantPrompt(inputText); } }} />
+                      <button type="button" onClick={isListening ? stopVoiceInput : startVoiceInput} disabled={!voiceInputSupported || isThinking} className={`mb-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition disabled:opacity-40 ${isListening ? 'bg-rose-500/10 text-rose-500' : 'text-[color:var(--muted)] hover:bg-slate-100 hover:text-[color:var(--accent)]'}`} aria-label={isListening ? 'หยุดฟังเสียง' : 'พูดเป็นข้อความ'}>
                         <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 10v2a7 7 0 0 0 14 0v-2" /><path d="M12 19v2" /></svg>
                       </button>
                     </div>
-                    <button type="submit" disabled={!canSendChat} className="flex h-[52px] w-[52px] shrink-0 items-center justify-center rounded-full bg-[linear-gradient(135deg,#5b8cff,#8b5cf6)] text-white shadow-[0_14px_28px_rgba(91,140,255,0.30)] transition hover:scale-[1.03] disabled:cursor-not-allowed disabled:opacity-40" aria-label="ส่งข้อความ">
+                    <button type="submit" disabled={!canSendChat} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-40" style={{ background: 'var(--accent)', color: '#ffffff', boxShadow: '0 4px 14px rgba(var(--accent-rgb),0.25)' }} aria-label="ส่งข้อความ">
                       <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 2 11 13" /><path d="M22 2 15 22 11 13 2 9 22 2Z" /></svg>
                     </button>
                   </form>
@@ -883,7 +899,7 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
           document.body
         ) : null}
 
-        <div className="smart-home-stack schedule-chat-card relative z-10 mx-auto grid h-full min-h-0 w-full max-w-4xl grid-rows-[auto_minmax(140px,1fr)_auto] gap-3 overflow-hidden px-3 pb-0 pt-3 sm:px-5 md:gap-4">
+        <div className="smart-home-stack schedule-chat-card relative z-10 flex h-full min-h-0 w-full flex-col overflow-hidden">
           <div className="pointer-events-none absolute right-4 top-[178px] hidden w-[220px]">
             <div className={`pointer-events-auto rounded-[1.75rem] border p-4 backdrop-blur-sm ${isDraggingSmartMenu ? 'select-none' : ''}`} style={{ borderColor: 'var(--border)', background: isDesktopLike ? 'color-mix(in srgb, var(--surface) 94%, transparent)' : 'var(--surface)', boxShadow: isDesktopLike ? 'var(--shadow-soft)' : 'none', transform: `translate3d(${smartMenuOffset.x}px, ${smartMenuOffset.y}px, 0)`, transition: isDraggingSmartMenu ? 'none' : 'transform 120ms ease', willChange: 'transform', contain: 'layout paint' }} title="ลาก Smart Menu ไปตำแหน่งที่ต้องการ">
               <div className="mb-3 flex items-center justify-between" style={{ cursor: isDraggingSmartMenu ? 'grabbing' : 'grab' }} onPointerDown={event => { if (event.button !== 0) return; if (!isDesktopLike) return; smartMenuDragStartRef.current = { x: smartMenuOffset.x, y: smartMenuOffset.y, pointerX: event.clientX, pointerY: event.clientY }; setIsDraggingSmartMenu(true); }}>
@@ -901,57 +917,95 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
+          <div className="relative z-30 flex h-[72px] shrink-0 items-center justify-between gap-3 border-b px-4 sm:px-6 lg:px-10" style={{ borderColor: 'var(--border)' }}>
             <div className="flex items-center gap-3">
-              <div className="grid h-11 w-11 place-items-center rounded-full bg-[color:var(--accent)] text-white shadow-[0_10px_24px_rgba(var(--accent-rgb),0.28)]">
+              <div className="grid h-10 w-10 shrink-0 place-items-center rounded-full shadow-md" style={{ background: 'var(--accent)', color: '#ffffff' }}>
                 <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="5" y="8" width="14" height="9" rx="4" /><path d="M12 8V5" /><path d="M8.5 12h.01M15.5 12h.01" /><path d="M9.5 16c1.2 1 3.8 1 5 0" /></svg>
               </div>
-              <div><p className="text-[15px] font-black text-slate-800">ผู้ช่วยเพิ่มตารางเรียน</p><p className="mt-0.5 flex items-center gap-1.5 text-[11px] font-semibold text-emerald-500"><span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />ออนไลน์</p></div>
+              <div className="flex flex-col justify-center"><p className="text-[15px] font-semibold leading-tight tracking-wide text-[color:var(--text)]">ผู้ช่วยเพิ่มตารางเรียน</p><p className="mt-0.5 flex items-center gap-1.5 text-[11px] font-medium text-[color:var(--muted)]"><span className="h-1.5 w-1.5 rounded-full bg-green-500 shadow-[0_0_4px_rgba(34,197,94,0.5)]" />ออนไลน์</p></div>
             </div>
-            <div className="ml-auto flex max-w-full flex-wrap justify-end gap-2">
-            <button type="button" onClick={createNewChatRoom} className="inline-flex items-center gap-2 whitespace-nowrap rounded-full px-3 py-2 text-[12px] font-semibold shadow-sm transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50 sm:px-4" style={{ color: 'rgba(var(--on-accent-rgb),0.96)', border: '1px solid rgba(var(--accent-rgb),0.52)', background: 'linear-gradient(135deg, rgba(var(--accent-rgb),0.92) 0%, rgba(var(--accent-rgb),0.74) 100%)', boxShadow: lowFxMode ? '0 6px 12px rgba(var(--accent-rgb),0.20)' : '0 10px 24px rgba(var(--accent-rgb),0.28)', backdropFilter: lowFxMode ? undefined : 'blur(10px)' }}>
+            <div className="ml-auto flex items-center gap-3">
+            <button type="button" onClick={createNewChatRoom} className="inline-flex items-center gap-2 whitespace-nowrap rounded-full px-5 py-2.5 text-[14px] font-medium transition-all duration-300 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50" style={{ background: 'var(--accent)', color: '#ffffff', WebkitTextFillColor: '#ffffff', boxShadow: '0 4px 14px rgba(var(--accent-rgb),0.25)' }}>
               <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg> เริ่มแชทใหม่
             </button>
-            <button type="button" onClick={() => setHistoryOpen(prev => !prev)} className="inline-flex items-center gap-2 whitespace-nowrap rounded-full px-3 py-2 text-[12px] font-semibold shadow-sm transition hover:brightness-110 sm:px-4" style={{ color: 'var(--text)', border: '1px solid rgba(var(--accent-rgb),0.28)', background: 'rgba(var(--accent-rgb),0.10)', backdropFilter: lowFxMode ? undefined : 'blur(10px)' }}>
+            <button type="button" onClick={() => setHistoryOpen(prev => !prev)} className="inline-flex items-center gap-2 whitespace-nowrap rounded-full border border-white/40 bg-white/60 px-4 py-2.5 text-[14px] font-medium backdrop-blur-md transition-all duration-300 hover:bg-white" style={{ color: 'var(--text)', boxShadow: 'var(--shadow-soft)' }}>
               <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 8v4l3 3" /><circle cx="12" cy="12" r="9" /></svg> ดูประวัติ
             </button>
             </div>
           </div>
 
-          <section className="schedule-guide min-h-0 overflow-y-auto rounded-[1.6rem] bg-slate-50/80 px-4 py-5 text-left md:px-6 md:py-6">
-            <div className="flex items-start gap-4">
-              <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-sky-50 text-[color:var(--accent)] shadow-[0_10px_18px_rgba(var(--accent-rgb),0.12)]">
-                <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="5" y="8" width="14" height="9" rx="4" /><path d="M12 8V5" /><path d="M8.5 12h.01M15.5 12h.01" /><path d="M9.5 16c1.2 1 3.8 1 5 0" /></svg>
-              </div>
-              <div className="min-w-0 flex-1">
+          <div ref={homeScrollRef} className="smart-home-scroll relative flex min-h-0 flex-1 flex-col overflow-y-auto px-4 py-6 sm:px-6 lg:px-10">
+            {chatMessages.length === 0 ? (
+              <div className="smart-home-welcome mx-auto my-auto flex w-full max-w-3xl flex-col">
+          <section className="schedule-guide mx-auto w-full rounded-3xl border border-white bg-white/80 px-6 py-8 text-center shadow-[var(--shadow-float)] backdrop-blur-md md:px-10 md:py-10">
+            <div>
+              <div className="min-w-0">
                 {isThinking ? (
-                  <div className="mt-4 inline-flex items-center gap-2 rounded-full px-3 py-2" style={{ background: 'var(--surface-3)', color: 'var(--text)' }}><span className="h-2.5 w-2.5 animate-bounce rounded-full bg-current [animation-delay:-0.2s]" /><span className="h-2.5 w-2.5 animate-bounce rounded-full bg-current [animation-delay:-0.1s]" /><span className="h-2.5 w-2.5 animate-bounce rounded-full bg-current" /></div>
+                  <div className="mx-auto inline-flex items-center gap-2 rounded-full px-3 py-2" style={{ background: 'var(--surface-3)', color: 'var(--text)' }}><span className="h-2.5 w-2.5 animate-bounce rounded-full bg-current [animation-delay:-0.2s]" /><span className="h-2.5 w-2.5 animate-bounce rounded-full bg-current [animation-delay:-0.1s]" /><span className="h-2.5 w-2.5 animate-bounce rounded-full bg-current" /></div>
                 ) : (
                   <>
                     {lastUserPrompt ? (
-                      <div className="schedule-user-message rounded-2xl border px-4 py-3 text-left text-[13px] font-semibold leading-6" style={{ borderColor: 'rgba(var(--accent-rgb),0.22)', background: 'rgba(var(--accent-rgb),0.08)', color: 'var(--text)' }}>
-                        <span className="mr-1 font-black text-[color:var(--accent)]">ผู้ใช้:</span>
+                      <div className="mx-auto mb-4 inline-block max-w-full rounded-full px-4 py-1.5 text-[12px] font-normal" style={{ background: 'var(--surface-3)', color: 'var(--muted)' }}>
                         <span className="whitespace-pre-wrap break-words">{lastUserPrompt}</span>
                       </div>
                     ) : null}
-                    <h2 className={`schedule-assistant-message whitespace-pre-wrap break-words font-black text-[color:var(--text)] ${lastUserPrompt ? 'mt-4' : ''}`}>{assistantMessage}</h2>
-                    <p className="schedule-helper-text mt-2 font-semibold text-[color:var(--muted)]">ระบุชื่อวิชา วันเรียน เวลา ห้อง ภาคเรียน และปีการศึกษาได้เลย</p>
-                    <div className="schedule-examples rounded-2xl border font-semibold" style={{ borderColor: 'rgba(var(--accent-rgb),0.24)', background: 'rgba(var(--accent-rgb),0.08)', color: 'var(--text)' }}>
-                      <p><span className="font-black text-[color:var(--accent)]">ตัวอย่าง:</span> {currentAssistantPromptExample}</p>
-                      <p className="mt-2 whitespace-pre-wrap"><span className="font-black text-[color:var(--accent)]">เพิ่มหลายวิชาในครั้งเดียว:</span><br />{currentAssistantPromptMultipleExample}</p>
-                      <p className="mt-2"><span className="font-black text-[color:var(--accent)]">ลบวิชา:</span> พิมพ์ “ลบวิชา ชื่อวิชา” (ลบได้เมื่อไม่มีข้อมูลอื่นเชื่อมโยงอยู่)</p>
-                      <p className="mt-2"><span className="font-black text-[color:var(--accent)]">เพิ่มตารางวิชา:</span> คณิตพื้นฐานคณิตศาสตร์</p>
-                      <p><span className="font-black text-[color:var(--accent)]">ตรวจจากระบบ:</span> พิมพ์ “วิชาไหนอยู่เทอมอะไร”</p>
+                    <h2 className={`schedule-assistant-message whitespace-pre-wrap break-words font-normal leading-relaxed text-[color:var(--text)]`}>{assistantMessage}</h2>
+                    <p className="schedule-helper-text mt-4 inline-block rounded-full px-4 py-2 font-medium text-[color:var(--muted)]" style={{ background: 'var(--surface-3)' }}>ระบุชื่อวิชา วันเรียน เวลา ห้อง ภาคเรียน และปีการศึกษาได้เลย</p>
+                    <details className="group mt-4 text-left">
+                    <summary className="mx-auto inline-flex cursor-pointer list-none items-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] font-medium text-[color:var(--muted)] transition hover:text-[color:var(--accent)]">
+                      <span>ดูตัวอย่างคำสั่ง</span>
+                      <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 transition group-open:rotate-180" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+                    </summary>
+                    <div className="schedule-examples mt-3 rounded-xl border p-4 font-normal" style={{ borderColor: 'var(--border)', background: 'var(--surface-3)', color: 'var(--muted)' }}>
+                      <p><span className="font-medium text-[color:var(--accent)]">ตัวอย่าง:</span> {currentAssistantPromptExample}</p>
+                      <p className="mt-2 whitespace-pre-wrap"><span className="font-medium text-[color:var(--accent)]">เพิ่มหลายวิชาในครั้งเดียว:</span><br />{currentAssistantPromptMultipleExample}</p>
+                      <p className="mt-2"><span className="font-medium text-[color:var(--accent)]">ลบวิชา:</span> พิมพ์ “ลบวิชา ชื่อวิชา” (ลบได้เมื่อไม่มีข้อมูลอื่นเชื่อมโยงอยู่)</p>
+                      <p className="mt-2"><span className="font-medium text-[color:var(--accent)]">เพิ่มตารางวิชา:</span> คณิตพื้นฐานคณิตศาสตร์</p>
+                      <p><span className="font-medium text-[color:var(--accent)]">ตรวจจากระบบ:</span> พิมพ์ “วิชาไหนอยู่เทอมอะไร”</p>
                     </div>
+                    </details>
                   </>
                 )}
               </div>
             </div>
           </section>
+              </div>
+            ) : (
+              <div className="mx-auto flex w-full max-w-4xl flex-col gap-4">
+                {chatMessages.map(message => {
+                  const isAssistant = message.sender_type === 'assistant';
+                  return (
+                    <div key={message.id} className={`flex items-end gap-3 ${isAssistant ? 'justify-start' : 'justify-end'}`}>
+                      {isAssistant ? (
+                        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-[11px] font-medium" style={{ background: 'var(--accent)', color: '#ffffff' }}>AI</span>
+                      ) : null}
+                      <div
+                        className={`w-fit min-w-[5rem] max-w-[80%] rounded-2xl px-4 py-2.5 text-[15px] leading-7 ${isAssistant ? 'rounded-bl-md border border-black/5 bg-white text-[color:var(--text)] shadow-[var(--shadow-soft)]' : 'rounded-br-md'}`}
+                        style={isAssistant ? undefined : { background: 'var(--accent)', color: '#ffffff' }}
+                      >
+                        <p className="whitespace-pre-wrap break-words">{isAssistant ? normalizeAssistantFallback(message.message) : message.message}</p>
+                        <p className="mt-1.5 text-[10px]" style={isAssistant ? { color: 'var(--muted)' } : { color: 'rgba(255,255,255,0.75)' }}>{formatChatMessageTime(message.created_at)}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+                {isThinking ? (
+                  <div className="flex items-end gap-3">
+                    <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-[11px] font-medium" style={{ background: 'var(--accent)', color: '#ffffff' }}>AI</span>
+                    <div className="flex items-center gap-1.5 rounded-3xl rounded-bl-lg border border-black/5 bg-white px-4 py-4 shadow-[var(--shadow-soft)]">
+                      <span className="h-2 w-2 animate-bounce rounded-full bg-[color:var(--accent)] opacity-40 [animation-delay:-0.2s]" />
+                      <span className="h-2 w-2 animate-bounce rounded-full bg-[color:var(--accent)] opacity-70 [animation-delay:-0.1s]" />
+                      <span className="h-2 w-2 animate-bounce rounded-full bg-[color:var(--accent)]" />
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            )}
+          </div>
 
-          <section className="smart-home-composer relative bg-transparent px-0 pt-0 pb-1 md:pb-3 lg:pb-0" ref={attachmentTrayRef}>
-            <div className="mx-auto w-full max-w-4xl">
-              <div className={`mb-3 transition-all duration-200 ${attachmentTrayOpen ? 'translate-y-0 opacity-100' : 'pointer-events-none -translate-y-2 opacity-0'}`}>
+          <section className="smart-home-composer relative z-30 shrink-0 border-t px-4 pb-4 pt-3 sm:px-6 sm:pb-5 lg:px-10" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }} ref={attachmentTrayRef}>
+            <div className="relative mx-auto w-full max-w-4xl">
+              <div className={`absolute bottom-full left-0 mb-3 transition-all duration-200 ${attachmentTrayOpen ? 'translate-y-0 opacity-100' : 'pointer-events-none -translate-y-2 opacity-0'}`}>
                 <div className="inline-flex rounded-[1.6rem] px-5 py-4 ring-1" style={{ background: 'color-mix(in srgb, var(--surface) 94%, transparent)', borderColor: 'var(--border)' }}>
                   <div className="flex items-start gap-5">
                     <label className="flex cursor-pointer flex-col items-center gap-3 text-slate-600 transition hover:text-[color:var(--accent)]">
@@ -981,50 +1035,39 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
               {chatError ? (<div className="mb-3 rounded-2xl bg-rose-50 px-3 py-2 text-[12px] font-medium text-rose-600 ring-1 ring-rose-100">{chatError}</div>) : null}
               {!hasAuthToken && !authLoading ? (<div className="mb-3 rounded-2xl bg-amber-50 px-3 py-2 text-[12px] font-medium text-amber-700 ring-1 ring-amber-100">กรุณาเข้าสู่ระบบใหม่อีกครั้งก่อนใช้งานแชต</div>) : null}
 
-              <div className="relative mb-4 h-[92px] w-full sm:h-[96px]">
-                <div className="smart-home-robot-shadow absolute bottom-1 left-1/2 h-3 w-12 -translate-x-1/2 rounded-[90%] bg-slate-500/70 blur-sm" style={{ animation: 'assistantRobotShadow 3s ease-in-out infinite' }} />
-                <div className="smart-home-robot-anchor absolute bottom-0 left-1/2 z-10 flex flex-col items-center" style={{ animation: 'floatCenter 3s ease-in-out infinite' }}>
-                  <button type="button" onClick={() => setAssistantToolsOpen(open => !open)} className="bg-transparent p-0 transition hover:scale-105" aria-label="เปิดเมนูผู้ช่วย">
-                    <img src={robotImage} alt="AI Robot" className="smart-home-robot h-[64px] w-[60px] object-contain drop-shadow-[0_8px_12px_rgba(15,23,42,0.20)] contrast-[1.06] sm:h-[72px] sm:w-[72px]" />
-                  </button>
-                  <div className={`absolute bottom-[92%] left-1/2 flex -translate-x-1/2 gap-2 whitespace-nowrap transition ${assistantToolsOpen ? 'translate-y-0 opacity-100' : 'pointer-events-none translate-y-2 opacity-0'}`}>
-                    <button type="button" onClick={() => appendAssistantTemplate(`เวลาเรียน [09:00-12:00] ภาคเรียนที่ [1] ปีการศึกษา [ปี]`)} className="rounded-full border border-violet-200 bg-white px-3 py-1.5 text-[11px] font-bold text-violet-600 shadow-sm hover:bg-violet-50">เวลา/เทอม</button>
-                    <button type="button" onClick={() => appendAssistantTemplate('วิชาไหนอยู่เทอมอะไร?')} className="rounded-full border border-teal-200 bg-white px-3 py-1.5 text-[11px] font-bold text-teal-600 shadow-sm hover:bg-teal-50">เช็คตารางเรียน</button>
-                  </div>
-                </div>
-              </div>
-
-              <div className="mx-auto mb-3 flex w-full max-w-[720px] flex-wrap items-stretch justify-center gap-3">
+              <div className="mb-3 flex w-full flex-wrap items-center justify-center gap-2">
                 {[quickActions[0], storageAction].map((action) => (
-                  <button key={action.id} type="button" onClick={() => navigate(action.to)} className="flex min-h-[62px] min-w-0 flex-1 basis-[140px] flex-col items-center justify-center gap-1 rounded-[1rem] border px-2 py-2 text-center transition active:scale-[0.97]" style={{ borderColor: 'var(--border)', background: 'color-mix(in srgb, var(--surface) 94%, transparent)', boxShadow: '0 6px 16px rgba(15,23,42,0.05)' }} title={action.label}>
-                    <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-[0.7rem] border border-white/80 ${action.iconClassName ?? ''}`} style={action.tileStyle}>{action.icon}</span>
-                    <span className="line-clamp-2 w-full text-center text-[11px] font-semibold leading-tight text-[color:var(--text)]">{action.label}</span>
+                  <button key={action.id} type="button" onClick={() => navigate(action.to)} className="flex items-center gap-2.5 rounded-full border border-black/5 bg-white py-1.5 pl-2 pr-5 text-[14px] transition-all duration-300 hover:-translate-y-0.5" style={{ boxShadow: 'var(--shadow-soft)' }} title={action.label}>
+                    <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full ${action.iconClassName ?? ''}`} style={action.tileStyle}>{action.icon}</span>
+                    <span className="whitespace-nowrap font-medium text-[color:var(--text)]">{action.label}</span>
                   </button>
                 ))}
-                <button type="button" onClick={() => appendAssistantTemplate(scheduleTemplate)} disabled={isThinking} className="group inline-flex min-h-[62px] min-w-0 flex-1 basis-[140px] items-center justify-center gap-2 rounded-full border border-[color:rgba(var(--accent-rgb),0.20)] bg-white px-3 py-2 text-[11px] font-bold text-[color:var(--accent)] shadow-[0_8px_18px_rgba(var(--accent-rgb),0.10)] transition hover:-translate-y-0.5 hover:bg-[color:var(--accent-soft)] focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-[color:rgba(var(--accent-rgb),0.16)] disabled:cursor-not-allowed disabled:opacity-50 sm:px-4 sm:text-[12px]" aria-label="เพิ่มวิชาเดียว">
-                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z" /><path d="M14 3v6h6M8 13h8M8 17h5" /></svg><span className="hidden sm:inline">เพิ่มวิชาเดียว</span><span className="sm:hidden">เพิ่มวิชาเดียว</span>
+                <button type="button" onClick={() => appendAssistantTemplate(scheduleTemplate)} disabled={isThinking} className="group inline-flex items-center gap-2.5 rounded-full border border-black/5 bg-white px-5 py-2 text-[14px] font-medium text-[color:var(--text)] transition-all duration-300 hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-50" style={{ boxShadow: 'var(--shadow-soft)' }} aria-label="เพิ่มวิชาเดียว">
+                  <svg viewBox="0 0 24 24" className="h-[18px] w-[18px] text-[color:var(--accent)]" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z" /><path d="M14 3v6h6M8 13h8M8 17h5" /></svg><span className="hidden sm:inline">เพิ่มวิชาเดียว</span><span className="sm:hidden">เพิ่มวิชาเดียว</span>
                 </button>
-                <button type="button" onClick={() => appendAssistantTemplate(multipleScheduleTemplate)} disabled={isThinking} className="group inline-flex min-h-[62px] min-w-0 flex-1 basis-[140px] items-center justify-center gap-2 rounded-full border border-[color:rgba(var(--accent-rgb),0.20)] bg-white px-3 py-2 text-[11px] font-bold text-[color:var(--accent)] shadow-[0_8px_18px_rgba(var(--accent-rgb),0.10)] transition hover:-translate-y-0.5 hover:bg-[color:var(--accent-soft)] focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-[color:rgba(var(--accent-rgb),0.16)] disabled:cursor-not-allowed disabled:opacity-50 sm:px-4 sm:text-[12px]" aria-label="เพิ่มหลายวิชา">
-                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1" /><rect x="13" y="4" width="7" height="7" rx="1" /><rect x="4" y="13" width="7" height="7" rx="1" /><rect x="13" y="13" width="7" height="7" rx="1" /></svg><span>เพิ่มหลายวิชา</span>
+                <button type="button" onClick={() => appendAssistantTemplate(multipleScheduleTemplate)} disabled={isThinking} className="group inline-flex items-center gap-2.5 rounded-full border border-black/5 bg-white px-5 py-2 text-[14px] font-medium text-[color:var(--text)] transition-all duration-300 hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-50" style={{ boxShadow: 'var(--shadow-soft)' }} aria-label="เพิ่มหลายวิชา">
+                  <svg viewBox="0 0 24 24" className="h-[18px] w-[18px] text-[color:var(--accent)]" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1" /><rect x="13" y="4" width="7" height="7" rx="1" /><rect x="4" y="13" width="7" height="7" rx="1" /><rect x="13" y="13" width="7" height="7" rx="1" /></svg><span>เพิ่มหลายวิชา</span>
                 </button>
               </div>
-
               <div className="lg:flex lg:items-end lg:gap-4">
-              <form onSubmit={handleAssistantSubmit} className="flex items-center gap-2 sm:gap-4 lg:flex-1">
-                <div className="smart-home-input-shell flex min-h-[120px] flex-1 items-center rounded-[1.75rem] border px-6 py-4 shadow-[0_12px_28px_rgba(15,23,42,0.05)]" style={{ background: 'color-mix(in srgb, var(--surface) 94%, transparent)', borderColor: 'rgba(var(--accent-rgb),0.26)', boxShadow: lowFxMode ? '0 10px 20px rgba(var(--accent-rgb),0.08)' : '0 18px 36px rgba(var(--accent-rgb),0.10)', backdropFilter: lowFxMode ? undefined : 'blur(8px)' }}>
-                  <button type="button" onClick={() => setAttachmentTrayOpen(prev => !prev)} className="smart-home-tool-button mr-4 flex h-12 w-12 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-50 hover:text-[color:var(--accent)]" aria-label="แนบไฟล์และเครื่องมือ">
-                    {attachmentTrayOpen ? (<svg viewBox="0 0 24 24" className="h-7 w-7" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>) : (<svg viewBox="0 0 24 24" className="h-7 w-7" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>)}
+              <form onSubmit={handleAssistantSubmit} className="flex items-end gap-2 sm:gap-4 lg:flex-1">
+                <div className="smart-home-input-shell flex min-h-[60px] flex-1 items-end rounded-[24px] border p-2" style={{ background: 'var(--surface)', borderColor: 'rgba(0,0,0,0.10)', boxShadow: 'var(--shadow-float)' }}>
+                  <button type="button" onClick={() => setAttachmentTrayOpen(prev => !prev)} className="smart-home-tool-button mr-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[color:var(--muted)] transition hover:bg-slate-100" aria-label="แนบไฟล์และเครื่องมือ">
+                    {attachmentTrayOpen ? (<svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>) : (<svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>)}
                   </button>
-                  <textarea ref={assistantInputRef} value={inputText} onChange={event => setInputText(event.target.value)} placeholder={currentAssistantPromptExample} disabled={isThinking} rows={2} className="max-h-40 min-h-[72px] flex-1 resize-none bg-transparent py-2 text-[16px] font-medium leading-7 text-[color:var(--text)] outline-none placeholder:text-slate-400" onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitAssistantPrompt(inputText); } }} />
-                  <button type="button" onClick={() => { if (isListening) { stopVoiceInput(); } else { startVoiceInput(); } }} disabled={!voiceInputSupported || isThinking} className={`smart-home-mic-button ml-4 flex h-12 w-12 items-center justify-center rounded-full transition disabled:cursor-not-allowed disabled:opacity-50 ${isListening ? 'bg-rose-50 text-rose-500 shadow-[0_10px_24px_rgba(244,63,94,0.15)]' : 'text-slate-400 hover:bg-slate-50 hover:text-[color:var(--accent)]'}`} aria-label={isListening ? 'หยุดฟังเสียง' : 'พูดเป็นข้อความ'} title={!voiceInputSupported ? 'อุปกรณ์นี้ไม่รองรับการพูดเป็นข้อความ' : isListening ? 'กำลังฟังอยู่' : 'พูดเป็นข้อความ'}>
+                  <textarea ref={assistantInputRef} value={inputText} onChange={event => setInputText(event.target.value)} placeholder={currentAssistantPromptExample} disabled={isThinking} rows={1} style={{ maxHeight: `${ASSISTANT_INPUT_MAX_HEIGHT}px` }} className="min-h-[28px] flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1 text-[14px] font-normal leading-7 text-[color:var(--text)] outline-none placeholder:text-[color:var(--muted)]" onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitAssistantPrompt(inputText); } }} />
+                  <button type="button" onClick={() => { if (isListening) { stopVoiceInput(); } else { startVoiceInput(); } }} disabled={!voiceInputSupported || isThinking} className={`smart-home-mic-button ml-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition disabled:cursor-not-allowed disabled:opacity-50 ${isListening ? 'bg-rose-50 text-rose-500' : 'text-[color:var(--muted)] hover:bg-slate-100'}`} aria-label={isListening ? 'หยุดฟังเสียง' : 'พูดเป็นข้อความ'} title={!voiceInputSupported ? 'อุปกรณ์นี้ไม่รองรับการพูดเป็นข้อความ' : isListening ? 'กำลังฟังอยู่' : 'พูดเป็นข้อความ'}>
                     {isListening ? (<span className="relative flex h-3 w-3"><span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-current/35" /><span className="relative inline-flex h-3 w-3 rounded-full bg-current" /></span>) : null}
                     <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 10v2a7 7 0 0 0 14 0v-2" /><path d="M12 19v2" /></svg>
                   </button>
                 </div>
-                <button type="submit" disabled={!canSendChat} className="smart-home-send flex h-[64px] w-[64px] shrink-0 items-center justify-center rounded-full border text-white transition hover:scale-[1.02] disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-300" style={{ borderColor: 'rgba(var(--accent-rgb),0.24)', background: 'linear-gradient(135deg, rgba(var(--accent-rgb),0.98), rgba(var(--accent-rgb),0.78))', boxShadow: '0 14px 26px rgba(var(--accent-rgb),0.18)' }}>
-                  <svg viewBox="0 0 24 24" className="h-7 w-7" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M22 2 11 13" /><path d="M22 2 15 22 11 13 2 9 22 2Z" /></svg>
+                <button type="submit" disabled={!canSendChat} className="smart-home-send ml-2 flex h-11 w-11 shrink-0 items-center justify-center rounded-full transition active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-300" style={{ background: 'var(--accent)', color: '#ffffff', boxShadow: '0 4px 14px rgba(var(--accent-rgb),0.25)' }}>
+                  <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M22 2 11 13" /><path d="M22 2 15 22 11 13 2 9 22 2Z" /></svg>
                 </button>
               </form>
+              </div>
+              <div className="mt-3 text-center">
+                <span className="text-[11px] font-medium text-[color:var(--muted)]">Smart Room อาจแสดงข้อมูลที่ไม่ถูกต้อง โปรดตรวจสอบข้อมูลสำคัญอีกครั้ง</span>
               </div>
             </div>
           </section>
