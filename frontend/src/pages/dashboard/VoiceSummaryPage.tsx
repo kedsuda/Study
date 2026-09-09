@@ -1,16 +1,14 @@
 import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useLocation } from 'react-router-dom';
 import { format, isValid, parseISO } from 'date-fns';
 import { th } from 'date-fns/locale';
+import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { api } from '../../services/api';
 import { getLastSubjectKey } from '../../constants/storage';
 import { aiApi } from "../../services/aiApi";
-// import { useAuth } from '../../context/AuthContext';
 import { useAuth } from '../../context/AuthContext';
-import { useSemesterOptions } from '../../hooks/useSemesterOptions';
+import { useDefaultSemesterSelection, useSemesterOptions } from '../../hooks/useSemesterOptions';
 import { filterBySemester, toNumberOrNull } from '../../utils/semester';
 import { subscribeSubjectsUpdated } from '../../utils/subjectSync';
-
 
 type VoiceSummaryResponse = {
   transcript?: string;
@@ -31,6 +29,11 @@ type SubjectOption = {
   academic_year?: number | null;
 };
 
+type MoodOption = {
+  value: string;
+  label: string;
+};
+
 type ProcessingSource = 'upload' | 'record' | null;
 
 type SavedAudioSummary = {
@@ -47,6 +50,8 @@ type SavedAudioSummary = {
 type VoiceSummaryPageProps = {
   embedded?: boolean;
   initialSection?: 'upload' | 'record';
+  summaryPeriod?: SummaryPeriod;
+  onSummaryPeriodChange?: (period: SummaryPeriod) => void;
   onSummaryReady?: (payload: {
     summary: string;
     transcript?: string;
@@ -54,13 +59,55 @@ type VoiceSummaryPageProps = {
   }) => void;
 };
 
+type ConfirmState = {
+  title: string;
+  description: string;
+  confirmLabel: string;
+  onConfirm: () => Promise<void> | void;
+};
+
 const voiceSummaryListEndpoint = '/ai/summaries/audio';
+const voiceSummaryPeriodStorageKey = 'slt::voice-summary-period';
+const summaryPeriodOptions = [
+  { value: 'daily', label: 'รายวัน' },
+  { value: 'weekly', label: 'รายสัปดาห์' },
+  { value: 'monthly', label: 'รายเดือน' },
+] as const;
+const moodOptions: MoodOption[] = [
+  { value: 'สนุก', label: 'สนุก' },
+  { value: 'เฉย ๆ', label: 'เฉย ๆ' },
+  { value: 'เครียด', label: 'เครียด' },
+];
+type SummaryPeriod = (typeof summaryPeriodOptions)[number]['value'];
 const LARGE_UPLOAD_THRESHOLD_BYTES = 8 * 1024 * 1024; // 8MB
+const DIRECT_AUDIO_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024;
+const RECORDING_TIMESLICE_MS = 1000;
 
 const formatTimer = (value: number) => {
   const minutes = Math.floor(value / 60);
   const seconds = value % 60;
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+};
+
+const formatFileSize = (bytes: number) => {
+  if (bytes <= 0) return '0 MB';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
+};
+
+const extensionFromMimeType = (mimeType?: string) => {
+  const normalized = (mimeType ?? '').toLowerCase();
+  if (normalized.includes('ogg')) return 'ogg';
+  if (normalized.includes('mp4')) return 'm4a';
+  if (normalized.includes('mpeg')) return 'mp3';
+  if (normalized.includes('wav')) return 'wav';
+  return 'webm';
 };
 
 const formatSummaryTime = (value?: string) => {
@@ -76,31 +123,59 @@ const truncateText = (value: string, max = 160) => {
   if (normalized.length <= max) return normalized;
   return `${normalized.slice(0, Math.max(0, max - 3))}...`;
 };
-const buildRealtimeSummary = (value: string) => {
+const splitTranscriptSegments = (value: string) => {
   const normalized = value.replace(/\s+/g, ' ').trim();
-  if (!normalized) return '';
-  const segments = normalized
-    .split(/[.!?。\n]+/g)
+  if (!normalized) return [];
+
+  const roughSegments = normalized
+    .split(/(?<=[.!?。])\s+|\n+/g)
     .map(item => item.trim())
-    .filter(item => item.length >= 12)
-    .slice(0, 4);
-  if (!segments.length) return normalized.slice(0, 220);
-  return segments.map((segment, index) => `${index + 1}. ${segment}`).join('\n');
+    .filter(Boolean);
+
+  const segments = roughSegments.length > 1
+    ? roughSegments
+    : normalized
+        .split(/(?:ครับ|ค่ะ|นะครับ|นะคะ|แล้วก็|จากนั้น|ต่อมา|เพราะฉะนั้น|ดังนั้น)/g)
+        .map(item => item.trim())
+        .filter(Boolean);
+
+  return segments
+    .map(item => item.replace(/\s+/g, ' ').trim())
+    .filter(item => item.length >= 12);
+};
+
+const makeAudioArchiveKey = (title?: string | null, summary?: string | null, transcript?: string | null) =>
+  `${(title ?? 'สรุปจากเสียง').trim()}::${((summary ?? '').trim() || (transcript ?? '').trim())}`;
+
+const uniqueLatestSegments = (segments: string[], limit: number) => {
+  const seen = new Set<string>();
+  const latest: string[] = [];
+
+  for (let index = segments.length - 1; index >= 0 && latest.length < limit; index -= 1) {
+    const segment = segments[index];
+    const key = segment.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '').slice(0, 80);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    latest.unshift(segment);
+  }
+
+  return latest;
 };
 
 const buildDocumentStyleSummaryFallback = (value: string) => {
   const normalized = value.replace(/\s+/g, ' ').trim();
   if (!normalized) return '';
-  const segments = normalized
-    .split(/[.!?。\n]+/g)
-    .map(item => item.trim())
-    .filter(item => item.length >= 12)
-    .slice(0, 6);
+  const segments = splitTranscriptSegments(normalized);
+  const overviewSegments = segments.slice(0, 2);
+  const latestSegments = uniqueLatestSegments(segments, 5);
   if (!segments.length) return normalized.slice(0, 260);
 
   return [
-    'ประเด็นสำคัญจากไฟล์เสียง:',
-    ...segments.map(segment => `- ${segment}`),
+    'สรุปภาพรวม:',
+    overviewSegments.length ? overviewSegments.join(' ') : normalized.slice(0, 220),
+    '',
+    'ใจความสำคัญล่าสุด:',
+    ...latestSegments.map(segment => `- ${segment}`),
   ].join('\n');
 };
 
@@ -136,7 +211,6 @@ const isLowConfidenceTranscriptError = (message?: string | null) => {
 };
 
 const encodeWavChunk = (audioBuffer: AudioBuffer, startSample: number, endSample: number) => {
-  // Google Speech synchronous recognize is most stable with mono PCM.
   const channels = 1;
   const sampleRate = audioBuffer.sampleRate;
   const frameCount = endSample - startSample;
@@ -194,35 +268,22 @@ type ExpandableTextProps = {
 
 const ExpandableText = ({
   text,
-  previewChars = 280,
   className = '',
-  buttonClassName = '',
   emptyText = '-',
 }: ExpandableTextProps) => {
-  const [expanded, setExpanded] = useState(false);
   const normalizedText = text?.trim() ?? '';
-  const shouldTruncate = normalizedText.length > previewChars;
-  const previewText = shouldTruncate ? `${normalizedText.slice(0, Math.max(0, previewChars)).trimEnd()}...` : normalizedText;
 
-  return (
-    <div>
-      <p className={className}>{normalizedText ? (expanded ? normalizedText : previewText) : emptyText}</p>
-      {shouldTruncate ? (
-        <button
-          type="button"
-          onClick={() => setExpanded(value => !value)}
-          className={buttonClassName}
-        >
-          {expanded ? 'ย่อข้อความ' : 'ดูข้อความเพิ่มเติม'}
-        </button>
-      ) : null}
-    </div>
-  );
+  return <p className={className}>{normalizedText || emptyText}</p>;
 };
 
-export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryReady }: VoiceSummaryPageProps) => {
+export const VoiceSummaryPage = ({
+  embedded = false,
+  initialSection,
+  summaryPeriod: controlledSummaryPeriod,
+  onSummaryPeriodChange,
+  onSummaryReady,
+}: VoiceSummaryPageProps) => {
   const { user } = useAuth();
-  const location = useLocation();
   const [isRecording, setIsRecording] = useState(false);
   const [timer, setTimer] = useState(0);
   const [statusText, setStatusText] = useState('อัปโหลดไฟล์เสียงที่บันทึกไว้ หรือกดอัดใหม่เพื่อเริ่มสรุป');
@@ -236,26 +297,47 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
   const [isDragging, setIsDragging] = useState(false);
   const [processingSource, setProcessingSource] = useState<ProcessingSource>(null);
   const [liveTranscript, setLiveTranscript] = useState('');
-  const [liveSummary, setLiveSummary] = useState('');
+  const [recordedBytes, setRecordedBytes] = useState(0);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [subjects, setSubjects] = useState<SubjectOption[]>([]);
   const [selectedSemesterKey, setSelectedSemesterKey] = useState('all');
   const [selectedSubjectId, setSelectedSubjectId] = useState('');
   const [analysisType, setAnalysisType] = useState<'summary' | 'career'>('summary');
+  const [selectedMood, setSelectedMood] = useState('');
+  const [summaryPeriod, setSummaryPeriod] = useState<SummaryPeriod>(() => {
+    const saved = localStorage.getItem(voiceSummaryPeriodStorageKey);
+    return summaryPeriodOptions.some(option => option.value === saved) ? saved as SummaryPeriod : 'daily';
+  });
+  const activeSummaryPeriod = controlledSummaryPeriod ?? summaryPeriod;
+  
+
+const [isMoodDropdownOpen, setIsMoodDropdownOpen] = useState(false);
+  const moodDropdownRef = useRef<HTMLDivElement | null>(null);
+
+
+
   const [savedSummaries, setSavedSummaries] = useState<SavedAudioSummary[]>([]);
+  const [archivedSummaryKeys, setArchivedSummaryKeys] = useState<Set<string>>(() => new Set());
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedError, setSavedError] = useState<string | null>(null);
   const [deletingSummaryId, setDeletingSummaryId] = useState<number | null>(null);
   const [archivingSummaryId, setArchivingSummaryId] = useState<number | null>(null);
   const [isDarkTheme, setIsDarkTheme] = useState(false);
+  const [confirmState, setConfirmState] = useState<ConfirmState | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   const lastSubjectKey = useMemo(() => getLastSubjectKey(user?.id), [user?.id]);
   const semesterOptions = useSemesterOptions();
+  useDefaultSemesterSelection(semesterOptions, selectedSemesterKey, setSelectedSemesterKey);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const speechRecognitionRef = useRef<any>(null);
   const timerRef = useRef<number | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const recordedBytesRef = useRef(0);
+  const recorderMimeTypeRef = useRef('audio/webm');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const liveTranscriptRef = useRef('');
+  const committedSpeechTranscriptRef = useRef('');
 
   const filteredSubjects = useMemo(() => filterBySemester(subjects, selectedSemesterKey), [subjects, selectedSemesterKey]);
   const selectableSubjects = useMemo(
@@ -302,13 +384,30 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
     };
   }, []);
 
+
+
+
+
+useEffect(() => {
+    if (!isMoodDropdownOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (moodDropdownRef.current?.contains(event.target as Node)) return;
+      setIsMoodDropdownOpen(false);
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => document.removeEventListener('pointerdown', handlePointerDown);
+  }, [isMoodDropdownOpen]);
+
+
+
+
   useEffect(() => {
-    if (!location.hash) return;
-    const targetId = location.hash.replace(/^#/, '');
+    if (typeof window === 'undefined' || !window.location.hash) return;
+    const targetId = window.location.hash.replace(/^#/, '');
     const target = document.getElementById(targetId);
     if (!target) return;
     target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }, [location.hash]);
+  }, []);
 
   useEffect(() => {
     if (!embedded || !initialSection) return;
@@ -350,12 +449,10 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
   }, []);
   const leftPanelLayoutClass = embedded
     ? 'grid gap-6'
-    : (showUploadSection && showRecordSection ? 'grid gap-6 xl:grid-cols-2' : 'space-y-6');
+    : 'space-y-6';
   const mainLayoutClass = embedded
-    ? 'grid gap-6 2xl:grid-cols-[320px,minmax(0,1fr)]'
-    : 'grid gap-6 xl:grid-cols-[1.2fr,0.8fr]';
-  const uploadPreviewText = truncateText(uploadResult?.summary || uploadResult?.transcript || '', 120);
-  const recordPreviewText = truncateText(recordResult?.summary || recordResult?.transcript || '', 120);
+    ? 'grid gap-6'
+    : 'grid gap-6';
 
   const fetchSubjects = async () => {
     try {
@@ -402,6 +499,10 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
   }, [lastSubjectKey]);
 
   useEffect(() => {
+    localStorage.setItem(voiceSummaryPeriodStorageKey, activeSummaryPeriod);
+  }, [activeSummaryPeriod]);
+
+  useEffect(() => {
     if (selectedSubjectId && selectableSubjects.some(subject => String(subject.id) === selectedSubjectId)) return;
     const fallback = selectableSubjects[0];
     if (!fallback) {
@@ -431,6 +532,36 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
     }
   }, []);
 
+  const saveBrowserAudioSummary = async (
+    result: VoiceSummaryResponse,
+    source: Exclude<ProcessingSource, null>,
+    title?: string | null
+  ) => {
+    if (!selectedSubjectId || analysisType === 'career') return null;
+
+    const summary = String(result.summary ?? result.analysis ?? '').trim();
+    const transcript = String(result.transcript ?? '').trim();
+    if (!summary && !transcript) return null;
+
+    try {
+      const response = await api.post<SavedAudioSummary>('/ai/summaries/audio', {
+        subject_id: selectedSubjectId,
+        source_mode: source,
+        title: title?.trim() || (source === 'record' ? 'สรุปจากการอัดสด' : selectedFileName || 'สรุปจากไฟล์เสียง'),
+        transcript,
+        summary,
+        summary_period: activeSummaryPeriod,
+        mood: selectedMood || null,
+      });
+      const saved = response.data;
+      setSavedSummaries(prev => [saved, ...prev.filter(item => item.id !== saved.id)].slice(0, 30));
+      return saved;
+    } catch (err: any) {
+      setSavedError(err.response?.data?.message ?? 'บันทึกสรุปจากเสียงไม่สำเร็จ');
+      return null;
+    }
+  };
+
   useEffect(() => {
     if (!selectedSubjectId) {
       setSavedSummaries([]);
@@ -450,6 +581,34 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
   }, [selectedSubjectId, fetchSavedSummaries]);
 
   useEffect(() => {
+    if (!selectedSubjectId) {
+      setArchivedSummaryKeys(new Set());
+      return;
+    }
+
+    let cancelled = false;
+    const loadArchivedAudioSummaries = async () => {
+      try {
+        const response = await api.get(`/subjects/${selectedSubjectId}/summary-archives`);
+        const payload = Array.isArray(response.data) ? response.data : response.data?.data;
+        const items = Array.isArray(payload) ? payload : [];
+        if (cancelled) return;
+
+        setArchivedSummaryKeys(new Set(
+          items.map((item: any) => makeAudioArchiveKey(item?.name, item?.description))
+        ));
+      } catch {
+        if (!cancelled) setArchivedSummaryKeys(new Set());
+      }
+    };
+
+    void loadArchivedAudioSummaries();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSubjectId]);
+
+  useEffect(() => {
     if (embedded) return;
     if (!selectedSubjectId) return;
     if (isLoading || savedLoading) return;
@@ -466,7 +625,6 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
       const currSummary = current?.summary ?? '';
       const currTranscript = current?.transcript ?? '';
 
-      // ถ้ามีผลลัพธ์แสดงอยู่แล้ว ไม่บังคับทับทันที
       if (current) {
         return false;
       }
@@ -495,8 +653,19 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
     fileInputRef.current?.click();
   };
 
+  const updateLiveTranscript = (value: string) => {
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    liveTranscriptRef.current = normalized;
+    setLiveTranscript(normalized);
+  };
+
+  const resetLiveTranscript = () => {
+    liveTranscriptRef.current = '';
+    committedSpeechTranscriptRef.current = '';
+    setLiveTranscript('');
+  };
+
   const pushBellNotification = async (input: { title: string; message: string }) => {
-    // Best-effort: if backend fails, local notification already covers UX.
     try {
       const payload: Record<string, any> = {
         type: 'voice_summary',
@@ -514,42 +683,66 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
     }
   };
 
-  const deleteSavedSummary = async (item: SavedAudioSummary) => {
-    const confirmed = window.confirm(`ต้องการลบ "${item.title ?? 'สรุปจากเสียง'}" ใช่หรือไม่?`);
-    if (!confirmed) return;
+  const openConfirmDialog = (config: { title: string; description: string; confirmLabel: string; onConfirm: () => Promise<void> | void }) => {
+    setConfirmState(config);
+    setConfirmBusy(false);
+  };
 
-    setDeletingSummaryId(item.id);
-    setSavedError(null);
+  const handleConfirmDialogCancel = () => {
+    setConfirmState(null);
+    setConfirmBusy(false);
+  };
+
+  const handleConfirmDialogConfirm = async () => {
+    if (!confirmState) return;
+    setConfirmBusy(true);
     try {
-      if (item.id < 0) {
-        setSavedSummaries(prev => prev.filter(summary => summary.id !== item.id));
-      } else {
-        await api.delete(`/ai/summaries/audio/${item.id}`);
-        setSavedSummaries(prev => prev.filter(summary => summary.id !== item.id));
-      }
-
-      const targetSetter = item.source_mode === 'record' ? setRecordResult : setUploadResult;
-      const targetResult = item.source_mode === 'record' ? recordResult : uploadResult;
-      if (
-        targetResult &&
-        (targetResult.summary ?? '') === (item.summary ?? '') &&
-        (targetResult.transcript ?? '') === (item.transcript ?? '')
-      ) {
-        targetSetter(null);
-      }
-      setStatusText('ลบสรุปจากเสียงเรียบร้อยแล้ว');
-    } catch (err: any) {
-      setSavedError(err.response?.data?.message ?? 'ลบสรุปจากเสียงไม่สำเร็จ');
+      await confirmState.onConfirm();
     } finally {
-      setDeletingSummaryId(null);
+      setConfirmBusy(false);
+      setConfirmState(null);
     }
+  };
+
+  const deleteSavedSummary = async (item: SavedAudioSummary) => {
+    openConfirmDialog({
+      title: 'ลบสรุปจากเสียง',
+      description: `ต้องการลบ "${item.title ?? 'สรุปจากเสียง'}" ใช่หรือไม่?`,
+      confirmLabel: 'ลบสรุป',
+      onConfirm: async () => {
+        setDeletingSummaryId(item.id);
+        setSavedError(null);
+        try {
+          if (item.id < 0) {
+            setSavedSummaries(prev => prev.filter(summary => summary.id !== item.id));
+          } else {
+            await api.delete(`/ai/summaries/audio/${item.id}`);
+            setSavedSummaries(prev => prev.filter(summary => summary.id !== item.id));
+          }
+
+          const targetSetter = item.source_mode === 'record' ? setRecordResult : setUploadResult;
+          const targetResult = item.source_mode === 'record' ? recordResult : uploadResult;
+          if (
+            targetResult &&
+            (targetResult.summary ?? '') === (item.summary ?? '') &&
+            (targetResult.transcript ?? '') === (item.transcript ?? '')
+          ) {
+            targetSetter(null);
+          }
+          setStatusText('ลบสรุปจากเสียงเรียบร้อยแล้ว');
+        } catch (err: any) {
+          setSavedError(err.response?.data?.message ?? 'ลบสรุปจากเสียงไม่สำเร็จ');
+        } finally {
+          setDeletingSummaryId(null);
+        }
+      },
+    });
   };
 
   const clearResult = (source: Exclude<ProcessingSource, null>) => {
     if (source === 'record') {
       setRecordResult(null);
-      setLiveTranscript('');
-      setLiveSummary('');
+      resetLiveTranscript();
     } else {
       setUploadResult(null);
     }
@@ -565,27 +758,47 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
   }) => {
     if (!selectedSubjectId) {
       setSavedError('กรุณาเลือกวิชาก่อนเก็บถาวร');
+      setError('กรุณาเลือกวิชาก่อนเก็บถาวร');
+      setStatusText('กรุณาเลือกวิชา ก่อนเก็บสรุปถาวร');
       return;
     }
 
     const content = (item.summary ?? '').trim() || (item.transcript ?? '').trim();
     if (!content) {
       setSavedError('ยังไม่มีเนื้อหาสำหรับเก็บถาวร');
+      setError('ยังไม่มีเนื้อหาสำหรับเก็บถาวร');
+      setStatusText('ยังไม่มีเนื้อหาสำหรับเก็บถาวร');
+      return;
+    }
+
+    const archiveTitle = item.title?.trim() || 'สรุปจากเสียง';
+    const archiveContentKey = makeAudioArchiveKey(archiveTitle, content);
+    if (archivedSummaryKeys.has(archiveContentKey)) {
+      setStatusText('สรุปจากเสียงนี้ถูกเก็บถาวรแล้ว');
       return;
     }
 
     const archiveKey = Number.isFinite(Number(item.id)) ? Number(item.id) : -1;
     setArchivingSummaryId(archiveKey);
     setSavedError(null);
+    setError(null);
     try {
-      await api.post(`/subjects/${selectedSubjectId}/summary-archives`, {
-        name: item.title?.trim() || 'สรุปจากเสียง',
+      const response = await api.post(`/subjects/${selectedSubjectId}/summary-archives`, {
+        name: archiveTitle,
         description: content,
       });
+      const archived = response.data?.data ?? response.data;
+      if (!archived?.id) {
+        throw new Error('ระบบยังไม่ยืนยันการบันทึกลงคลังเก็บถาวร');
+      }
+      setArchivedSummaryKeys(prev => new Set(prev).add(archiveContentKey));
       window.dispatchEvent(new Event('slt:archive-refresh'));
       setStatusText('เก็บถาวรสรุปจากเสียงเรียบร้อยแล้ว');
+      if (!embedded) {
+        window.location.href = '/document-summary?tab=archived';
+      }
     } catch (err: any) {
-      setSavedError(err.response?.data?.message ?? 'เก็บถาวรสรุปจากเสียงไม่สำเร็จ');
+      setSavedError(err.response?.data?.message ?? err.message ?? 'เก็บถาวรสรุปจากเสียงไม่สำเร็จ');
     } finally {
       setArchivingSummaryId(null);
     }
@@ -683,13 +896,19 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
       const recorder = supportedMimeType
         ? new MediaRecorder(stream, { mimeType: supportedMimeType })
         : new MediaRecorder(stream);
+      const recorderMimeType = recorder.mimeType || supportedMimeType || 'audio/webm';
       const SpeechRecognitionCtor =
         (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition;
       chunksRef.current = [];
+      recordedBytesRef.current = 0;
+      recorderMimeTypeRef.current = recorderMimeType;
+      setRecordedBytes(0);
 
       recorder.ondataavailable = event => {
         if (event.data.size > 0) {
           chunksRef.current.push(event.data);
+          recordedBytesRef.current += event.data.size;
+          setRecordedBytes(recordedBytesRef.current);
         }
       };
 
@@ -697,16 +916,20 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
         stream.getTracks().forEach(track => track.stop());
         mediaRecorderRef.current = null;
         if (chunksRef.current.length) {
-          const audioBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
-          const recordedFile = new File([audioBlob], 'recording.webm', {
-            type: 'audio/webm',
+          const audioBlob = new Blob(chunksRef.current, { type: recorderMimeTypeRef.current });
+          const extension = extensionFromMimeType(recorderMimeTypeRef.current);
+          const recordedFile = new File([audioBlob], `recording.${extension}`, {
+            type: recorderMimeTypeRef.current,
           });
           processAudio(recordedFile, 'record');
+        } else {
+          setStatusText('ไม่พบข้อมูลเสียงที่บันทึก กรุณาลองอัดใหม่');
         }
       };
 
-      recorder.start();
+      recorder.start(RECORDING_TIMESLICE_MS);
       mediaRecorderRef.current = recorder;
+      resetLiveTranscript();
       if (SpeechRecognitionCtor) {
         try {
           const recognition = new SpeechRecognitionCtor();
@@ -714,13 +937,24 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
           recognition.continuous = true;
           recognition.interimResults = true;
           recognition.onresult = (event: any) => {
-            const fullText = Array.from(event.results ?? [])
-              .map((item: any) => item?.[0]?.transcript ?? '')
-              .join(' ')
-              .replace(/\s+/g, ' ')
-              .trim();
-            setLiveTranscript(fullText);
-            setLiveSummary(buildRealtimeSummary(fullText));
+            let committed = committedSpeechTranscriptRef.current;
+            const interimParts: string[] = [];
+
+            for (let index = event.resultIndex ?? 0; index < (event.results?.length ?? 0); index += 1) {
+              const result = event.results[index];
+              const transcript = String(result?.[0]?.transcript ?? '').replace(/\s+/g, ' ').trim();
+              if (!transcript) continue;
+
+              if (result.isFinal) {
+                committed = [committed, transcript].filter(Boolean).join(' ');
+              } else {
+                interimParts.push(transcript);
+              }
+            }
+
+            committed = committed.replace(/\s+/g, ' ').trim();
+            committedSpeechTranscriptRef.current = committed;
+            updateLiveTranscript([committed, ...interimParts].filter(Boolean).join(' '));
           };
           recognition.onerror = () => {
             setStatusText('กำลังบันทึกเสียง... (ถอดเสียงเรียลไทม์ใช้งานไม่ได้ชั่วคราว)');
@@ -746,9 +980,7 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
       setError(null);
       setRecordResult(null);
       setSelectedFileName(null);
-      setLiveTranscript('');
-      setLiveSummary('');
-      setStatusText('กำลังบันทึกเสียง... กดอีกครั้งเพื่อหยุด');
+      setStatusText('กำลังบันทึกและถอดเสียงแบบเรียลไทม์... กดอีกครั้งเพื่อหยุดและบันทึก');
 
       timerRef.current = window.setInterval(() => {
         setTimer(prev => prev + 1);
@@ -787,8 +1019,7 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
     if (!text) return '';
 
     const formData = new FormData();
-    const txtBlob = new Blob([text], { type: 'text/plain' });
-    formData.append('file', txtBlob, 'audio-transcript.txt');
+    formData.append('text', text);
 
     try {
       const response = await api.post('/ai/summarize/document', formData);
@@ -811,8 +1042,6 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
     try {
       const arrayBuffer = await blob.arrayBuffer();
       const decoded = await audioContext.decodeAudioData(arrayBuffer.slice(0));
-      // Google Speech synchronous recognize supports about 10MB/request.
-      // Use a conservative raw WAV target to avoid base64/request overhead issues.
       const targetBytesPerChunk = 4 * 1024 * 1024; // 4MB
       const bytesPerSample = 2;
       const bytesPerFrame = decoded.numberOfChannels * bytesPerSample;
@@ -833,9 +1062,28 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
         formData.append('file', wavBlob, `audio-chunk-${chunkIndex + 1}.wav`);
 
         setStatusText(`กำลังถอดเสียงช่วงที่ ${chunkIndex + 1}/${totalChunks}...`);
-        const response = await api.post('/ai/transcribe/audio', formData);
-        const text = String(response.data?.text ?? '').trim();
-        if (text) transcripts.push(text);
+        try {
+          const response = await api.post('/ai/transcribe/audio', formData);
+          const text = String(response.data?.text ?? '').trim();
+          if (text) transcripts.push(text);
+        } catch (err: any) {
+          const message =
+            err?.response?.data?.message ||
+            err?.response?.data?.detail ||
+            err?.message ||
+            '';
+
+          if (isLowConfidenceTranscriptError(message)) {
+            console.warn('voice-summary skipped low-confidence audio chunk', {
+              chunk: chunkIndex + 1,
+              total: totalChunks,
+              message,
+            });
+            continue;
+          }
+
+          throw err;
+        }
       }
 
       const mergedTranscript = transcripts.join('\n').trim();
@@ -862,49 +1110,130 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
     setIsLoading(true);
     setProcessingSource(source);
     setError(null);
-    setLiveTranscript('');
-    setLiveSummary('');
+    const finishProcessing = () => {
+      setIsLoading(false);
+      setProcessingSource(null);
+      setTimer(0);
+    };
+    const fallbackTranscript = source === 'record' ? liveTranscriptRef.current.trim() : '';
+    if (source !== 'record') {
+      resetLiveTranscript();
+    }
     if (source === 'record') {
       setRecordResult(null);
     } else {
       setUploadResult(null);
     }
 
+    if (source === 'record' && fallbackTranscript) {
+      try {
+        setStatusText('กำลังสรุปข้อความที่ถอดเสียงแบบเรียลไทม์...');
+        const summary = await summarizeTranscriptLikeDocument(fallbackTranscript);
+        const nextResult = {
+          transcript: fallbackTranscript,
+          summary: summary || buildDocumentStyleSummaryFallback(fallbackTranscript),
+        };
+        setRecordResult(nextResult);
+        finishProcessing();
+        void saveBrowserAudioSummary(nextResult, 'record', 'สรุปจากการอัดสด');
+        onSummaryReady?.({
+          summary: nextResult.summary,
+          transcript: nextResult.transcript,
+          source: 'record',
+        });
+        setStatusText('สรุปจากเสียงสดเรียบร้อยแล้ว');
+        return;
+      } catch {
+        // Continue with audio-file processing if transcript summarization is unavailable.
+      }
+    }
+
     const formData = new FormData();
-    const fileName = source === 'upload' && blob instanceof File ? blob.name : 'recording.webm';
+    const fileName = blob instanceof File ? blob.name : `recording.${extensionFromMimeType(blob.type)}`;
     const isCareer = analysisType === 'career';
-    const shouldUseChunkMode =
-      source === 'upload' &&
-      !isCareer &&
-      blob.size >= LARGE_UPLOAD_THRESHOLD_BYTES;
+    const shouldUseChunkMode = !isCareer && (source === 'upload' || blob.size >= LARGE_UPLOAD_THRESHOLD_BYTES);
+    const canAttemptDirectUpload = blob.size < DIRECT_AUDIO_UPLOAD_LIMIT_BYTES;
 
     if (shouldUseChunkMode) {
       try {
-        setStatusText('ไฟล์ขนาดใหญ่ ระบบกำลังแบ่งไฟล์และถอดเสียงอัตโนมัติ...');
+        if (source === 'record' && !canAttemptDirectUpload && fallbackTranscript) {
+          setStatusText('เสียงที่อัดยาวมาก ระบบกำลังสรุปจากข้อความที่ถอดสดไว้...');
+          const fallbackSummary = await summarizeTranscriptLikeDocument(fallbackTranscript);
+          const nextResult = {
+            transcript: fallbackTranscript,
+            summary: fallbackSummary || buildDocumentStyleSummaryFallback(fallbackTranscript),
+          };
+          setRecordResult(nextResult);
+          updateLiveTranscript(fallbackTranscript);
+          finishProcessing();
+          void saveBrowserAudioSummary(nextResult, 'record', 'สรุปจากการอัดสด');
+          onSummaryReady?.({
+            summary: nextResult.summary,
+            transcript: nextResult.transcript,
+            source: 'record',
+          });
+          setStatusText('สรุปเสร็จแล้วจากข้อความที่ถอดสดไว้');
+          return;
+        }
+
+        setStatusText(
+          blob.size >= LARGE_UPLOAD_THRESHOLD_BYTES
+            ? 'ไฟล์ขนาดใหญ่ ระบบกำลังแบ่งไฟล์และถอดเสียงอัตโนมัติ...'
+            : 'ระบบกำลังแบ่งไฟล์เสียงเป็นช่วงสั้น ๆ เพื่อถอดเสียงให้เสถียรขึ้น...'
+        );
         const chunked = await transcribeLargeAudioByChunks(blob);
         const nextResult = {
           transcript: chunked.transcript,
           summary: chunked.summary,
         };
-        setUploadResult(nextResult);
+        if (source === 'record') {
+          setRecordResult(nextResult);
+        } else {
+          setUploadResult(nextResult);
+        }
         setLiveTranscript(chunked.transcript);
-        setLiveSummary(chunked.summary);
+        finishProcessing();
+        void saveBrowserAudioSummary(nextResult, source === 'record' ? 'record' : 'upload', source === 'upload' ? fileName : 'สรุปจากการอัดสด');
         onSummaryReady?.({
           summary: chunked.summary,
           transcript: chunked.transcript,
-          source: 'upload',
+          source: source === 'record' ? 'record' : 'upload',
         });
         setPendingFile(null);
         setStatusText('สรุปเสร็จแล้ว (โหมดแบ่งไฟล์อัตโนมัติ)');
         return;
       } catch (chunkErr: any) {
-        const chunkMessage =
-          chunkErr?.response?.data?.message ||
-          chunkErr?.message ||
-          'แบ่งไฟล์อัตโนมัติไม่สำเร็จ';
-        setError(chunkMessage);
-        setStatusText('เกิดข้อผิดพลาดในการแบ่งไฟล์เสียงอัตโนมัติ');
-        return;
+        if (source === 'record' && fallbackTranscript) {
+          setStatusText('แบ่งไฟล์อัตโนมัติไม่สำเร็จ ระบบกำลังสรุปจากข้อความที่ถอดสดไว้...');
+          const fallbackSummary = await summarizeTranscriptLikeDocument(fallbackTranscript);
+          const nextResult = {
+            transcript: fallbackTranscript,
+            summary: fallbackSummary || buildDocumentStyleSummaryFallback(fallbackTranscript),
+          };
+          setRecordResult(nextResult);
+          updateLiveTranscript(fallbackTranscript);
+          finishProcessing();
+          void saveBrowserAudioSummary(nextResult, 'record', 'สรุปจากการอัดสด');
+          onSummaryReady?.({
+            summary: nextResult.summary,
+            transcript: nextResult.transcript,
+            source: 'record',
+          });
+          setStatusText('สรุปเสร็จแล้วจากข้อความที่ถอดสดไว้');
+          return;
+        }
+
+        if (!canAttemptDirectUpload) {
+          const chunkMessage =
+            chunkErr?.response?.data?.message ||
+            chunkErr?.message ||
+            'แบ่งไฟล์อัตโนมัติไม่สำเร็จ';
+          setError(chunkMessage);
+          setStatusText('ไฟล์เสียงยาวเกินกว่าจะส่งตรง ระบบแบ่งไฟล์อัตโนมัติไม่สำเร็จ');
+          return;
+        }
+
+        setStatusText('แบ่งไฟล์อัตโนมัติไม่สำเร็จ ระบบกำลังลองส่งไฟล์ตรง...');
       }
     }
 
@@ -916,6 +1245,10 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
     if (source) {
       formData.append('source_mode', source);
     }
+    if (!isCareer) {
+      formData.append('summary_period', activeSummaryPeriod);
+      if (selectedMood) formData.append('mood', selectedMood);
+    }
 
     const endpoint = isCareer ? '/ai/analyze/career/audio' : '/ai/summarize/audio';
     const client = isCareer ? aiApi : api;
@@ -924,7 +1257,7 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
       const response = await client.post(endpoint, formData);
       const payload = response.data ?? {};
       let resolvedSummary = String(payload.summary ?? payload.analysis ?? '').trim();
-      const resolvedTranscript = String(payload.transcript ?? payload.text ?? '').trim();
+      const resolvedTranscript = String(payload.transcript ?? payload.text ?? fallbackTranscript).trim();
 
       if (!resolvedSummary && resolvedTranscript) {
         resolvedSummary = await summarizeTranscriptLikeDocument(resolvedTranscript);
@@ -943,18 +1276,15 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
       } else {
         setUploadResult(nextResult);
       }
+      setPendingFile(null);
+      updateLiveTranscript(resolvedTranscript);
+      finishProcessing();
+      setStatusText('สรุปเสร็จแล้ว! เลือกไฟล์ใหม่หรือลองอัดอีกครั้งได้เลย');
       onSummaryReady?.({
         summary: resolvedSummary || buildDocumentStyleSummaryFallback(resolvedTranscript),
         transcript: resolvedTranscript,
         source: source === 'record' ? 'record' : 'upload',
       });
-      setPendingFile(null);
-      setLiveTranscript(resolvedTranscript);
-      setLiveSummary(
-        resolvedSummary ||
-          buildDocumentStyleSummaryFallback(resolvedTranscript)
-      );
-      setStatusText('สรุปเสร็จแล้ว! เลือกไฟล์ใหม่หรือลองอัดอีกครั้งได้เลย');
       const title = 'สรุปจากเสียงเสร็จแล้ว';
       const message = truncateText(resolvedSummary || resolvedTranscript || 'สรุปจากเสียงเสร็จแล้ว');
       void pushBellNotification({ title, message });
@@ -962,11 +1292,6 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
         fetchSavedSummaries(selectedSubjectId);
       }
     } catch (err) {
-      console.error('voice-summary request failed', {
-        endpoint,
-        status: (err as any)?.response?.status,
-        data: (err as any)?.response?.data,
-      });
       const serverMessage = (err as any)?.response?.data?.message;
       const serverDetail = (err as any)?.response?.data?.detail;
       const serverErrors = (err as any)?.response?.data?.errors;
@@ -977,7 +1302,33 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
         (typeof firstError === 'string' && firstError.trim() !== '' && firstError) ||
         (err instanceof Error ? err.message : 'เกิดข้อผิดพลาดระหว่างการประมวลผล');
 
-      // Auto fallback for long files when Google Speech synchronous payload hits 10MB limit.
+      if (source === 'record' && fallbackTranscript) {
+        try {
+          setStatusText('เสียงจากไฟล์ประมวลผลไม่สำเร็จ ระบบกำลังสรุปจากข้อความที่ถอดสดไว้...');
+          const fallbackSummary = await summarizeTranscriptLikeDocument(fallbackTranscript);
+          const nextResult = {
+            transcript: fallbackTranscript,
+            summary: fallbackSummary || buildDocumentStyleSummaryFallback(fallbackTranscript),
+          };
+          setRecordResult(nextResult);
+          updateLiveTranscript(fallbackTranscript);
+          finishProcessing();
+          void saveBrowserAudioSummary(nextResult, 'record', 'สรุปจากการอัดสด');
+          onSummaryReady?.({
+            summary: nextResult.summary,
+            transcript: nextResult.transcript,
+            source: 'record',
+          });
+          setStatusText('สรุปเสร็จแล้วจากข้อความที่ถอดสดไว้');
+          const title = 'สรุปจากเสียงเสร็จแล้ว';
+          const notificationMessage = truncateText(nextResult.summary || nextResult.transcript);
+          void pushBellNotification({ title, message: notificationMessage });
+          return;
+        } catch {
+          // Fall through to the original error message when transcript fallback also fails.
+        }
+      }
+
       if (
         source === 'upload' &&
         (isGooglePayloadLimitError(message) || isGoogleMonoChannelError(message) || isLowConfidenceTranscriptError(message))
@@ -992,7 +1343,8 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
           };
           setUploadResult(nextResult);
           setLiveTranscript(chunked.transcript);
-          setLiveSummary(chunked.summary);
+          finishProcessing();
+          void saveBrowserAudioSummary(nextResult, 'upload', fileName);
           onSummaryReady?.({
             summary: chunked.summary,
             transcript: chunked.transcript,
@@ -1022,6 +1374,8 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
   };
 
   const renderResultPanel = ({ source, data }: ResultBucket) => {
+    if (!data) return null;
+
     const title = source === 'record' ? 'ผลการสรุปจากการบันทึกสด' : 'ผลการสรุปจากไฟล์เสียง';
     const description =
       source === 'record'
@@ -1052,14 +1406,14 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
                     transcript: data.transcript,
                   })
                 }
-                disabled={archivingSummaryId === archiveId || !selectedSubjectId}
+                disabled={archivingSummaryId === archiveId || !selectedSubjectId || archivedSummaryKeys.has(makeAudioArchiveKey(archiveTitle, data.summary, data.transcript))}
                 className={`doc-toolbar-btn rounded-full px-4 py-2 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${
                   embedded
                     ? 'border border-[color:var(--border)] bg-[color:var(--surface)] text-[color:var(--accent)] hover:opacity-90'
                     : 'border border-[color:rgba(var(--accent-rgb),0.24)] bg-[color:var(--surface)] text-[color:var(--accent)] hover:bg-[color:rgba(var(--accent-rgb),0.08)]'
                 }`}
               >
-                {archivingSummaryId === archiveId ? 'กำลังเก็บถาวร...' : 'เก็บถาวร'}
+                {archivingSummaryId === archiveId ? 'กำลังเก็บถาวร...' : archivedSummaryKeys.has(makeAudioArchiveKey(archiveTitle, data.summary, data.transcript)) ? 'เก็บถาวรแล้ว' : 'เก็บถาวร'}
               </button>
             ) : null}
             {data ? (
@@ -1081,7 +1435,9 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
         <div className="space-y-4 px-6 py-6">
           <div className={`rounded-[24px] p-5 ${embedded ? 'border border-[color:rgba(var(--accent-rgb),0.18)] bg-[color:rgba(var(--accent-rgb),0.08)]' : 'border border-[color:rgba(var(--accent-rgb),0.18)] bg-[color:rgba(var(--accent-rgb),0.08)]'}`}>
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-sm font-semibold text-[color:var(--text)]">ใจความสำคัญล่าสุด</p>
+            <p className="text-sm font-semibold text-[color:var(--text)]">
+              {source === 'record' ? 'ข้อความจากการอัดสด' : 'ใจความสำคัญล่าสุด'}
+            </p>
             </div>
             <ExpandableText
               text={data?.summary || data?.transcript || ''}
@@ -1092,18 +1448,6 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
             />
           </div>
 
-          {data?.transcript ? (
-            <div className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] p-4">
-              <p className="text-sm font-semibold text-[color:var(--text)]">ถอดเสียงจากไฟล์</p>
-              <ExpandableText
-                text={data.transcript}
-                previewChars={520}
-                className="mt-2 whitespace-pre-wrap text-sm text-muted"
-                buttonClassName={`mt-3 text-sm font-semibold transition hover:opacity-80 text-[color:var(--accent)]`}
-              />
-            </div>
-          ) : null}
-
           <div className="doc-result-empty rounded-2xl border border-dashed border-[color:var(--border)] bg-[color:var(--surface-2)] p-6 text-center text-sm text-muted">
             ระบบจะแยกผลลัพธ์ของแต่ละโหมดออกจากกันเพื่อให้ดูง่ายขึ้น
           </div>
@@ -1112,118 +1456,44 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
     );
   };
 
-  const renderSavedSection = () => (
-    <section className={`doc-summary-card ${shellClass}`}>
-      <div className="flex items-center justify-between border-b border-[color:var(--border)] px-6 py-5">
-        <h2 className="text-xl font-bold tracking-[-0.03em] text-[color:var(--text)]">สรุปจากเสียงที่บันทึกไว้</h2>
-        <span className={`rounded-full px-3 py-1 text-xs font-semibold ${embedded ? 'bg-[color:var(--surface-2)] text-muted border border-[color:var(--border)]' : 'bg-[color:var(--surface-2)] text-muted'}`}>{savedSummaries.length} รายการ</span>
-      </div>
-      <div className="space-y-6 px-6 py-6">
-        <p className="text-sm text-muted">รวมรายการสรุปจากไฟล์เสียงและการอัดสดไว้ในที่เดียว</p>
-
-        {savedLoading ? (
-          <div className="flex items-center gap-2 text-sm text-muted">
-            <span className="h-5 w-5 animate-spin rounded-full border-2 border-[color:rgba(var(--accent-rgb),0.24)] border-t-[color:var(--accent)]"></span>
-            <p>กำลังโหลดสรุปจากเสียง...</p>
-          </div>
-        ) : savedError ? (
-          <p className="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">{savedError}</p>
-        ) : savedSummaries.length === 0 ? (
-          <div className="doc-empty-state rounded-2xl border border-dashed border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-6 text-center text-sm text-muted">
-            ยังไม่มีสรุปจากเสียงที่บันทึกไว้
-          </div>
-        ) : (
-          <div className="space-y-3">
-            {savedSummaries.map(item => (
-              <article key={item.id} className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-3 shadow-sm">
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <p className="text-xs uppercase tracking-widest text-muted">{item.subject ?? 'ไม่ระบุวิชา'}</p>
-                      <span className="rounded-full bg-[color:var(--surface)] px-2.5 py-1 text-[11px] font-semibold text-muted">
-                        {item.source_mode === 'record' ? 'อัดสด' : 'ไฟล์เสียง'}
-                      </span>
-                    </div>
-                    <p className="text-sm font-semibold text-[color:var(--text)]">
-                      {item.title ?? (item.source_mode === 'record' ? 'สรุปจากการอัดสด' : 'สรุปจากเสียง')}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {item.created_at ? <span className="text-xs text-muted">{formatSummaryTime(item.created_at)}</span> : null}
-                    <button
-                      type="button"
-                      onClick={() => void archiveAudioSummary(item)}
-                      disabled={archivingSummaryId === item.id}
-                      className={`rounded-full px-3 py-1 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${
-                        embedded
-                          ? 'border border-[color:var(--border)] bg-[color:var(--surface)] text-[color:var(--accent)] hover:opacity-90'
-                          : 'border border-[color:rgba(var(--accent-rgb),0.24)] bg-[color:var(--surface)] text-[color:var(--accent)] hover:bg-[color:rgba(var(--accent-rgb),0.08)]'
-                      }`}
-                    >
-                      {archivingSummaryId === item.id ? 'กำลังเก็บ...' : 'เก็บถาวร'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void deleteSavedSummary(item)}
-                      disabled={deletingSummaryId === item.id}
-                    className="rounded-full border border-rose-500/30 bg-rose-500/10 px-3 py-1 text-xs font-semibold text-rose-300 transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {deletingSummaryId === item.id ? 'กำลังลบ...' : 'ลบ'}
-                    </button>
-                  </div>
-                </div>
-                <ExpandableText
-                  text={item.summary || item.transcript || ''}
-                  previewChars={260}
-                  className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted"
-                  buttonClassName={`mt-2 text-sm font-semibold transition hover:opacity-80 text-[color:var(--accent)]`}
-                />
-              </article>
-            ))}
-          </div>
-        )}
-      </div>
-    </section>
-  );
-
   return (
     <div className={`ai-summary-theme voice-summary-page doc-summary-page ${embedded ? 'space-y-6' : 'relative min-h-screen overflow-hidden space-y-6 pb-16 bg-transparent font-sans'}`}>
+      <div className={embedded ? '' : 'relative z-10 mx-auto max-w-7xl space-y-8 px-4 pb-4 pt-2 md:p-8'}>
       {!embedded ? (
-        <section className="doc-summary-card rounded-[34px] border border-[color:var(--border)] bg-[linear-gradient(135deg,rgba(var(--accent-rgb),0.14)_0%,rgba(var(--accent-rgb),0.05)_100%)] px-6 py-6 shadow-[0_18px_42px_rgba(15,23,42,0.10)]">
-          <div className="flex flex-wrap items-start justify-between gap-4">
-            <div className="doc-summary-header">
-              <span className="inline-flex items-center rounded-full border border-[color:rgba(var(--accent-rgb),0.35)] bg-[color:rgba(var(--accent-rgb),0.08)] px-3 py-1 text-[11px] font-bold uppercase tracking-[0.2em] text-accent">
+        <header className="doc-summary-header mb-8 flex flex-col gap-5 md:flex-row md:items-center md:justify-between">
+          <div className="flex items-start gap-4">
+            <div className="doc-summary-header-icon flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl shadow-lg" style={{ background: 'linear-gradient(135deg, var(--accent), rgba(var(--accent-rgb),0.72))', boxShadow: '0 18px 38px rgba(var(--accent-rgb),0.30)' }}>
+              <svg viewBox="0 0 24 24" className="h-7 w-7 text-white" fill="none" aria-hidden="true">
+                <path d="M12 1v11M8 5a4 4 0 1 1 8 0v7a4 4 0 1 1-8 0V5ZM19 10v2a7 7 0 0 1-14 0v-2M12 19v4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+              </svg>
+            </div>
+            <div>
+              <span className="mb-2 inline-flex items-center rounded-full border border-[color:rgba(var(--accent-rgb),0.22)] bg-[color:rgba(var(--accent-rgb),0.12)] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">
                 Voice Summary
               </span>
-              <h1 className="mt-3 text-3xl font-black tracking-tight text-[color:var(--text)]">สรุปจากเสียง</h1>
-              <p className="mt-1 text-sm text-muted">อัปโหลดหรืออัดเสียง แล้วให้ AI สรุปใจความสำคัญทันที</p>
-            </div>
-            <div className="rounded-2xl border border-[color:rgba(var(--accent-rgb),0.22)] bg-[color:var(--surface)]/80 px-4 py-3 text-right">
-              <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-muted">บันทึกทั้งหมด</p>
-              <p className="mt-1 text-2xl font-black text-[color:var(--text)]">{savedSummaries.length}</p>
+              <h1 className="text-2xl font-bold tracking-wide text-[color:var(--text)] md:text-3xl">สรุปจากเสียงด้วย AI</h1>
+              <p className="mt-1 max-w-2xl text-sm leading-6 text-muted">อัปโหลดหรืออัดเสียง แล้วจัดเก็บสรุปแยกตามวิชาและช่วงเวลา</p>
             </div>
           </div>
-        </section>
+          <div className="flex flex-wrap gap-2">
+            <span className="doc-summary-chip"><span className="h-2 w-2 rounded-full" style={{ background: 'var(--accent)' }} />{subjects.find(subject => String(subject.id) === selectedSubjectId)?.name ?? 'ยังไม่เลือกวิชา'}</span>
+            <span className="doc-summary-chip">{savedSummaries.length} สรุป</span>
+          </div>
+        </header>
       ) : null}
         <div className={mainLayoutClass}>
         <div className={leftPanelLayoutClass}>
           {!embedded ? (
           <section className={`doc-summary-card ${shellClass} xl:col-span-2`}>
-            <div className="flex flex-col gap-5 border-b border-[color:var(--border)] px-6 py-6 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex items-center gap-4">
-                <span className="doc-summary-header-icon flex h-14 w-14 items-center justify-center rounded-2xl bg-[color:var(--accent)] text-[color:var(--on-accent)] shadow-[0_14px_30px_rgba(var(--accent-rgb),0.24)]">
-                  <svg viewBox="0 0 24 24" className="h-7 w-7" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                    <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 1 0 6 0V6a3 3 0 0 0-3-3Z" />
-                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                    <path d="M12 19v2" />
-                  </svg>
-                </span>
+            <div className="px-6 py-6">
+              <div className="mb-5 flex items-center gap-3">
+                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-bold text-[color:var(--on-accent)]" style={{ background: 'var(--accent)' }}>1</span>
                 <div>
-                  <h2 className="text-2xl font-black tracking-[-0.03em] text-[color:var(--text)]">ให้ AI ช่วยสรุปเนื้อหาวิชา</h2>
-                  <p className="text-sm text-muted">อัปโหลดไฟล์เสียงหรือบันทึกสดเพื่อให้ระบบวิเคราะห์ทันที</p>
+                  <p className="text-xs font-bold" style={{ color: 'var(--accent)' }}>ขั้นที่ 1</p>
+                  <h2 className="text-lg font-black tracking-[-0.02em] text-[color:var(--text)]">เลือกบริบท <span className="font-medium text-muted">เทอม / วิชา</span></h2>
                 </div>
               </div>
-              <div className="grid w-full gap-3 sm:grid-cols-3 lg:w-auto lg:min-w-[560px]">
+              <div className="grid w-full gap-5 sm:grid-cols-2">
                 <div>
                   <label className="mb-2 block text-xs font-semibold text-muted">ภาคเรียน</label>
                   <select
@@ -1257,23 +1527,10 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
                     ))}
                   </select>
                 </div>
-                <div>
-                  <label className="mb-2 block text-xs font-semibold text-muted">ประเภทการวิเคราะห์</label>
-                  <select
-                    value={analysisType}
-                    onChange={e => setAnalysisType(e.target.value as 'summary' | 'career')}
-                    className={fieldClass}
-                  >
-                    <option value="summary">สรุปเนื้อหา</option>
-                    <option value="career">วิเคราะห์แนวทางอาชีพ</option>
-                  </select>
-                </div>
               </div>
-            </div>
-            <div className="px-6 pb-5 pt-3">
               {subjects.length === 0 ? (
                 <p className="text-xs text-muted">
-                  ยังไม่มีวิชาในระบบ <Link to="/subjects" className="font-semibold text-[color:var(--accent)]">ไปเพิ่มวิชา</Link>
+                  ยังไม่มีวิชาในระบบ <a href="/subjects" className="font-semibold text-[color:var(--accent)]">ไปเพิ่มวิชา</a>
                 </p>
               ) : filteredSubjects.length === 0 && selectedSemesterKey !== 'all' ? (
                 <p className="text-xs text-[color:var(--accent)]">เทอมนี้ยังไม่มีวิชาที่ผูกไว้ ระบบแสดงวิชาทั้งหมดให้เลือกแทน</p>
@@ -1295,19 +1552,147 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
                 : undefined
             }
           >
-            <div className="mb-4 flex items-center gap-3">
-              <span className={`flex h-10 w-10 items-center justify-center rounded-2xl ${embedded ? 'bg-[color:rgba(var(--accent-rgb),0.12)] text-accent' : 'bg-[color:rgba(var(--accent-rgb),0.12)] text-accent'}`}>
-                <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  <path d="M9 18V5l12-2v13" />
-                  <circle cx="6" cy="18" r="3" />
-                  <circle cx="18" cy="16" r="3" />
-                </svg>
-              </span>
+            <div className="mb-5 flex items-center gap-3">
+              {embedded ? (
+                <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[color:rgba(var(--accent-rgb),0.12)] text-accent">
+                  <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M9 18V5l12-2v13" />
+                    <circle cx="6" cy="18" r="3" />
+                    <circle cx="18" cy="16" r="3" />
+                  </svg>
+                </span>
+              ) : (
+                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-bold text-[color:var(--on-accent)]" style={{ background: 'var(--accent)' }}>2</span>
+              )}
               <div>
-                <h2 className="text-xl font-black tracking-[-0.03em] text-[color:var(--text)]">สรุปจากไฟล์เสียง</h2>
+                {!embedded ? <p className="text-xs font-bold" style={{ color: 'var(--accent)' }}>ขั้นที่ 2</p> : null}
+                <h2 className="text-xl font-black tracking-[-0.03em] text-[color:var(--text)]">ใส่เนื้อหา <span className="font-medium text-muted">ไฟล์เสียง</span></h2>
                 <p className="mt-1 text-sm text-muted">{embedded ? 'อัปโหลดไฟล์เพื่อสรุปทันที' : 'เลือกไฟล์เสียงที่มีอยู่แล้ว แล้วให้ระบบถอดและสรุปใจความทันที'}</p>
               </div>
             </div>
+            {!embedded ? (
+              <div className="mb-5 flex w-full max-w-md rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-2)] p-1">
+                <a href="/document-summary" className="flex-1 rounded-lg px-4 py-2 text-center text-sm font-semibold text-muted transition hover:bg-[color:var(--surface)]">เอกสาร</a>
+                <span className="flex-1 rounded-lg px-4 py-2 text-center text-sm font-semibold shadow-[0_6px_16px_rgba(var(--accent-rgb),0.25)]" style={{ background: 'var(--accent)', color: 'var(--on-accent)' }}>ไฟล์เสียง</span>
+              </div>
+            ) : null}
+
+
+   
+
+          {!embedded ? (
+            <section className={`doc-summary-card ${shellClass} xl:col-span-2`}>
+              <div className="px-6 py-6">
+                <div className="mb-5 flex items-center gap-3">
+                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-bold text-[color:var(--on-accent)]" style={{ background: 'var(--accent)' }}>3</span>
+                  <div>
+                    <p className="text-xs font-bold" style={{ color: 'var(--accent)' }}>ขั้นที่ 3</p>
+                    <h2 className="text-lg font-black tracking-[-0.02em] text-[color:var(--text)]">
+                      ตั้งค่าการสรุป <span className="font-medium text-muted">รูปแบบ / อารมณ์</span>
+                    </h2>
+                  </div>
+                </div>
+                
+                <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+                  <label className="text-sm font-semibold text-[color:var(--text)] whitespace-nowrap">
+                    รูปแบบการสรุป:
+                  </label>
+                  <div className="flex w-full sm:w-max rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-2)] p-1">
+                    {summaryPeriodOptions.map(option => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        onClick={() => {
+                          setSummaryPeriod(option.value);
+                          if (onSummaryPeriodChange) {
+                            onSummaryPeriodChange(option.value);
+                          }
+                        }}
+                        className={`flex-1 sm:flex-none rounded-lg px-6 py-2 text-center text-sm font-semibold transition ${
+                          activeSummaryPeriod === option.value
+                            ? 'shadow-[0_4px_12px_rgba(var(--accent-rgb),0.25)] text-[color:var(--on-accent)]'
+                            : 'text-muted hover:bg-[color:var(--surface)]'
+                        }`}
+                        style={
+                          activeSummaryPeriod === option.value
+                            ? { background: 'var(--accent)' }
+                            : undefined
+                        }
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Dropdown อารมณ์ */}
+                  <div className="relative z-20 w-full sm:w-[260px]" ref={moodDropdownRef}>
+                    <button
+                      type="button"
+                      className="flex w-full items-center rounded-xl pl-4 pr-10 py-2.5 text-left text-sm text-[color:var(--text)] transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-[color:var(--accent)]"
+                      style={{
+                        background: 'var(--surface-2)',
+                        border: '1px solid var(--border)'
+                      }}
+                      aria-haspopup="listbox"
+                      aria-expanded={isMoodDropdownOpen}
+                      onClick={() => setIsMoodDropdownOpen(open => !open)}
+                    >
+                      <span className="min-w-0 flex-1 truncate font-medium">
+                        {moodOptions.find(o => o.value === selectedMood)?.label ?? 'เลือกอารมณ์ก่อนบันทึกสรุป'}
+                      </span>
+                    </button>
+                    <span className={`pointer-events-none absolute right-3 top-[19px] text-xs text-muted transition-transform ${isMoodDropdownOpen ? 'rotate-180' : ''}`}>▼</span>
+
+                    {isMoodDropdownOpen && (
+                      <div
+                        className="absolute left-0 right-0 top-full mt-1 overflow-hidden rounded-lg py-1 text-sm shadow-xl ring-1 ring-[color:var(--border)]"
+                        style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
+                        role="listbox"
+                      >
+                        <button
+                          type="button"
+                          className={`flex w-full items-center px-4 py-2 text-left font-semibold transition-colors ${selectedMood === '' ? 'text-[color:var(--on-accent)]' : 'text-[color:var(--text)] hover:bg-[color:var(--surface)]'}`}
+                          style={selectedMood === '' ? { background: 'var(--accent)' } : undefined}
+                          role="option"
+                          aria-selected={selectedMood === ''}
+                          onClick={() => {
+                            setSelectedMood('');
+                            setIsMoodDropdownOpen(false);
+                          }}
+                        >
+                          <span className="truncate">เลือกอารมณ์ก่อนบันทึกสรุป</span>
+                        </button>
+                        {moodOptions.map(option => (
+                          <button
+                            key={option.value}
+                            type="button"
+                            className={`flex w-full items-center px-4 py-2 text-left font-semibold transition-colors ${selectedMood === option.value ? 'text-[color:var(--on-accent)]' : 'text-[color:var(--text)] hover:bg-[color:var(--surface)]'}`}
+                            style={selectedMood === option.value ? { background: 'var(--accent)' } : undefined}
+                            role="option"
+                            aria-selected={selectedMood === option.value}
+                            onClick={() => {
+                              setSelectedMood(option.value);
+                              setIsMoodDropdownOpen(false);
+                            }}
+                          >
+                            <span className="truncate">{option.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </section>
+          ) : null}
+
+
+
+
+
+
+
+            
 
             <div
               className={`doc-upload-zone mt-5 rounded-[28px] border-2 border-dashed px-6 py-10 text-center transition ${
@@ -1460,7 +1845,11 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
               <div className="text-center">
                 <p className={`${embedded ? 'text-4xl' : 'text-5xl'} font-mono font-black text-[color:var(--text)]`}>{formatTimer(timer)}</p>
                 <p className="mt-2 text-sm text-muted">{isRecording ? 'กำลังบันทึกเสียง...' : 'พร้อมเริ่มบันทึกใหม่'}</p>
-                <p className="mt-1 text-xs text-muted">อัดเสียงได้ตามขนาดไฟล์สูงสุด 50MB (โดยทั่วไปประมาณ 1-2 ชั่วโมง ขึ้นกับคุณภาพเสียง)</p>
+                <p className="mt-1 text-xs text-muted">
+                  {isRecording || recordedBytes > 0
+                    ? `บันทึกแล้วประมาณ ${formatFileSize(recordedBytes)} ระบบจะแบ่งเสียงเป็นช่วงสั้น ๆ ตอนสรุป`
+                    : 'อัดสดได้นานขึ้น ระบบจะแบ่งเสียงเป็นช่วงสั้น ๆ ตอนสรุป'}
+                </p>
               </div>
               {embedded ? (
                 <button
@@ -1491,16 +1880,39 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
                 กำลังประมวลผลเสียงที่บันทึก...
               </div>
             ) : null}
-            {(isRecording || liveSummary || liveTranscript) ? (
+            {isRecording ? (
               <div className="mt-4 rounded-2xl border border-[color:rgba(var(--accent-rgb),0.16)] bg-[color:rgba(var(--accent-rgb),0.08)] p-4">
-                <p className="text-sm font-semibold text-[color:var(--text)]">สรุประหว่างอัดเสียง</p>
-                <p className="mt-2 whitespace-pre-wrap text-sm text-muted">
-                  {liveSummary || liveTranscript || 'กำลังรอเสียงพูด...'}
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <p className="text-sm font-semibold text-[color:var(--text)]">
+                    ข้อความที่ถอดเสียงแบบเรียลไทม์
+                  </p>
+                  {liveTranscript ? (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void archiveAudioSummary({
+                          id: -3,
+                          title: 'บันทึกการอัดเสียงสด',
+                          summary: liveTranscript,
+                          transcript: liveTranscript,
+                        })
+                      }
+                      disabled={archivingSummaryId === -3 || !selectedSubjectId}
+                      className="rounded-full border border-[color:rgba(var(--accent-rgb),0.24)] bg-[color:var(--surface)] px-3 py-1.5 text-xs font-semibold text-[color:var(--accent)] transition hover:bg-[color:rgba(var(--accent-rgb),0.08)] disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {archivingSummaryId === -3 ? 'กำลังเก็บถาวร...' : 'เก็บถาวร'}
+                    </button>
+                  ) : null}
+                </div>
+                <p className="mt-2 max-h-72 overflow-y-auto whitespace-pre-wrap pr-2 text-sm text-muted">
+                  {liveTranscript || 'กำลังรอเสียงพูด...'}
                 </p>
               </div>
             ) : null}
           </section>
           ) : null}
+
+          {!embedded && showRecordSection && recordResult ? renderResultPanel({ source: 'record', data: recordResult }) : null}
 
           <div className={`doc-status-banner rounded-2xl border border-[color:rgba(var(--accent-rgb),0.16)] bg-[color:rgba(var(--accent-rgb),0.08)] p-4 text-sm font-medium text-[color:var(--text)] xl:col-span-2 ${embedded ? 'hidden' : ''}`}>
             {statusText}
@@ -1512,63 +1924,7 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
         </div>
 
         <div className={`${embedded ? 'space-y-5' : 'space-y-6'}`}>
-          <section
-            className={`doc-summary-card ${shellClass}`}
-            style={
-              embedded
-                ? {
-                    background: isDarkTheme ? 'rgba(15,20,27,0.92)' : 'color-mix(in srgb, var(--surface) 92%, transparent)',
-                    borderColor: isDarkTheme ? 'rgba(255,255,255,0.14)' : 'var(--border)',
-                    boxShadow: isDarkTheme ? '0 18px 36px rgba(0,0,0,0.45)' : undefined
-                  }
-                : isDarkTheme
-                  ? { background: 'rgba(15,20,27,0.92)', borderColor: 'rgba(255,255,255,0.10)' }
-                  : undefined
-            }
-          >
-            <div className="flex items-center justify-between border-b border-[color:var(--border)] px-6 py-5">
-              <h2 className="text-xl font-black tracking-[-0.03em] text-[color:var(--text)]">ผลการสรุปใจความสำคัญ</h2>
-              <button
-                type="button"
-                onClick={() => {
-                  clearResult('upload');
-                  clearResult('record');
-                }}
-                className={`text-xs font-bold text-accent hover:opacity-80`}
-              >
-                รีเฟรชผลลัพธ์
-              </button>
-            </div>
-            <div className={`${embedded ? 'grid gap-3 px-6 py-6' : 'grid gap-4 px-6 py-6 sm:grid-cols-2'}`}>
-              <div
-                className={`rounded-[22px] p-4 ${embedded ? 'border border-[color:rgba(var(--accent-rgb),0.24)] bg-[color:rgba(var(--accent-rgb),0.08)]' : 'border border-[color:rgba(var(--accent-rgb),0.24)] bg-[color:rgba(var(--accent-rgb),0.08)]'}`}
-                style={isDarkTheme ? { background: 'rgba(var(--accent-rgb),0.14)' } : undefined}
-              >
-                <p className={`text-sm font-bold ${embedded ? 'text-[color:var(--accent)]' : 'text-[color:var(--accent)]'}`}>ผลการสรุปจากไฟล์</p>
-                <p className={`mt-2 text-sm ${embedded ? 'text-[color:var(--text)]/90' : 'text-[color:var(--text)]/90'}`}>{uploadPreviewText || 'ยังไม่มีข้อมูล กรุณาเริ่มสรุปไฟล์เสียงก่อน'}</p>
-              </div>
-              <div
-                className={`rounded-[22px] p-4 ${embedded ? 'border border-dashed border-[color:var(--border)] bg-[color:var(--surface-2)]/80' : 'border border-dashed border-[color:var(--border)] bg-[color:var(--surface-2)]/80'}`}
-                style={isDarkTheme ? { background: 'rgba(22,27,34,0.90)' } : undefined}
-              >
-                <p className={`text-sm font-bold ${embedded ? 'text-muted' : 'text-muted'}`}>ผลการสรุปจากการบันทึกสด</p>
-                <p className={`mt-2 text-sm ${embedded ? 'text-muted' : 'text-muted'}`}>{recordPreviewText || 'รอการบันทึกเสียงในส่วนนี้...'}</p>
-              </div>
-            </div>
-          </section>
-
-          {showUploadSection ? renderResultPanel({ source: 'upload', data: uploadResult }) : null}
-          {embedded ? (
-            <div className="grid gap-5 xl:grid-cols-2">
-              {showRecordSection ? renderResultPanel({ source: 'record', data: recordResult }) : null}
-              {renderSavedSection()}
-            </div>
-          ) : (
-            <>
-              {showRecordSection ? renderResultPanel({ source: 'record', data: recordResult }) : null}
-              {renderSavedSection()}
-            </>
-          )}
+          {!embedded && showUploadSection && uploadResult ? renderResultPanel({ source: 'upload', data: uploadResult }) : null}
         </div>
         </div>
 
@@ -1582,6 +1938,16 @@ export const VoiceSummaryPage = ({ embedded = false, initialSection, onSummaryRe
           ) : null}
         </div>
       ) : null}
+      </div>
+      <ConfirmDialog
+        isOpen={Boolean(confirmState)}
+        title={confirmState?.title ?? ''}
+        description={confirmState?.description ?? ''}
+        confirmLabel={confirmState?.confirmLabel ?? 'ยืนยัน'}
+        onConfirm={handleConfirmDialogConfirm}
+        onCancel={handleConfirmDialogCancel}
+        busy={confirmBusy}
+      />
     </div>
   );
 };

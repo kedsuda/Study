@@ -1,0 +1,184 @@
+<svg viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Smart Learning Tracker network book logo</title>
+  <desc id="desc">A neon open book with connected network nodes.</desc>
+  <defs>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+    <filter id="glow-light" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+    <linearGradient id="pageGradLeft1" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#4a00e0" />
+      <stop offset="100%" stop-color="#8e2de2" />
+    </linearGradient>
+    <linearGradient id="pageGradLeft2" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#3f51b1" />
+      <stop offset="100%" stop-color="#5a55ae" />
+    </linearGradient>
+    <linearGradient id="pageGradLeft3" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00c6ff" />
+      <stop offset="100%" stop-color="#0072ff" />
+    </linearGradient>
+    <linearGradient id="pageGradRight1" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00b09b" />
+      <stop offset="100%" stop-color="#96c93d" />
+    </linearGradient>
+    <linearGradient id="pageGradRight2" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#11998e" />
+      <stop offset="100%" stop-color="#38ef7d" />
+    </linearGradient>
+    <linearGradient id="pageGradRight3" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#f2d50f" />
+      <stop offset="100%" stop-color="#da8c08" />
+    </linearGradient>
+    <linearGradient id="netGradLeft" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00f2fe" />
+      <stop offset="50%" stop-color="#4facfe" />
+      <stop offset="100%" stop-color="#7b2ff7" />
+    </linearGradient>
+    <linearGradient id="netGradRight" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f9d423" />
+      <stop offset="50%" stop-color="#00e676" />
+      <stop offset="100%" stop-color="#11998e" />
+    </linearGradient>
+    <style>
+      .book-line {
+        fill: none;
+        stroke-width: 4.5;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        filter: url(#glow);
+      }
+      .network-line {
+        fill: none;
+        stroke-width: 2.5;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        filter: url(#glow-light);
+        stroke-dasharray: 6 12;
+        animation: dataFlow 20s linear infinite;
+      }
+      .network-line-solid {
+        fill: none;
+        stroke-width: 1.5;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        opacity: 0.4;
+      }
+      .node {
+        filter: url(#glow);
+        transform-box: fill-box;
+        transform-origin: center;
+      }
+      .pulse-1 { animation: pulseNode 2s infinite alternate; }
+      .pulse-2 { animation: pulseNode 2.5s infinite alternate-reverse; }
+      .pulse-3 { animation: pulseNode 3s infinite alternate 0.5s; }
+      .pulse-4 { animation: pulseNode 1.8s infinite alternate-reverse 0.2s; }
+      @keyframes dataFlow {
+        from { stroke-dashoffset: 0; }
+        to { stroke-dashoffset: -200; }
+      }
+      @keyframes pulseNode {
+        0% { transform: scale(0.8); opacity: 0.7; }
+        100% { transform: scale(1.4); opacity: 1; }
+      }
+    </style>
+  </defs>
+
+  <rect width="400" height="400" rx="18" fill="#0b0f22" />
+  <circle cx="200" cy="180" r="150" fill="#ffffff" opacity="0.02" filter="url(#glow)" />
+
+  <g transform="translate(200, 310)">
+    <path class="book-line" stroke="url(#pageGradLeft1)" d="M 0,0 C -20,15 -60,20 -150,-10 L -150,-200 C -60,-170 -20,-175 0,-190" />
+    <path class="book-line" stroke="url(#pageGradLeft2)" d="M 0,-10 C -20,5 -60,10 -130,-20 L -130,-190 C -60,-160 -20,-165 0,-180" />
+    <path class="book-line" stroke="url(#pageGradLeft3)" d="M 0,-20 C -20,-5 -60,0 -110,-30 L -110,-180 C -60,-150 -20,-155 0,-170" />
+    <path class="book-line" stroke="url(#pageGradRight1)" d="M 0,0 C 20,15 60,20 150,-10 L 150,-200 C 60,-170 20,-175 0,-190" />
+    <path class="book-line" stroke="url(#pageGradRight2)" d="M 0,-10 C 20,5 60,10 130,-20 L 130,-190 C 60,-160 20,-165 0,-180" />
+    <path class="book-line" stroke="url(#pageGradRight3)" d="M 0,-20 C 20,-5 60,0 110,-30 L 110,-180 C 60,-150 20,-155 0,-170" />
+    <path fill="#0f172a" stroke="#00f2fe" stroke-width="1.5" filter="url(#glow-light)" d="M 0,12 L -15,-5 L 0,-20 L 15,-5 Z" />
+  </g>
+
+  <g transform="translate(200, 310)">
+    <g class="network-line-solid" stroke="url(#netGradLeft)">
+      <line x1="0" y1="-30" x2="0" y2="-250" />
+      <line x1="0" y1="-70" x2="-35" y2="-120" />
+      <line x1="-35" y1="-120" x2="-80" y2="-90" />
+      <line x1="-35" y1="-120" x2="-80" y2="-150" />
+      <line x1="-35" y1="-120" x2="0" y2="-170" />
+      <line x1="0" y1="-170" x2="-80" y2="-150" />
+      <line x1="-80" y1="-150" x2="-100" y2="-210" />
+      <line x1="-80" y1="-150" x2="-30" y2="-220" />
+      <line x1="-30" y1="-220" x2="0" y2="-250" />
+      <line x1="-30" y1="-220" x2="-100" y2="-210" />
+      <line x1="-35" y1="-120" x2="-30" y2="-170" />
+      <line x1="-80" y1="-150" x2="-30" y2="-170" />
+      <line x1="-30" y1="-170" x2="-30" y2="-220" />
+      <line x1="-30" y1="-170" x2="0" y2="-170" />
+      <line x1="0" y1="-70" x2="-80" y2="-50" />
+      <line x1="-80" y1="-90" x2="-80" y2="-50" />
+    </g>
+    <g class="network-line" stroke="url(#netGradLeft)">
+      <line x1="0" y1="-30" x2="0" y2="-250" />
+      <line x1="0" y1="-70" x2="-35" y2="-120" />
+      <line x1="-35" y1="-120" x2="0" y2="-170" />
+      <line x1="-80" y1="-150" x2="-30" y2="-220" />
+      <line x1="-30" y1="-220" x2="0" y2="-250" />
+      <line x1="-30" y1="-170" x2="-30" y2="-220" />
+    </g>
+    <circle class="node pulse-1" cx="0" cy="-70" r="5.5" fill="#8e2de2" />
+    <circle class="node pulse-2" cx="-80" cy="-50" r="4" fill="#4a00e0" />
+    <circle class="node pulse-3" cx="-80" cy="-90" r="4.5" fill="#5a55ae" />
+    <circle class="node pulse-4" cx="-35" cy="-120" r="5" fill="#0072ff" />
+    <circle class="node pulse-1" cx="-30" cy="-170" r="4.5" fill="#00c6ff" />
+    <circle class="node pulse-2" cx="-80" cy="-150" r="6" fill="#3f51b1" />
+    <circle class="node pulse-3" cx="0" cy="-170" r="5" fill="#00f2fe" />
+    <circle class="node pulse-4" cx="-100" cy="-210" r="4.5" fill="#4facfe" />
+    <circle class="node pulse-1" cx="-30" cy="-220" r="5.5" fill="#00c6ff" />
+    <circle class="node pulse-2" cx="0" cy="-250" r="6.5" fill="#ffffff" />
+  </g>
+
+  <g transform="translate(200, 310)">
+    <g class="network-line-solid" stroke="url(#netGradRight)">
+      <line x1="0" y1="-70" x2="35" y2="-120" />
+      <line x1="35" y1="-120" x2="80" y2="-90" />
+      <line x1="35" y1="-120" x2="80" y2="-150" />
+      <line x1="35" y1="-120" x2="0" y2="-170" />
+      <line x1="0" y1="-170" x2="80" y2="-150" />
+      <line x1="80" y1="-150" x2="100" y2="-210" />
+      <line x1="80" y1="-150" x2="30" y2="-220" />
+      <line x1="30" y1="-220" x2="0" y2="-250" />
+      <line x1="30" y1="-220" x2="100" y2="-210" />
+      <line x1="35" y1="-120" x2="30" y2="-170" />
+      <line x1="80" y1="-150" x2="30" y2="-170" />
+      <line x1="30" y1="-170" x2="30" y2="-220" />
+      <line x1="30" y1="-170" x2="0" y2="-170" />
+      <line x1="0" y1="-70" x2="80" y2="-50" />
+      <line x1="80" y1="-90" x2="80" y2="-50" />
+    </g>
+    <g class="network-line" stroke="url(#netGradRight)">
+      <line x1="0" y1="-70" x2="35" y2="-120" />
+      <line x1="35" y1="-120" x2="0" y2="-170" />
+      <line x1="80" y1="-150" x2="30" y2="-220" />
+      <line x1="30" y1="-220" x2="0" y2="-250" />
+      <line x1="30" y1="-170" x2="30" y2="-220" />
+      <line x1="80" y1="-150" x2="100" y2="-210" />
+    </g>
+    <circle class="node pulse-3" cx="80" cy="-50" r="4" fill="#00b09b" />
+    <circle class="node pulse-1" cx="80" cy="-90" r="5" fill="#11998e" />
+    <circle class="node pulse-4" cx="35" cy="-120" r="5.5" fill="#38ef7d" />
+    <circle class="node pulse-2" cx="30" cy="-170" r="4.5" fill="#96c93d" />
+    <circle class="node pulse-1" cx="80" cy="-150" r="6" fill="#00e676" />
+    <circle class="node pulse-3" cx="100" cy="-210" r="4.5" fill="#da8c08" />
+    <circle class="node pulse-4" cx="30" cy="-220" r="5.5" fill="#f2d50f" />
+  </g>
+</svg>

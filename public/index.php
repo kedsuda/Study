@@ -22,6 +22,122 @@ if ($apiPos !== false) {
     $path = substr($path, $apiPos);
 }
 
+function maintenance_mode_settings($rootDir)
+{
+    if (!function_exists('mysqli_connect')) {
+        return ['enabled' => false, 'end_at' => ''];
+    }
+
+    $config = [
+        'host' => '127.0.0.1',
+        'port' => 3306,
+        'database' => 'db_651998018',
+        'username' => 'root',
+        'password' => '',
+        'charset' => 'utf8',
+    ];
+    $envPath = $rootDir . DIRECTORY_SEPARATOR . '.env';
+    if (file_exists($envPath)) {
+        $env = parse_ini_file($envPath, false, INI_SCANNER_RAW);
+        if (is_array($env)) {
+            $config['host'] = $env['DB_HOST'] ?? $config['host'];
+            $config['port'] = (int) ($env['DB_PORT'] ?? $config['port']);
+            $config['database'] = $env['DB_DATABASE'] ?? $config['database'];
+            $config['username'] = $env['DB_USERNAME'] ?? $config['username'];
+            $config['password'] = $env['DB_PASSWORD'] ?? $config['password'];
+            $config['charset'] = $env['DB_CHARSET'] ?? $config['charset'];
+        }
+    }
+
+    $connection = @mysqli_connect(
+        $config['host'],
+        $config['username'],
+        $config['password'],
+        $config['database'],
+        $config['port']
+    );
+    if (!$connection) {
+        return ['enabled' => false, 'end_at' => ''];
+    }
+
+    @mysqli_set_charset($connection, $config['charset']);
+    $table = @mysqli_query($connection, "SHOW TABLES LIKE 'admin_settings'");
+    $hasSettingsTable = $table && mysqli_num_rows($table) > 0;
+    if ($table) {
+        mysqli_free_result($table);
+    }
+    if (!$hasSettingsTable) {
+        mysqli_close($connection);
+        return ['enabled' => false, 'end_at' => ''];
+    }
+
+    $statement = @mysqli_prepare($connection, "SELECT setting_key, setting_value FROM admin_settings WHERE setting_key IN ('maintenance_mode', 'maintenance_end_at')");
+    if (!$statement) {
+        mysqli_close($connection);
+        return ['enabled' => false, 'end_at' => ''];
+    }
+    mysqli_stmt_execute($statement);
+    mysqli_stmt_bind_result($statement, $key, $value);
+    $settings = ['maintenance_mode' => '0', 'maintenance_end_at' => ''];
+    while (mysqli_stmt_fetch($statement)) {
+        $settingKey = is_string($key) || is_int($key) ? (string) $key : '';
+        if ($settingKey === '') {
+            continue;
+        }
+        $settings[$settingKey] = $value === null ? '' : (string) $value;
+    }
+    mysqli_stmt_close($statement);
+    mysqli_close($connection);
+
+    return [
+        'enabled' => $settings['maintenance_mode'] === '1',
+        'end_at' => $settings['maintenance_end_at'],
+    ];
+}
+
+function maintenance_mode_end_label($endAt)
+{
+    $endAt = trim((string) $endAt);
+    if ($endAt === '') {
+        return '';
+    }
+
+    try {
+        $date = new DateTime($endAt, new DateTimeZone('Asia/Bangkok'));
+        return $date->format('H:i') . ' น. วันที่ ' . $date->format('d/m/Y');
+    } catch (Exception $exception) {
+        return '';
+    }
+}
+
+function maintenance_mode_allows_path($path)
+{
+    return (bool) preg_match('#^/(admin|admin-login|admin-logout|admin\\.php|admin_login\\.php|admin_logout\\.php|admin_api\\.php)(?:/|$)#', $path);
+}
+
+$maintenanceSettings = maintenance_mode_settings($rootDir);
+if ($maintenanceSettings['enabled'] && !maintenance_mode_allows_path($path)) {
+    http_response_code(503);
+    $maintenanceEndLabel = maintenance_mode_end_label($maintenanceSettings['end_at']);
+    $maintenanceMessage = 'ระบบกำลังอยู่ระหว่างการซ่อมบำรุง กรุณาลองใหม่อีกครั้งภายหลัง';
+    if ($maintenanceEndLabel !== '') {
+        $maintenanceMessage .= ' (คาดว่าจะเปิดใช้งานอีกครั้ง ' . $maintenanceEndLabel . ')';
+    }
+    if (strpos($path, '/api') === 0) {
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode([
+            'message' => $maintenanceMessage,
+            'maintenance' => true,
+            'maintenance_end_at' => $maintenanceSettings['end_at'],
+        ], JSON_UNESCAPED_UNICODE);
+    } else {
+        header('Content-Type: text/html; charset=utf-8');
+        $endAtHtml = $maintenanceEndLabel === '' ? '' : '<p class="end-time">คาดว่าจะเปิดใช้งานอีกครั้ง: <strong>' . htmlspecialchars($maintenanceEndLabel, ENT_QUOTES, 'UTF-8') . '</strong></p>';
+        echo '<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>กำลังซ่อมบำรุง</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f1f5f9;font-family:system-ui,sans-serif;color:#172033}.box{max-width:34rem;margin:1.5rem;padding:2.5rem;border-radius:1rem;background:#fff;box-shadow:0 12px 35px #0f172a18;text-align:center}h1{margin:0 0 .75rem;font-size:1.6rem}p{margin:0;color:#526176;line-height:1.7}.end-time{margin-top:1rem;padding:.8rem 1rem;border-radius:.75rem;background:#eff6ff;color:#1e40af}.end-time strong{white-space:nowrap}</style></head><body><main class="box"><h1>ระบบกำลังซ่อมบำรุง</h1><p>ขออภัยในความไม่สะดวก กรุณาลองใช้งานใหม่อีกครั้งภายหลัง</p>' . $endAtHtml . '</main></body></html>';
+    }
+    exit;
+}
+
 if (strpos($path, '/api') === 0) {
     $useLegacy = false;
     if (defined('PHP_VERSION_ID') && PHP_VERSION_ID < 80200) {

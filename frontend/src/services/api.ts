@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
-import { getStoredUserId } from '../constants/storage';
+import { getStoredUserId, getStoredUserRole } from '../constants/storage';
 
 const normalizeBaseURL = (value?: string | null) => {
   if (!value) return '';
@@ -60,11 +60,12 @@ const detectLocalProjectPrefix = () => {
     'notifications',
     'profile',
     'goals',
+    'learning-stats',
     'voice-summary',
     'document-summary',
+    'archived-summaries',
     'career-advisor',
     'overview',
-    'study-capture',
     'study-digest',
     'ai-assistant',
     'study-storage',
@@ -146,6 +147,7 @@ const filterCollectionByUserId = (items: unknown[], userId: number) => {
 };
 
 const filterResponseByUserId = (data: any) => {
+  if (getStoredUserRole() === 'admin') return data;
   const userId = getStoredUserId();
   if (!userId) return data;
   if (Array.isArray(data)) {

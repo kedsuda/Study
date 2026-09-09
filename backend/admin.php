@@ -1,7 +1,4 @@
-﻿
-
-
-<?php
+﻿<?php
 if (function_exists('session_status') && session_status() !== PHP_SESSION_ACTIVE) {
     $sessionPath = __DIR__ . DIRECTORY_SEPARATOR . '.sessions';
     if (!is_dir($sessionPath)) {
@@ -23,6 +20,8 @@ if ($baseDir === '.' || $baseDir === '/') {
 $adminLoginUrl = $baseDir . '/admin_login.php';
 $rootUrl = $baseDir !== '' ? rtrim(dirname($baseDir), '/') : '';
 $faviconUrl = ($rootUrl !== '' ? $rootUrl : '') . '/public/app/img/admin.png';
+$brandLogoUrl = ($rootUrl !== '' ? $rootUrl : '') . '/public/app/logo-network-book.svg';
+$appImgUrl = ($rootUrl !== '' ? $rootUrl : '') . '/public/img/';
 
 if (!isset($_SESSION['user_id'])) {
     header("Location: {$adminLoginUrl}");
@@ -271,9 +270,6 @@ function admin_group_schedules($schedules)
             isset($schedule['user_id']) ? (string) $schedule['user_id'] : '',
             isset($schedule['subject_id']) ? (string) $schedule['subject_id'] : '',
             isset($schedule['day_of_week']) ? (string) $schedule['day_of_week'] : '',
-            isset($schedule['start_time']) ? (string) $schedule['start_time'] : '',
-            isset($schedule['end_time']) ? (string) $schedule['end_time'] : '',
-            isset($schedule['room']) ? (string) $schedule['room'] : '',
             isset($schedule['schedule_type']) ? (string) $schedule['schedule_type'] : '',
             $termKey,
         ];
@@ -283,6 +279,18 @@ function admin_group_schedules($schedules)
             $groups[$key] = $schedule;
         } else {
             $groups[$key]['duplicate_count']++;
+
+            if (empty($groups[$key]['room']) && !empty($schedule['room'])) {
+                $groups[$key]['room'] = $schedule['room'];
+            }
+
+            if (empty($groups[$key]['start_time']) && !empty($schedule['start_time'])) {
+                $groups[$key]['start_time'] = $schedule['start_time'];
+            }
+
+            if (empty($groups[$key]['end_time']) && !empty($schedule['end_time'])) {
+                $groups[$key]['end_time'] = $schedule['end_time'];
+            }
         }
     }
     return array_values($groups);
@@ -326,32 +334,20 @@ function admin_daily_label($dateKey)
     return $weekday . ' ' . date('d/m', $timestamp);
 }
 
-function admin_delta_label($todayValue, $yesterdayValue, $unit)
-{
-    $today = (int) $todayValue;
-    $yesterday = (int) $yesterdayValue;
-    $diff = $today - $yesterday;
-    if ($diff === 0) {
-        return ['class' => 'same', 'text' => 'เท่ากับเมื่อวาน'];
-    }
-    if ($diff > 0) {
-        return ['class' => 'up', 'text' => '+' . $diff . ' ' . $unit . ' จากเมื่อวาน'];
-    }
-    return ['class' => 'down', 'text' => $diff . ' ' . $unit . ' จากเมื่อวาน'];
-}
-
 $conn = admin_db_connect();
 $users = [];
 $subjects = [];
 $schedules = [];
-$notifications = [];
 $studyLogs = [];
 $quizzes = [];
+$learningGoals = [];
 $usersById = [];
 $subjectsById = [];
+$subjectUserIdsById = [];
 $subjectTermsById = [];
 $semesterOptions = [];
 $semesterById = [];
+$semesterSubjectCounts = [];
 $currentAdminProfile = [
     'id' => isset($_SESSION['user_id']) ? (string) $_SESSION['user_id'] : '',
     'name' => isset($_SESSION['username']) ? (string) $_SESSION['username'] : 'ผู้ดูแล',
@@ -363,7 +359,6 @@ $hasSubjectSemesterColumn = false;
 $userCountFromDb = 0;
 $subjectCountFromDb = 0;
 $scheduleCountFromDb = 0;
-$notificationCountFromDb = 0;
 $studyLogCountFromDb = 0;
 $quizCountFromDb = 0;
 
@@ -371,13 +366,15 @@ if ($conn) {
     $userCountFromDb = admin_count_rows($conn, 'users');
     $subjectCountFromDb = admin_count_rows($conn, 'subjects');
     $scheduleCountFromDb = admin_count_rows($conn, 'schedules');
-    $notificationCountFromDb = admin_count_rows($conn, 'learning_notifications');
-    $studyLogCountFromDb = admin_count_rows($conn, 'study_logs');
+    // This is counted from the filtered rows loaded below so legacy quiz-source
+    // logs are not included in the learning-summary total.
+    $studyLogCountFromDb = 0;
     $quizCountFromDb = admin_count_rows($conn, 'quizzes');
 
     $semesterKeys = [];
     if (admin_table_exists($conn, 'semester')) {
-        $result = admin_db_query($conn, 'SELECT semester_id, semester, academic_year FROM semester ORDER BY academic_year DESC, semester ASC');
+        // เรียงภาคเรียนจากใหม่ไปเก่า: ปีการศึกษาล่าสุดก่อน และภาคเรียนเลขมากกว่าก่อน
+        $result = admin_db_query($conn, 'SELECT semester_id, semester, academic_year FROM semester ORDER BY CAST(academic_year AS UNSIGNED) DESC, CAST(semester AS UNSIGNED) DESC, semester_id DESC');
         if ($result) {
             while ($row = mysqli_fetch_assoc($result)) {
                 $term = isset($row['semester']) ? (string) $row['semester'] : '';
@@ -439,7 +436,11 @@ if ($conn) {
     }
     foreach ($subjects as $subject) {
         $subjectsById[$subject['id']] = $subject['name'];
+        $subjectUserIdsById[$subject['id']] = isset($subject['user_id']) ? (string) $subject['user_id'] : '';
         $semesterId = isset($subject['semester_id']) ? (string) $subject['semester_id'] : '';
+        if ($semesterId !== '') {
+            $semesterSubjectCounts[$semesterId] = ($semesterSubjectCounts[$semesterId] ?? 0) + 1;
+        }
         if ($hasSubjectSemesterColumn && $semesterId !== '' && isset($semesterById[$semesterId])) {
             $subjectTermsById[$subject['id']] = $semesterById[$semesterId]['key'];
         } else {
@@ -455,13 +456,27 @@ if ($conn) {
         mysqli_free_result($result);
     }
     if (count($schedules) === 0 && admin_table_exists($conn, 'study_calendar_events')) {
-        $result = admin_db_query($conn, 'SELECT id, user_id, subject_id, start_time, end_time, event_type, created_at, updated_at FROM study_calendar_events ORDER BY id ASC');
+        $eventHasRoomColumn = admin_column_exists($conn, 'study_calendar_events', 'room');
+        $eventSelectSql = 'SELECT id, user_id, subject_id, start_time, end_time, event_type, metadata, created_at, updated_at';
+        if ($eventHasRoomColumn) {
+            $eventSelectSql .= ', room';
+        }
+        $eventSelectSql .= ' FROM study_calendar_events ORDER BY id ASC';
+
+        $result = admin_db_query($conn, $eventSelectSql);
         if ($result) {
             while ($row = mysqli_fetch_assoc($result)) {
+                $metadata = json_decode($row['metadata'] ?? '', true);
+                if (!is_array($metadata)) {
+                    $metadata = [];
+                }
+
                 $startTime = $row['start_time'];
                 $endTime = $row['end_time'];
+
                 $startTs = $startTime ? strtotime($startTime) : false;
                 $endTs = $endTime ? strtotime($endTime) : false;
+
                 $schedules[] = [
                     'id' => $row['id'],
                     'user_id' => $row['user_id'],
@@ -469,7 +484,7 @@ if ($conn) {
                     'day_of_week' => $startTs ? date('l', $startTs) : 'N/A',
                     'start_time' => $startTs ? date('H:i:s', $startTs) : null,
                     'end_time' => $endTs ? date('H:i:s', $endTs) : null,
-                    'room' => null,
+                    'room' => !empty($row['room'] ?? '') ? $row['room'] : ($metadata['room'] ?? ''),
                     'schedule_type' => $row['event_type'],
                     'term_key' => admin_term_key_from_date($row['start_time']),
                     'created_at' => $row['created_at'],
@@ -480,15 +495,14 @@ if ($conn) {
         }
     }
 
-    $result = admin_db_query($conn, 'SELECT id, title, channel, status, notify_at FROM learning_notifications ORDER BY id ASC');
-    if ($result) {
-        while ($row = mysqli_fetch_assoc($result)) {
-            $notifications[] = $row;
-        }
-        mysqli_free_result($result);
-    }
+    $schedules = admin_group_schedules($schedules);
 
-    $result = admin_db_query($conn, 'SELECT id, user_id, subject_id, title, log_date, duration_minutes FROM study_logs ORDER BY id ASC');
+    $studyLogSql = 'SELECT id, user_id, subject_id, title, log_date, duration_minutes FROM study_logs';
+    if (admin_column_exists($conn, 'study_logs', 'note')) {
+        $studyLogSql .= " WHERE COALESCE(note, '') <> 'อัปโหลดไฟล์เพื่อสร้างแบบฝึกหัด'";
+    }
+    $studyLogSql .= ' ORDER BY id ASC';
+    $result = admin_db_query($conn, $studyLogSql);
     if ($result) {
         while ($row = mysqli_fetch_assoc($result)) {
             $studyLogs[] = $row;
@@ -501,6 +515,16 @@ if ($conn) {
             $quizzes[] = $row;
         }
         mysqli_free_result($result);
+    }
+
+    if (admin_table_exists($conn, 'learning_goal_targets')) {
+        $result = admin_db_query($conn, 'SELECT id, user_id, subject_id, period_type, title, target_value, current_value, status, period_start, period_end FROM learning_goal_targets ORDER BY period_start ASC, period_end ASC, id ASC');
+        if ($result) {
+            while ($row = mysqli_fetch_assoc($result)) {
+                $learningGoals[] = $row;
+            }
+            mysqli_free_result($result);
+        }
     }
 }
 
@@ -543,7 +567,7 @@ if (count($semesterOptions) === 0) {
                 if ($termA === $termB) {
                     return 0;
                 }
-                return ($termA < $termB) ? -1 : 1;
+                return ($termA < $termB) ? 1 : -1;
             }
             return ($yearA < $yearB) ? 1 : -1;
         });
@@ -554,9 +578,13 @@ if (count($semesterOptions) === 0) {
 $countUsers = $userCountFromDb > 0 ? $userCountFromDb : count($users);
 $countSubjects = $subjectCountFromDb > 0 ? $subjectCountFromDb : count($subjects);
 $countSchedules = $scheduleCountFromDb > 0 ? $scheduleCountFromDb : count($schedules);
-$countNotifications = $notificationCountFromDb > 0 ? $notificationCountFromDb : count($notifications);
 $countStudyLogs = $studyLogCountFromDb > 0 ? $studyLogCountFromDb : count($studyLogs);
 $countQuizzes = $quizCountFromDb > 0 ? $quizCountFromDb : count($quizzes);
+$statMaxValue = max(1, $countUsers, $countSubjects, $countSchedules, $countStudyLogs);
+$usersStatPercent = max(12, (int) round(($countUsers / $statMaxValue) * 100));
+$subjectsStatPercent = max(12, (int) round(($countSubjects / $statMaxValue) * 100));
+$schedulesStatPercent = max(12, (int) round(($countSchedules / $statMaxValue) * 100));
+$studyLogsStatPercent = max(12, (int) round(($countStudyLogs / $statMaxValue) * 100));
 
 $adminUsersCount = 0;
 $memberUsersCount = 0;
@@ -566,14 +594,6 @@ foreach ($users as $userRow) {
         $adminUsersCount++;
     } else {
         $memberUsersCount++;
-    }
-}
-
-$subjectsWithTargetsCount = 0;
-foreach ($subjects as $subjectRow) {
-    $targetHours = isset($subjectRow['target_hours']) ? (float) $subjectRow['target_hours'] : 0;
-    if ($targetHours > 0) {
-        $subjectsWithTargetsCount++;
     }
 }
 
@@ -589,16 +609,120 @@ foreach ($schedules as $scheduleRow) {
 }
 
 $totalStudyMinutes = 0;
-$activeStudyUsers = [];
 foreach ($studyLogs as $logRow) {
     $totalStudyMinutes += isset($logRow['duration_minutes']) ? max(0, (int) $logRow['duration_minutes']) : 0;
-    $studyUserId = isset($logRow['user_id']) ? (string) $logRow['user_id'] : '';
-    if ($studyUserId !== '') {
-        $activeStudyUsers[$studyUserId] = true;
+}
+$avgStudyMinutes = $countStudyLogs > 0 ? (int) round($totalStudyMinutes / $countStudyLogs) : 0;
+
+$completedGoalsCount = 0;
+$goalProgressTotal = 0;
+$goalProgressCount = count($learningGoals);
+foreach ($learningGoals as &$goalRow) {
+    $targetValue = max(0, (int) ($goalRow['target_value'] ?? 0));
+    $currentValue = max(0, (int) ($goalRow['current_value'] ?? 0));
+    $progressPercent = $targetValue > 0 ? min(100, (int) round(($currentValue / $targetValue) * 100)) : 0;
+    $goalRow['progress_percent'] = $progressPercent;
+    $goalProgressTotal += $progressPercent;
+    if (($goalRow['status'] ?? '') === 'completed' || $progressPercent >= 100) {
+        $completedGoalsCount++;
     }
 }
-$activeStudyUsersCount = count($activeStudyUsers);
-$avgStudyMinutes = $countStudyLogs > 0 ? (int) round($totalStudyMinutes / $countStudyLogs) : 0;
+unset($goalRow);
+$averageGoalProgress = $goalProgressCount > 0 ? (int) round($goalProgressTotal / $goalProgressCount) : 0;
+
+// Surface operational follow-ups on the dashboard without requiring additional queries.
+$subjectOwnerIds = [];
+foreach ($subjects as $subjectRow) {
+    $ownerId = isset($subjectRow['user_id']) ? (string) $subjectRow['user_id'] : '';
+    if ($ownerId !== '') {
+        $subjectOwnerIds[$ownerId] = true;
+    }
+}
+$usersWithoutSubjectsCount = 0;
+foreach ($users as $userRow) {
+    $userId = isset($userRow['id']) ? (string) $userRow['id'] : '';
+    $role = isset($userRow['role']) ? strtolower((string) $userRow['role']) : 'user';
+    if ($userId !== '' && $role !== 'admin' && !isset($subjectOwnerIds[$userId])) {
+        $usersWithoutSubjectsCount++;
+    }
+}
+$goalsNeedingAttentionCount = 0;
+foreach ($learningGoals as $goalRow) {
+    $goalStatus = (string) ($goalRow['status'] ?? 'pending');
+    if ($goalStatus !== 'completed' && (int) ($goalRow['progress_percent'] ?? 0) < 100) {
+        $goalsNeedingAttentionCount++;
+    }
+}
+$dashboardFollowUps = [
+    [
+        'icon' => '🎯',
+        'tone' => 'violet',
+        'title' => 'เป้าหมายที่ยังไม่เสร็จ',
+        'detail' => $goalsNeedingAttentionCount > 0 ? $goalsNeedingAttentionCount . ' เป้าหมายต้องติดตาม' : 'ไม่มีเป้าหมายที่ค้างอยู่',
+        'view' => 'goals',
+    ],
+    [
+        'icon' => '📚',
+        'tone' => 'blue',
+        'title' => 'ผู้ใช้ที่ยังไม่มีวิชา',
+        'detail' => $usersWithoutSubjectsCount > 0 ? $usersWithoutSubjectsCount . ' คนยังไม่มีรายวิชา' : 'ผู้ใช้ทุกคนมีรายวิชาแล้ว',
+        'view' => 'users',
+    ],
+    [
+        'icon' => '🗓️',
+        'tone' => 'orange',
+        'title' => 'ตารางสอบและกิจกรรม',
+        'detail' => $examSchedulesCount > 0 ? $examSchedulesCount . ' รายการในระบบ' : 'ยังไม่มีรายการสอบหรือกิจกรรม',
+        'view' => 'schedules',
+    ],
+];
+
+$dashboardSchedules = $schedules;
+usort($dashboardSchedules, function ($a, $b) {
+    $dayA = (string) ($a['day_of_week'] ?? '');
+    $dayB = (string) ($b['day_of_week'] ?? '');
+    $timeA = (string) ($a['start_time'] ?? '');
+    $timeB = (string) ($b['start_time'] ?? '');
+    return [$dayA, $timeA] <=> [$dayB, $timeB];
+});
+$dashboardSchedules = array_slice($dashboardSchedules, 0, 5);
+
+$userFieldOptions = array_map(function ($userRow) {
+    $id = isset($userRow['id']) ? (string) $userRow['id'] : '';
+    $name = trim((string) ($userRow['name'] ?? ''));
+    $email = trim((string) ($userRow['email'] ?? ''));
+    $labelParts = [];
+    if ($id !== '') {
+        $labelParts[] = '#' . $id;
+    }
+    if ($name !== '') {
+        $labelParts[] = $name;
+    }
+    if ($email !== '') {
+        $labelParts[] = '(' . $email . ')';
+    }
+    return [
+        'value' => $id,
+        'label' => count($labelParts) > 0 ? implode(' ', $labelParts) : $id,
+    ];
+}, $users);
+
+$subjectFieldOptions = array_map(function ($subjectRow) use ($usersById) {
+    $id = isset($subjectRow['id']) ? (string) $subjectRow['id'] : '';
+    $name = trim((string) ($subjectRow['name'] ?? ''));
+    $userId = isset($subjectRow['user_id']) ? (string) $subjectRow['user_id'] : '';
+    $owner = $userId !== '' && isset($usersById[$userId]) ? $usersById[$userId] : $userId;
+    $label = '#' . $id . ' ' . ($name !== '' ? $name : 'ไม่ระบุชื่อวิชา');
+    if ($owner !== '') {
+        $label .= ' - ' . $owner;
+    }
+    return [
+        'value' => $id,
+        'label' => $label,
+        'user_id' => $userId,
+    ];
+}, $subjects);
+
 $adminProfileInitial = mb_substr(trim((string) $currentAdminProfile['name']), 0, 1, 'UTF-8');
 if ($adminProfileInitial === '') {
     $adminProfileInitial = 'ผ';
@@ -609,7 +733,7 @@ $adminJoinedLabel = isset($currentAdminProfile['created_at']) && trim((string) $
 
 $latestActivityTimestamp = 0;
 $latestActivityLabel = 'ยังไม่มีข้อมูลล่าสุด';
-foreach ([$users, $subjects, $schedules, $studyLogs] as $recordGroup) {
+foreach ([$users, $subjects, $schedules, $studyLogs, $quizzes] as $recordGroup) {
     foreach ($recordGroup as $record) {
         foreach (['updated_at', 'created_at', 'log_date', 'start_date'] as $dateField) {
             if (!isset($record[$dateField]) || trim((string) $record[$dateField]) === '') {
@@ -667,13 +791,6 @@ foreach ($dailyStudyUsers as $dateKey => $userSet) {
     $dailySeries[$dateKey]['active_users'] = count($userSet);
 }
 
-foreach ($notifications as $notification) {
-    $dateKey = admin_date_key(isset($notification['notify_at']) ? $notification['notify_at'] : null);
-    if ($dateKey !== null && isset($dailySeries[$dateKey])) {
-        $dailySeries[$dateKey]['notifications']++;
-    }
-}
-
 foreach ($quizzes as $quiz) {
     $dateKey = admin_date_key(isset($quiz['created_at']) ? $quiz['created_at'] : null);
     if ($dateKey !== null && isset($dailySeries[$dateKey])) {
@@ -687,42 +804,6 @@ foreach ($users as $user) {
         $dailySeries[$dateKey]['new_users']++;
     }
 }
-
-$todayKey = date('Y-m-d');
-$yesterdayKey = date('Y-m-d', strtotime('-1 day'));
-$todayDaily = isset($dailySeries[$todayKey]) ? $dailySeries[$todayKey] : [
-    'logs' => 0, 'minutes' => 0, 'active_users' => 0, 'notifications' => 0, 'quizzes' => 0, 'new_users' => 0
-];
-$yesterdayDaily = isset($dailySeries[$yesterdayKey]) ? $dailySeries[$yesterdayKey] : [
-    'logs' => 0, 'minutes' => 0, 'active_users' => 0, 'notifications' => 0, 'quizzes' => 0, 'new_users' => 0
-];
-
-$logsDelta = admin_delta_label($todayDaily['logs'], $yesterdayDaily['logs'], 'บันทึก');
-$minutesDelta = admin_delta_label($todayDaily['minutes'], $yesterdayDaily['minutes'], 'นาที');
-$activeDelta = admin_delta_label($todayDaily['active_users'], $yesterdayDaily['active_users'], 'คน');
-$notifyDelta = admin_delta_label($todayDaily['notifications'], $yesterdayDaily['notifications'], 'แจ้งเตือน');
-
-$countByDate = function ($items, $field, $dateKey) {
-    $count = 0;
-    foreach ($items as $item) {
-        $itemDateKey = admin_date_key(isset($item[$field]) ? $item[$field] : null);
-        if ($itemDateKey === $dateKey) {
-            $count++;
-        }
-    }
-    return $count;
-};
-
-$todayUsersCreated = $countByDate($users, 'created_at', $todayKey);
-$yesterdayUsersCreated = $countByDate($users, 'created_at', $yesterdayKey);
-$todaySubjectsCreated = $countByDate($subjects, 'created_at', $todayKey);
-$yesterdaySubjectsCreated = $countByDate($subjects, 'created_at', $yesterdayKey);
-$todaySchedulesCreated = $countByDate($schedules, 'created_at', $todayKey);
-$yesterdaySchedulesCreated = $countByDate($schedules, 'created_at', $yesterdayKey);
-
-$usersDelta = admin_delta_label($todayUsersCreated, $yesterdayUsersCreated, 'คน');
-$subjectsDelta = admin_delta_label($todaySubjectsCreated, $yesterdaySubjectsCreated, 'วิชา');
-$schedulesDelta = admin_delta_label($todaySchedulesCreated, $yesterdaySchedulesCreated, 'ตาราง');
 
 $currentHour = (int) date('G');
 $greetingText = 'สวัสดี';
@@ -844,17 +925,17 @@ foreach (array_slice(array_reverse($subjects), 0, 4) as $subjectPreview) {
     ];
 }
 
-foreach (array_slice(array_reverse($studyLogs), 0, 4) as $logPreview) {
-    $activitySubjectId = isset($logPreview['subject_id']) ? (string) $logPreview['subject_id'] : '';
-    $activitySubjectName = $activitySubjectId !== '' && isset($subjectsById[$activitySubjectId]) ? $subjectsById[$activitySubjectId] : 'บันทึกการเรียน';
-    $recentActivities[] = [
-        'icon_class' => 'orange',
-        'icon' => '📝',
-        'title' => 'บันทึกการเรียน',
-        'meta' => $activitySubjectName,
-        'time' => isset($logPreview['log_date']) ? (string) $logPreview['log_date'] : '',
-    ];
-}
+// foreach (array_slice(array_reverse($studyLogs), 0, 4) as $logPreview) {
+//     $activitySubjectId = isset($logPreview['subject_id']) ? (string) $logPreview['subject_id'] : '';
+//     $activitySubjectName = $activitySubjectId !== '' && isset($subjectsById[$activitySubjectId]) ? $subjectsById[$activitySubjectId] : 'บันทึกการเรียน';
+//     $recentActivities[] = [
+//         'icon_class' => 'orange',
+//         'icon' => '📝',
+//         'title' => 'บันทึกการเรียน',
+//         'meta' => $activitySubjectName,
+//         'time' => isset($logPreview['log_date']) ? (string) $logPreview['log_date'] : '',
+//     ];
+// }
 
 usort($recentActivities, function ($a, $b) {
     $timeA = isset($a['time']) ? strtotime((string) $a['time']) : false;
@@ -868,42 +949,64 @@ $recentActivities = array_slice($recentActivities, 0, 5);
 ?>
 <!DOCTYPE html>
 <html lang="th">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ระบบการเรียน - ผู้ดูแลระบบ</title>
     <link rel="icon" type="image/png" href="<?php echo admin_h($faviconUrl); ?>">
     <link rel="shortcut icon" href="<?php echo admin_h($faviconUrl); ?>">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans+Thai:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-        <link rel="stylesheet" href="<?php echo admin_h(($baseDir !== '' ? $baseDir : '') . '/slty.css'); ?>">
+    <link rel="stylesheet" href="<?php echo admin_h(($baseDir !== '' ? $baseDir : '') . '/slty.css'); ?>">
+    <style>
+        /* ลดความกว้างช่องเลือกเวลาในหน้าตั้งค่าซ่อมบำรุง */
+        .maintenance-schedule .admin-time-picker {
+            display: flex !important;
+            align-items: center;
+            justify-content: flex-start;
+            gap: 10px;
+            width: auto !important;
+        }
+
+        .maintenance-schedule .admin-time-picker select {
+            flex: 0 0 160px !important;
+            width: 160px !important;
+            min-width: 160px !important;
+            max-width: 160px !important;
+        }
+
+        .maintenance-schedule .admin-time-picker > span {
+            flex: 0 0 auto;
+        }
+
+        @media (max-width: 520px) {
+            .maintenance-schedule .admin-time-picker {
+                width: 100% !important;
+            }
+
+            .maintenance-schedule .admin-time-picker select {
+                flex: 1 1 0 !important;
+                width: auto !important;
+                min-width: 0 !important;
+                max-width: none !important;
+            }
+        }
+    </style>
 </head>
+
 <body>
     <div class="layout" id="adminLayout">
         <aside class="sidebar">
             <div class="brand">
-                <span class="brand-badge brand-cluster" aria-hidden="true">
-                    <i class="dot dot-a"></i>
-                    <i class="dot dot-b"></i>
-                    <i class="dot dot-c"></i>
-                    <i class="dot dot-d"></i>
-                    <i class="dot dot-e"></i>
-                </span>
                 <span class="brand-text">
-                    <strong>Smart Learning</strong>
-                    <small>Tracker</small>
+                    <strong>ผู้ดูแลระบบ</strong>
                 </span>
             </div>
             <div class="user-card">
                 <div class="name">
                     <span class="greet">สวัสดี,</span>
-                    <span class="username"><?php echo admin_h(isset($_SESSION['username']) ? $_SESSION['username'] : 'ผู้ดูแล'); ?></span>
+                    <span class="username"><?php echo admin_h(isset($_SESSION['username']) ? $_SESSION['username'] : 'ผู้ดูแลระบบ'); ?></span>
                 </div>
-                <div class="role">
-                    <span class="role-icon">🛡</span>
-                    <span>ผู้ดูแลระบบหลัก</span>
-                </div>
+                <div class="role">สิทธิ์ผู้ดูแลระบบ</div>
             </div>
             <nav class="nav">
                 <a class="active" href="#" data-nav="dashboard">
@@ -914,17 +1017,29 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                     <span class="icon blue">👥</span>
                     <span class="label">ผู้ใช้งาน</span>
                 </a>
+                <a href="#" data-nav="semesters">
+                    <span class="icon cyan">📅</span>
+                    <span class="label">ภาคเรียน</span>
+                </a>
                 <a href="#" data-nav="subjects">
                     <span class="icon cyan">📚</span>
                     <span class="label">วิชาเรียน</span>
                 </a>
                 <a href="#" data-nav="schedules">
                     <span class="icon cyan">🗓️</span>
-                    <span class="label">ตารางเรียน</span>
+                    <span class="label">ตารางเรียนและสอบ</span>
                 </a>
                 <a href="#" data-nav="study-logs">
                     <span class="icon purple">🧾</span>
-                    <span class="label">บันทึกการเรียน</span>
+                    <span class="label">สรุปการเรียน</span>
+                </a>
+                <a href="#" data-nav="quizzes">
+                    <span class="icon purple">📝</span>
+                    <span class="label">แบบฝึกหัด</span>
+                </a>
+                <a href="#" data-nav="goals">
+                    <span class="icon purple">🎯</span>
+                    <span class="label">เป้าหมายและความคืบหน้า</span>
                 </a>
                 <a href="#" data-nav="settings">
                     <span class="icon gray">⚙️</span>
@@ -936,22 +1051,39 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                     <span class="label">ออกจากระบบ</span>
                 </a>
             </nav>
-            <div class="sidebar-footer">ระบบติดตามการเรียนรู้</div>
+            <div class="sidebar-footer">ผู้ดูแลระบบ</div>
         </aside>
 
         <main class="main">
-     
-            <section class="page-card">
+            <div class="topbar">
+                <div class="left">
+                    <button class="toggle-btn" type="button" id="sidebarToggle" aria-label="เมนู">เมนู</button>
+                    <div class="topbar-heading">
+                        <div class="topbar-title">ผู้ดูแลระบบ</div>
+                    </div>
+                </div>
+                <div class="right">
+                    <span class="icon-pill datetime-pill" id="currentDateTime"></span>
+                    <span class="admin-chip">
+                        <span class="admin-avatar"><?php echo admin_h($adminProfileInitial); ?></span>
+                        <span class="admin-meta">
+                            <strong>ผู้ดูแลระบบ</strong>
+                        </span>
+                    </span>
+                </div>
+            </div>
+
+            <section class="page-card admin-dashboard-mockup">
                 <div class="card-header" id="mainPanelHeader">
                     <div class="panel-context">
-                        <div class="panel-kicker" id="panelKicker">ศูนย์ควบคุมผู้ดูแล</div>
-                        <div class="card-title" id="cardTitle">ภาพรวมระบบ</div>
+                        <div class="panel-kicker" id="panelKicker">ผู้ดูแลระบบ</div>
+                        <div class="card-title" id="cardTitle">ตารางแสดงรายการ (ผู้ดูแลระบบ)</div>
                         <div class="panel-subtitle" id="cardSubtitle">ภาพรวมข้อมูลจริงของผู้ใช้ วิชา ตารางเรียน และบันทึกการเรียน</div>
                     </div>
                 </div>
 
                 <div class="panel-toolbar" id="mainPanelToolbar">
-                    <select id="userFilter" style="min-width:190px;">
+                    <select id="userFilter" aria-label="กรองตามผู้ใช้งาน" style="min-width:190px;">
                         <option value="">ทุกผู้ใช้งาน</option>
                         <?php foreach ($users as $userOption): ?>
                             <option value="<?php echo admin_h($userOption['id']); ?>">
@@ -959,94 +1091,113 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                             </option>
                         <?php endforeach; ?>
                     </select>
-                    <select id="termFilter" style="min-width:160px;">
-                        <option value="">ทุกเทอม</option>
-                        <?php if (count($semesterOptions) > 0): ?>
-                            <?php foreach ($semesterOptions as $semesterOption): ?>
-                                <option value="<?php echo admin_h($semesterOption['key']); ?>">
-                                    <?php echo admin_h($semesterOption['label']); ?>
-                                </option>
-                            <?php endforeach; ?>
-                        <?php else: ?>
-                            <option value="1">ภาคต้น</option>
-                            <option value="2">ภาคปลาย</option>
-                            <option value="3">ฤดูร้อน</option>
-                        <?php endif; ?>
+                    <select id="semesterFilter" aria-label="กรองตามภาคเรียน" style="min-width:220px;">
+                        <?php foreach ($semesterOptions as $semesterOption): ?>
+                            <option value="<?php echo admin_h($semesterOption['key'] ?? ''); ?>">
+                                <?php echo admin_h('ภาคเรียนที่ ' . ($semesterOption['term'] ?? '-') . ' ปีการศึกษา ' . ($semesterOption['year'] ?? '-')); ?>
+                            </option>
+                        <?php endforeach; ?>
                     </select>
                 </div>
 
-                <div class="tab-panel active" data-panel="dashboard">
-                    <div class="table-wrap">
-                        <div class="stats-grid" id="adminBarChart">
-                            <div class="stat-card">
-                                <div class="stat-icon violet">👥</div>
-                                <div class="stat-label" id="dashboardUsersLabel">ผู้ใช้ทั้งหมด</div>
-                                <div class="stat-value" id="dashboardUsersValue"><?php echo (int) $countUsers; ?></div>
-                                <div class="stat-sub" id="dashboardUsersSub">คนในระบบ</div>
-                                <div class="stat-trend <?php echo admin_h($usersDelta['class']); ?>"><?php echo admin_h($usersDelta['text']); ?></div>
-                                <div class="stat-mini-chart">
-                                    <div class="bar-item compact">
+                <div class="tab-panel active dashboard-overview-panel" data-panel="dashboard">
+                    <h3 class="mockup-section-title">สถิติภาพรวม</h3>
+                <div class="stats-grid stats-graph-grid">
+<div class="stat-card">
+    <div class="stat-icon violet">
+        <img src="<?php echo admin_h($appImgUrl . 'users-icon.png'); ?>" alt="ผู้ใช้ทั้งหมด">
+    </div>
+    <div class="stat-copy">
+        <div class="stat-label" id="dashboardUsersLabel">ผู้ใช้ทั้งหมด</div>
+        <div class="stat-value" id="dashboardUsersValue"><?php echo (int) $countUsers; ?></div>
+        <div class="stat-sub" id="dashboardUsersSub">คนในระบบ</div>
+    </div>
+    <div class="stat-mini-chart" aria-hidden="true">
+        <span class="stat-mini-track">
+            <i class="stat-mini-fill violet" id="dashboardUsersMiniBar" data-value="<?php echo (int) $countUsers; ?>" style="height: <?php echo (int) $usersStatPercent; ?>%;"></i>
+        </span>
+    </div>
+</div>
+
+<div class="stat-card">
+    <div class="stat-icon blue">
+        <img src="<?php echo admin_h($appImgUrl . 'subject-icon.png'); ?>" alt="วิชาเรียน">
+    </div>
+    <div class="stat-copy">
+        <div class="stat-label">วิชาเรียน</div>
+        <div class="stat-value" id="dashboardSubjectsValue"><?php echo (int) $countSubjects; ?></div>
+        <div class="stat-sub" id="dashboardSubjectsSub">วิชาที่บันทึกไว้</div>
+    </div>
+    <div class="stat-mini-chart" aria-hidden="true">
+        <span class="stat-mini-track">
+            <i class="stat-mini-fill blue" id="dashboardSubjectsMiniBar" data-value="<?php echo (int) $countSubjects; ?>" style="height: <?php echo (int) $subjectsStatPercent; ?>%;"></i>
+        </span>
+    </div>
+</div>
+
+<div class="stat-card">
+    <div class="stat-icon green">
+        <img src="<?php echo admin_h($appImgUrl . 'schedule-icon.png'); ?>" alt="ตารางเรียน">
+    </div>
+    <div class="stat-copy">
+        <div class="stat-label">ตารางเรียน</div>
+        <div class="stat-value" id="dashboardSchedulesValue"><?php echo (int) $countSchedules; ?></div>
+        <div class="stat-sub" id="dashboardSchedulesSub">รายการทั้งหมด</div>
+    </div>
+    <div class="stat-mini-chart" aria-hidden="true">
+        <span class="stat-mini-track">
+            <i class="stat-mini-fill green" id="dashboardSchedulesMiniBar" data-value="<?php echo (int) $countSchedules; ?>" style="height: <?php echo (int) $schedulesStatPercent; ?>%;"></i>
+        </span>
+    </div>
+</div>
+
+                </div>
+                        <div class="chart-card summary-chart-card mockup-summary-chart" aria-hidden="true">
+                            <div class="chart-title" id="dashboardChartTitle">ภาพรวมข้อมูล</div>
+                            <div class="bar-chart-with-axes">
+                                <div class="bar-y-axis" aria-hidden="true">
+                                    <span id="dashboardChartTickMax">0</span>
+                                    <span>0</span>
+                                    <span>0</span>
+                                    <span id="dashboardChartTickMid">0</span>
+                                    <span>0</span>
+                                    <span>0</span>
+                                    <span>0</span>
+                                </div>
+                                <div class="bar-chart" id="adminBarChart" aria-label="กราฟสรุปข้อมูลผู้ดูแลระบบ แกนตั้งแสดงจำนวนรายการ แกนนอนแสดงประเภทข้อมูล">
+                                    <div class="bar-item">
                                         <div class="bar-value" id="dashboardUsersBarValue"><?php echo (int) $countUsers; ?></div>
                                         <div class="bar-track">
-                                            <div class="bar-fill" id="dashboardUsersBar" data-value="<?php echo (int) $countUsers; ?>"></div>
+                                            <div class="bar-fill blue" id="dashboardUsersBar" data-value="<?php echo (int) $countUsers; ?>"></div>
                                         </div>
+                                        <div class="bar-label">ผู้ใช้งาน</div>
                                     </div>
-                                </div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-icon blue">🎓</div>
-                                <div class="stat-label">วิชาเรียน</div>
-                                <div class="stat-value" id="dashboardSubjectsValue"><?php echo (int) $countSubjects; ?></div>
-                                <div class="stat-sub" id="dashboardSubjectsSub">วิชาที่บันทึกไว้</div>
-                                <div class="stat-trend <?php echo admin_h($subjectsDelta['class']); ?>"><?php echo admin_h($subjectsDelta['text']); ?></div>
-                                <div class="stat-mini-chart">
-                                    <div class="bar-item compact">
+                                    <div class="bar-item">
                                         <div class="bar-value" id="dashboardSubjectsBarValue"><?php echo (int) $countSubjects; ?></div>
                                         <div class="bar-track">
-                                            <div class="bar-fill" id="dashboardSubjectsBar" data-value="<?php echo (int) $countSubjects; ?>"></div>
+                                            <div class="bar-fill green" id="dashboardSubjectsBar" data-value="<?php echo (int) $countSubjects; ?>"></div>
                                         </div>
+                                        <div class="bar-label">วิชาเรียน</div>
                                     </div>
-                                </div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-icon green">🗓</div>
-                                <div class="stat-label">ตารางเรียน</div>
-                                <div class="stat-value" id="dashboardSchedulesValue"><?php echo (int) $countSchedules; ?></div>
-                                <div class="stat-sub" id="dashboardSchedulesSub">รายการตารางทั้งหมด</div>
-                                <div class="stat-trend <?php echo admin_h($schedulesDelta['class']); ?>"><?php echo admin_h($schedulesDelta['text']); ?></div>
-                                <div class="stat-mini-chart">
-                                    <div class="bar-item compact">
+                                    <div class="bar-item">
                                         <div class="bar-value" id="dashboardSchedulesBarValue"><?php echo (int) $countSchedules; ?></div>
                                         <div class="bar-track">
-                                            <div class="bar-fill" id="dashboardSchedulesBar" data-value="<?php echo (int) $countSchedules; ?>"></div>
+                                            <div class="bar-fill amber" id="dashboardSchedulesBar" data-value="<?php echo (int) $countSchedules; ?>"></div>
                                         </div>
+                                        <div class="bar-label">ตารางเรียน</div>
                                     </div>
                                 </div>
                             </div>
-                            <div class="stat-card">
-                                <div class="stat-icon orange">🧾</div>
-                                <div class="stat-label">บันทึกการเรียน</div>
-                                <div class="stat-value" id="dashboardStudyLogsValue"><?php echo (int) $countStudyLogs; ?></div>
-                                <div class="stat-sub" id="dashboardStudyLogsSub">รายการบันทึกทั้งหมด</div>
-                                <div class="stat-trend <?php echo admin_h($logsDelta['class']); ?>"><?php echo admin_h($logsDelta['text']); ?></div>
-                                <div class="stat-mini-chart">
-                                    <div class="bar-item compact">
-                                        <div class="bar-value" id="dashboardStudyLogsBarValue"><?php echo (int) $countStudyLogs; ?></div>
-                                        <div class="bar-track">
-                                            <div class="bar-fill" id="dashboardStudyLogsBar" data-value="<?php echo (int) $countStudyLogs; ?>"></div>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
+                            <div class="bar-axis bar-x-axis" aria-label="แกนนอน: ประเภทข้อมูล">แกนนอน: ประเภทข้อมูล</div>
+                            <div class="bar-y-axis-title" aria-hidden="true">แกนตั้ง: จำนวน (รายการ)</div>
                         </div>
-
                         <div class="dashboard-insights-grid">
                             <div class="chart-card trend-card">
                                 <div class="trend-head">
                                     <div class="trend-title-wrap">
                                         <span class="trend-icon" aria-hidden="true">
                                             <svg viewBox="0 0 24 24" fill="none">
-                                                <path d="M3 12h4l2-5 4 10 2-5h6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                                                <path d="M3 12h4l2-5 4 10 2-5h6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
                                             </svg>
                                         </span>
                                         <div class="chart-title">แนวโน้มการใช้งาน (7 วันย้อนหลัง)</div>
@@ -1061,16 +1212,143 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                         <option value="year">ปี</option>
                                     </select>
                                 </div>
-                                <div class="trend-chart" id="adminTrendChart" data-trend="<?php echo admin_h(json_encode($trendChartData, JSON_UNESCAPED_UNICODE)); ?>">
-                                    <svg viewBox="0 0 920 320" preserveAspectRatio="none" role="img" aria-label="กราฟแนวโน้มผู้ใช้งานและบันทึกการเรียนย้อนหลัง 7 วัน"></svg>
-                                </div>
+                                <div class="trend-chart" id="adminTrendChart" data-trend="<?php echo admin_h(json_encode($trendChartData, JSON_UNESCAPED_UNICODE)); ?>"></div>
                             </div>
 
+
+                            <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+
+                            <script>
+                                document.addEventListener('DOMContentLoaded', function() {
+                                    const chartEl = document.querySelector('#adminTrendChart');
+                                    const rangeSelect = document.querySelector('#trendRangeSelect');
+
+                                    if (!chartEl) return;
+
+                                    const trendData = JSON.parse(chartEl.dataset.trend || '{}');
+                                    let chart = null;
+
+                                    function renderTrendChart(range = 'week') {
+                                        const trend = trendData[range] || trendData.week || {
+                                            labels: [],
+                                            users: [],
+                                            logs: []
+                                        };
+
+                                        if (chart) {
+                                            chart.destroy();
+                                        }
+
+                                        chart = new ApexCharts(chartEl, {
+                                            chart: {
+                                                type: 'area',
+                                                height: 300,
+                                                toolbar: {
+                                                    show: false
+                                                },
+                                                zoom: {
+                                                    enabled: false
+                                                }
+                                            },
+                                            series: [{
+                                                    name: 'ผู้ใช้งาน',
+                                                    data: trend.users
+                                                },
+                                                {
+                                                    name: 'บันทึก',
+                                                    data: trend.logs
+                                                }
+                                            ],
+                                            xaxis: {
+                                                categories: trend.labels,
+                                                labels: {
+                                                    style: {
+                                                        fontFamily: 'IBM Plex Sans Thai, sans-serif'
+                                                    }
+                                                }
+                                            },
+                                            yaxis: {
+                                                min: 0,
+                                                tickAmount: 5,
+                                                labels: {
+                                                    style: {
+                                                        fontFamily: 'IBM Plex Sans Thai, sans-serif'
+                                                    }
+                                                }
+                                            },
+                                            stroke: {
+                                                curve: 'smooth',
+                                                width: [3, 3]
+                                            },
+                                            colors: ['#6aa7e8', '#2fc6a3'],
+                                            fill: {
+                                                type: 'gradient',
+                                                gradient: {
+                                                    opacityFrom: 0.38,
+                                                    opacityTo: 0.05
+                                                }
+                                            },
+                                            markers: {
+                                                size: 4,
+                                                strokeWidth: 2,
+                                                hover: {
+                                                    size: 6
+                                                }
+                                            },
+                                            legend: {
+                                                show: false
+                                            },
+                                            grid: {
+                                                borderColor: '#e5e7eb',
+                                                strokeDashArray: 4
+                                            },
+                                            dataLabels: {
+                                                enabled: false
+                                            },
+                                            tooltip: {
+                                                shared: true,
+                                                intersect: false
+                                            }
+                                        });
+
+                                        chart.render();
+                                    }
+
+                                    renderTrendChart(rangeSelect ? rangeSelect.value : 'week');
+
+                                    if (rangeSelect) {
+                                        rangeSelect.addEventListener('change', function() {
+                                            renderTrendChart(this.value);
+                                        });
+                                    }
+                                });
+                            </script>
+
                             <div class="dashboard-side-stack">
+                                <div class="chart-card follow-up-card">
+                                    <div class="activity-head">
+                                        <div>
+                                            <div class="chart-title">รายการที่ต้องติดตาม</div>
+                                            <p class="panel-hint">ตรวจสอบรายการที่ยังต้องดำเนินการในระบบ</p>
+                                        </div>
+                                    </div>
+                                    <div class="follow-up-list">
+                                        <?php foreach ($dashboardFollowUps as $followUp): ?>
+                                            <button type="button" class="follow-up-item mini-link-btn" data-view="<?php echo admin_h($followUp['view']); ?>">
+                                                <span class="activity-icon <?php echo admin_h($followUp['tone']); ?>" aria-hidden="true"><?php echo admin_h($followUp['icon']); ?></span>
+                                                <span class="activity-copy">
+                                                    <strong><?php echo admin_h($followUp['title']); ?></strong>
+                                                    <small><?php echo admin_h($followUp['detail']); ?></small>
+                                                </span>
+                                                <span class="follow-up-arrow" aria-hidden="true">›</span>
+                                            </button>
+                                        <?php endforeach; ?>
+                                    </div>
+                                </div>
                                 <div class="chart-card activity-card">
                                     <div class="activity-head">
                                         <div class="chart-title">กิจกรรมล่าสุด</div>
-                                        <button type="button" class="mini-link-btn">ดูทั้งหมด</button>
+                                        <button type="button" class="mini-link-btn" data-view="study-logs">ดูทั้งหมด</button>
                                     </div>
                                     <div class="activity-list">
                                         <?php if (count($recentActivities) === 0): ?>
@@ -1083,7 +1361,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                                         <strong><?php echo admin_h($activity['title']); ?></strong>
                                                         <small><?php echo admin_h($activity['meta']); ?></small>
                                                     </span>
-                                                    <span class="activity-time"><?php echo admin_h(admin_format_datetime_short($activity['time'])); ?></span>
+                                                    <span class="activity-time"><?php echo admin_h(admin_format_short_date($activity['time'])); ?></span>
                                                 </div>
                                             <?php endforeach; ?>
                                         <?php endif; ?>
@@ -1093,14 +1371,44 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                         </div>
 
                         <div class="dashboard-bottom-grid">
+                            <div class="daily-table-card dashboard-schedule-card">
+                                <div class="daily-head">
+                                    <span class="daily-head-icon schedule">🗓️</span>
+                                    <div>
+                                        <h3 class="daily-table-title">ตารางเรียนและสอบในระบบ</h3>
+                                        <div class="daily-head-sub">รายการที่บันทึกไว้ เรียงตามวันและเวลา</div>
+                                    </div>
+                                    <button type="button" class="mini-link-btn" data-view="schedules">ดูทั้งหมด <span aria-hidden="true">›</span></button>
+                                </div>
+                                <div class="schedule-preview-list">
+                                    <?php if (count($dashboardSchedules) === 0): ?>
+                                        <div class="activity-empty">ยังไม่มีตารางเรียนหรือสอบ</div>
+                                    <?php else: ?>
+                                        <?php foreach ($dashboardSchedules as $schedulePreview): ?>
+                                            <?php
+                                            $scheduleSubjectId = isset($schedulePreview['subject_id']) ? (string) $schedulePreview['subject_id'] : '';
+                                            $scheduleType = admin_schedule_type_normalize($schedulePreview['schedule_type'] ?? '');
+                                            ?>
+                                            <div class="schedule-preview-item">
+                                                <span class="schedule-preview-date"><?php echo admin_h((string) ($schedulePreview['day_of_week'] ?? '-')); ?></span>
+                                                <span class="schedule-preview-copy">
+                                                    <strong><?php echo admin_h($subjectsById[$scheduleSubjectId] ?? 'ไม่ระบุวิชา'); ?></strong>
+                                                    <small><?php echo admin_h((string) ($schedulePreview['start_time'] ?? '--:--') . ' - ' . (string) ($schedulePreview['end_time'] ?? '--:--')); ?><?php echo !empty($schedulePreview['room']) ? ' · ' . admin_h((string) $schedulePreview['room']) : ''; ?></small>
+                                                </span>
+                                                <span class="badge <?php echo $scheduleType === 'exam' ? 'amber' : 'green'; ?>"><?php echo admin_h(admin_schedule_type_label($schedulePreview['schedule_type'] ?? '')); ?></span>
+                                            </div>
+                                        <?php endforeach; ?>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
                             <div class="daily-table-card users-latest-card">
                                 <div class="daily-head">
                                     <span class="daily-head-icon">👤</span>
                                     <div>
-                                        <h3 class="daily-table-title">ผู้ใช้งานล่าสุด <span class="title-sparkle">✦</span></h3>
+                                        <h3 class="daily-table-title">ผู้ใช้งานล่าสุด</h3>
                                         <div class="daily-head-sub">สรุปรายชื่อผู้ใช้งานที่เพิ่มเข้ามาล่าสุด</div>
                                     </div>
-                                    <button type="button" class="mini-link-btn">ดูทั้งหมด <span aria-hidden="true">›</span></button>
+                                    <button type="button" class="mini-link-btn" data-view="users">ดูทั้งหมด <span aria-hidden="true">›</span></button>
                                 </div>
                                 <div class="daily-table-wrap">
                                     <table class="daily-table compact-table">
@@ -1138,19 +1446,16 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                         </tbody>
                                     </table>
                                 </div>
-                                <div class="card-footer-action">
-                                    <button type="button" class="footer-outline-btn">→ ผู้ใช้ทั้งหมด</button>
-                                </div>
                             </div>
 
                             <div class="daily-table-card subject-latest-card">
                                 <div class="daily-head">
                                     <span class="daily-head-icon subject">📚</span>
                                     <div>
-                                        <h3 class="daily-table-title">วิชาเรียนที่เพิ่มล่าสุด <span class="title-sparkle">✦</span></h3>
+                                        <h3 class="daily-table-title">วิชาเรียนที่เพิ่มล่าสุด</h3>
                                         <div class="daily-head-sub">สรุปรายวิชาล่าสุดที่ถูกสร้างในระบบ</div>
                                     </div>
-                                    <button type="button" class="mini-link-btn">ดูทั้งหมด <span aria-hidden="true">›</span></button>
+                                    <button type="button" class="mini-link-btn" data-view="subjects">ดูทั้งหมด <span aria-hidden="true">›</span></button>
                                 </div>
                                 <div class="daily-table-wrap">
                                     <table class="daily-table compact-table">
@@ -1189,15 +1494,14 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                             </div>
                         </div>
                     </div>
-                </div>
 
-                <div class="tab-panel" data-panel="users">
+                <div class="tab-panel" data-panel="users" data-ignore-semester-filter="1">
                     <div class="table-wrap">
                         <div class="section-heading">
                             <div>
-                                <div class="section-kicker">จัดการผู้ใช้งาน</div>
-                                <h3>จัดการบัญชีผู้ใช้จากข้อมูลจริง</h3>
-                              
+                    
+                                <h3>ข้อมูลบัญชีผู้ใช้</h3>
+
                             </div>
                             <div class="section-metrics">
                                 <div class="mini-metric">
@@ -1208,10 +1512,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                     <span class="mini-label">ผู้ดูแล</span>
                                     <strong><?php echo (int) $adminUsersCount; ?></strong>
                                 </div>
-                                <div class="mini-metric">
-                                    <span class="mini-label">สมาชิก</span>
-                                    <strong><?php echo (int) $memberUsersCount; ?></strong>
-                                </div>
+
                             </div>
                         </div>
                         <table class="table user-table" data-table="users">
@@ -1222,13 +1523,13 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                     <th data-field="role" data-editable="1" data-create="1">บทบาท</th>
                                     <th>สถานะ</th>
                                     <th data-field="created_at" data-editable="0" data-create="0">วันที่เพิ่ม</th>
-                                    <th>จัดการ</th>
+
                                 </tr>
                             </thead>
                             <tbody>
                                 <?php if (count($users) === 0): ?>
                                     <tr>
-                                        <td colspan="6">ยังไม่มีข้อมูล</td>
+                                        <td colspan="5">ยังไม่มีข้อมูล</td>
                                     </tr>
                                 <?php else: ?>
                                     <?php foreach ($users as $user): ?>
@@ -1247,10 +1548,70 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                             <td><span class="status-pill on">ใช้งาน</span></td>
                                             <td data-field="created_at"><?php echo admin_h(admin_format_short_date(isset($user['created_at']) ? $user['created_at'] : '')); ?></td>
                                             <td>
-                                                <span class="tools user-actions">
-                                                    <button type="button" class="tool blue icon-only" aria-label="แก้ไข" title="แก้ไข">✏️</button>
-                                                    <button type="button" class="tool gray icon-only" aria-label="ดูรายละเอียด" title="ดูรายละเอียด">👁</button>
-                                                    <button type="button" class="tool red icon-only" aria-label="ลบ" title="ลบ">🗑</button>
+
+
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                <?php endif; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="pager">
+                        <div class="page-btn">‹</div>
+                        <div class="page-current">1</div>
+                        <div class="page-btn">›</div>
+                    </div>
+                </div>
+
+                <div class="tab-panel" data-panel="semesters" data-ignore-user-filter="1" data-ignore-semester-filter="1">
+                    <div class="table-wrap">
+                        <div class="section-heading">
+                            <div>
+                                <h3>ข้อมูลภาคเรียนทั้งหมด</h3>
+                            </div>
+                            <div class="section-metrics">
+                                <div class="mini-metric">
+                                    <span class="mini-label">ภาคเรียนทั้งหมด</span>
+                                    <strong><?php echo (int) count($semesterOptions); ?></strong>
+                                </div>
+                                <div class="mini-metric">
+                                    <span class="mini-label">วิชาทั้งหมด</span>
+                                    <strong><?php echo (int) $countSubjects; ?></strong>
+                                </div>
+                            </div>
+                        </div>
+                        <table class="table" data-table="semester">
+                            <thead>
+                                <tr>
+                                    <th data-field="semester_id">รหัส</th>
+                                    <th data-field="semester">ภาคเรียน</th>
+                                    <th data-field="academic_year">ปีการศึกษา</th>
+                                    <th data-field="subject_count">จำนวนวิชา</th>
+                                    <th>ดู</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php if (count($semesterOptions) === 0): ?>
+                                    <tr>
+                                        <td colspan="5">ยังไม่มีข้อมูลภาคเรียน</td>
+                                    </tr>
+                                <?php else: ?>
+                                    <?php foreach ($semesterOptions as $semesterOption): ?>
+                                        <?php
+                                        $semesterId = isset($semesterOption['id']) ? (string) $semesterOption['id'] : '';
+                                        $semesterTerm = isset($semesterOption['term']) ? (string) $semesterOption['term'] : '';
+                                        $semesterYear = isset($semesterOption['year']) ? (string) $semesterOption['year'] : '';
+                                        $semesterRowId = $semesterId !== '' ? $semesterId : (string) ($semesterOption['key'] ?? '');
+                                        ?>
+                                        <tr data-table="semester" data-id="<?php echo admin_h($semesterRowId); ?>">
+                                            <td data-field="semester_id"><?php echo admin_h($semesterId !== '' ? $semesterId : '-'); ?></td>
+                                            <td data-field="semester"><?php echo admin_h($semesterTerm !== '' ? 'ภาคเรียนที่ ' . $semesterTerm : '-'); ?></td>
+                                            <td data-field="academic_year"><?php echo admin_h($semesterYear !== '' ? $semesterYear : '-'); ?></td>
+                                            <td data-field="subject_count"><?php echo (int) ($semesterSubjectCounts[$semesterId] ?? 0); ?></td>
+                                            <td>
+                                                <span class="tools">
+                                                    <button type="button" class="tool gray">ดู</button>
                                                 </span>
                                             </td>
                                         </tr>
@@ -1270,9 +1631,9 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                     <div class="table-wrap">
                         <div class="section-heading">
                             <div>
-                                <div class="section-kicker">คลังวิชาเรียน</div>
+
                                 <h3>ภาพรวมวิชาเรียนทั้งหมด</h3>
-                              
+
                             </div>
                             <div class="section-metrics">
                                 <div class="mini-metric">
@@ -1280,16 +1641,12 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                     <strong><?php echo (int) $countSubjects; ?></strong>
                                 </div>
                                 <div class="mini-metric">
-                                    <span class="mini-label">มีเป้าหมาย</span>
-                                    <strong><?php echo (int) $subjectsWithTargetsCount; ?></strong>
-                                </div>
-                                <div class="mini-metric">
                                     <span class="mini-label">ภาคเรียน</span>
                                     <strong><?php echo (int) count($semesterOptions); ?></strong>
                                 </div>
                             </div>
                         </div>
-                        <?php $subjectColspan = $hasSubjectSemesterColumn ? 11 : 10; ?>
+                        <?php $subjectColspan = $hasSubjectSemesterColumn ? 8 : 7; ?>
                         <table class="table" data-table="subjects">
                             <thead>
                                 <tr>
@@ -1299,13 +1656,13 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                         <th data-field="semester_id" data-editable="1" data-create="1">ภาคเรียน</th>
                                     <?php endif; ?>
                                     <th data-field="name" data-editable="1" data-create="1">วิชา</th>
-                                    <th data-field="description" data-editable="1" data-create="1">คำอธิบาย</th>
+
                                     <th data-field="color" data-editable="1" data-create="1">สี</th>
-                           
-                                    <th data-field="start_date" data-editable="1" data-create="1">วันที่เริ่ม</th>
+
+
                                     <th data-field="start_time" data-editable="1" data-create="1">เวลาเริ่ม</th>
                                     <th data-field="end_time" data-editable="1" data-create="1">เวลาสิ้นสุด</th>
-                                    <th>ดูอย่างเดียว</th>
+                                    <th>ดู</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -1316,13 +1673,15 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                 <?php else: ?>
                                     <?php foreach ($subjects as $subject): ?>
                                         <?php
-                                            $subjectUserId = $subject['user_id'];
-                                            $subjectUserLabel = isset($usersById[$subjectUserId]) ? $usersById[$subjectUserId] : $subjectUserId;
-                                            $subjectSemesterId = isset($subject['semester_id']) ? (string) $subject['semester_id'] : '';
-                                            $subjectSemesterLabel = $subjectSemesterId !== '' && isset($semesterById[$subjectSemesterId]) ? $semesterById[$subjectSemesterId]['label'] : '';
+                                        $subjectUserId = $subject['user_id'];
+                                        $subjectUserLabel = isset($usersById[$subjectUserId]) ? $usersById[$subjectUserId] : $subjectUserId;
+                                        $subjectSemesterId = isset($subject['semester_id']) ? (string) $subject['semester_id'] : '';
+                                        $subjectSemesterLabel = $subjectSemesterId !== '' && isset($semesterById[$subjectSemesterId]) ? $semesterById[$subjectSemesterId]['label'] : '';
                                         ?>
                                         <?php $subjectTermKey = admin_term_key_from_date($subject['start_date']); ?>
-                                        <?php if ($hasSubjectSemesterColumn && $subjectSemesterId !== '' && isset($semesterById[$subjectSemesterId])) { $subjectTermKey = $semesterById[$subjectSemesterId]['key']; } ?>
+                                        <?php if ($hasSubjectSemesterColumn && $subjectSemesterId !== '' && isset($semesterById[$subjectSemesterId])) {
+                                            $subjectTermKey = $semesterById[$subjectSemesterId]['key'];
+                                        } ?>
                                         <tr data-table="subjects" data-id="<?php echo admin_h($subject['id']); ?>" data-term="<?php echo admin_h($subjectTermKey); ?>">
                                             <td data-field="id"><?php echo admin_h($subject['id']); ?></td>
                                             <td data-field="user_id" data-value="<?php echo admin_h($subjectUserId); ?>">
@@ -1334,13 +1693,13 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                                 </td>
                                             <?php endif; ?>
                                             <td data-field="name"><?php echo admin_h($subject['name']); ?></td>
-                                            <td data-field="description"><?php echo admin_h($subject['description']); ?></td>
+
                                             <td data-field="color">
                                                 <?php $color = isset($subject['color']) ? (string) $subject['color'] : ''; ?>
                                                 <span class="badge" style="background:<?php echo admin_h($color !== '' ? $color : '#64748b'); ?>;"><?php echo admin_h($color); ?></span>
                                             </td>
-                                            <td data-field="target_hours"><?php echo admin_h($subject['target_hours']); ?></td>
-                                            <td data-field="start_date"><?php echo admin_h($subject['start_date']); ?></td>
+
+
                                             <td data-field="start_time"><?php echo admin_h($subject['start_time']); ?></td>
                                             <td data-field="end_time"><?php echo admin_h($subject['end_time']); ?></td>
                                             <td>
@@ -1365,9 +1724,9 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                     <div class="table-wrap">
                         <div class="section-heading">
                             <div>
-                                <div class="section-kicker">ควบคุมตารางเรียน</div>
-                                <h3>ตารางเรียนและกิจกรรมทั้งหมด</h3>
-                              
+                             
+                                <h3>ตารางเรียนและตารางสอบทั้งหมด</h3>
+
                             </div>
                             <div class="section-metrics">
                                 <div class="mini-metric">
@@ -1395,33 +1754,37 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                     <th data-field="end_time" data-editable="1" data-create="1">เวลาสิ้นสุด</th>
                                     <th data-field="room" data-editable="1" data-create="1">ห้อง</th>
                                     <th data-field="schedule_type" data-editable="1" data-create="1">ประเภท</th>
-                                    <th>จำนวน</th>
-                                    <th>ดูอย่างเดียว</th>
+
+                                    <th>ดู</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 <?php if (count($schedules) === 0): ?>
                                     <tr>
-                                        <td colspan="10">ยังไม่มีข้อมูล</td>
+                                        <td colspan="8">ยังไม่มีข้อมูล</td>
                                     </tr>
                                 <?php else: ?>
+                                    <?php $scheduleNo = 1; ?>
+
                                     <?php foreach ($schedules as $schedule): ?>
                                         <?php
-                                            $scheduleUserId = $schedule['user_id'];
-                                            $scheduleSubjectId = $schedule['subject_id'];
-                                            $scheduleUserLabel = isset($usersById[$scheduleUserId]) ? $usersById[$scheduleUserId] : $scheduleUserId;
-                                            $scheduleSubjectLabel = isset($subjectsById[$scheduleSubjectId]) ? $subjectsById[$scheduleSubjectId] : $scheduleSubjectId;
-                                            $scheduleTermKey = '';
-                                            if (isset($schedule['term_key']) && $schedule['term_key'] !== '') {
-                                                $scheduleTermKey = $schedule['term_key'];
-                                            } elseif (isset($schedule['term']) && $schedule['term'] !== '') {
-                                                $scheduleTermKey = $schedule['term'];
-                                            } elseif (isset($subjectTermsById[$scheduleSubjectId])) {
-                                                $scheduleTermKey = $subjectTermsById[$scheduleSubjectId];
-                                            }
+                                        $scheduleUserId = $schedule['user_id'];
+                                        $scheduleSubjectId = $schedule['subject_id'];
+                                        $scheduleUserLabel = isset($usersById[$scheduleUserId]) ? $usersById[$scheduleUserId] : $scheduleUserId;
+                                        $scheduleSubjectLabel = isset($subjectsById[$scheduleSubjectId]) ? $subjectsById[$scheduleSubjectId] : $scheduleSubjectId;
+                                        $scheduleTermKey = '';
+                                        if (isset($schedule['term_key']) && $schedule['term_key'] !== '') {
+                                            $scheduleTermKey = $schedule['term_key'];
+                                        } elseif (isset($schedule['term']) && $schedule['term'] !== '') {
+                                            $scheduleTermKey = $schedule['term'];
+                                        } elseif (isset($subjectTermsById[$scheduleSubjectId])) {
+                                            $scheduleTermKey = $subjectTermsById[$scheduleSubjectId];
+                                        }
                                         ?>
+
+
                                         <tr data-table="schedules" data-id="<?php echo admin_h($schedule['id']); ?>" data-term="<?php echo admin_h($scheduleTermKey); ?>">
-                                            <td data-field="id"><?php echo admin_h($schedule['id']); ?></td>
+                                            <td data-field="id"><?php echo $scheduleNo++; ?></td>
                                             <td data-field="user_id" data-value="<?php echo admin_h($scheduleUserId); ?>">
                                                 <?php echo admin_h($scheduleUserLabel); ?>
                                             </td>
@@ -1437,10 +1800,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                                 <?php $normalizedType = admin_schedule_type_normalize($type); ?>
                                                 <span class="badge <?php echo $normalizedType === 'exam' ? 'amber' : 'green'; ?>"><?php echo admin_h(admin_schedule_type_label($type)); ?></span>
                                             </td>
-                                            <td>
-                                                <?php $dupCount = isset($schedule['duplicate_count']) ? (int) $schedule['duplicate_count'] : 1; ?>
-                                                <?php echo $dupCount > 1 ? 'x' . $dupCount : $dupCount; ?>
-                                            </td>
+
                                             <td>
                                                 <span class="tools">
                                                     <button type="button" class="tool gray">ดู</button>
@@ -1463,9 +1823,9 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                     <div class="table-wrap">
                         <div class="section-heading">
                             <div>
-                                <div class="section-kicker">กิจกรรมการเรียน</div>
-                                <h3>บันทึกการเรียนจากผู้ใช้จริง</h3>
-                             
+                              
+                                <h3>สรุปบันทึกการเรียนของผู้ใช้</h3>
+
                             </div>
                             <div class="section-metrics">
                                 <div class="mini-metric">
@@ -1482,22 +1842,22 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                     <th data-field="subject_id" data-editable="1" data-create="1">วิชา</th>
                                     <th data-field="title" data-editable="1" data-create="1">หัวข้อ</th>
                                     <th data-field="log_date" data-editable="1" data-create="1">วันที่</th>
-                                    <th>ดูอย่างเดียว</th>
+                                    <th>ดู</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 <?php if (count($studyLogs) === 0): ?>
                                     <tr>
-                                        <td colspan="6">ยังไม่มีข้อมูล</td>
+                                        <td colspan="5">ยังไม่มีข้อมูล</td>
                                     </tr>
                                 <?php else: ?>
                                     <?php foreach ($studyLogs as $log): ?>
                                         <?php
-                                            $logUserId = $log['user_id'];
-                                            $logSubjectId = $log['subject_id'];
-                                            $logUserLabel = isset($usersById[$logUserId]) ? $usersById[$logUserId] : $logUserId;
-                                            $logSubjectLabel = isset($subjectsById[$logSubjectId]) ? $subjectsById[$logSubjectId] : $logSubjectId;
-                                            $logTermKey = admin_term_key_from_date($log['log_date']);
+                                        $logUserId = $log['user_id'];
+                                        $logSubjectId = $log['subject_id'];
+                                        $logUserLabel = isset($usersById[$logUserId]) ? $usersById[$logUserId] : $logUserId;
+                                        $logSubjectLabel = isset($subjectsById[$logSubjectId]) ? $subjectsById[$logSubjectId] : $logSubjectId;
+                                        $logTermKey = $subjectTermsById[$logSubjectId] ?? admin_term_key_from_date($log['log_date']);
                                         ?>
                                         <tr data-table="study_logs" data-id="<?php echo admin_h($log['id']); ?>" data-term="<?php echo admin_h($logTermKey); ?>">
                                             <td data-field="id"><?php echo admin_h($log['id']); ?></td>
@@ -1508,7 +1868,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                                 <?php echo admin_h($logSubjectLabel); ?>
                                             </td>
                                             <td data-field="title"><?php echo admin_h($log['title']); ?></td>
-                                            <td data-field="log_date"><?php echo admin_h($log['log_date']); ?></td>
+                                            <td data-field="log_date"><?php echo admin_h(admin_format_short_date($log['log_date'] ?? '')); ?></td>
                                             <td>
                                                 <span class="tools">
                                                     <button type="button" class="tool gray">ดู</button>
@@ -1527,6 +1887,80 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                     </div>
                 </div>
 
+                <div class="tab-panel" data-panel="quizzes">
+                    <div class="table-wrap">
+                        <div class="section-heading">
+                            <div><h3>แบบฝึกหัดและแบบทดสอบ</h3></div>
+                            <div class="section-metrics"><div class="mini-metric"><span class="mini-label">ทั้งหมด</span><strong><?php echo (int) $countQuizzes; ?></strong></div></div>
+                        </div>
+                        <table class="table" data-table="quizzes">
+                            <thead><tr><th data-field="id">รหัส</th><th data-field="user_id">ผู้ใช้งาน</th><th data-field="subject_id">วิชา</th><th data-field="title">ชื่อแบบฝึกหัด</th><th data-field="ai_model">รูปแบบ</th><th data-field="created_at">วันที่สร้าง</th><th>ดู</th></tr></thead>
+                            <tbody>
+                                <?php if (count($quizzes) === 0): ?>
+                                    <tr><td colspan="7">ยังไม่มีข้อมูลแบบฝึกหัด</td></tr>
+                                <?php else: foreach ($quizzes as $quiz): ?>
+                                    <?php
+                                    $quizSubjectId = (string) ($quiz['subject_id'] ?? '');
+                                    $quizUserId = $subjectUserIdsById[$quizSubjectId] ?? '';
+                                    $quizUserLabel = $quizUserId !== '' ? ($usersById[$quizUserId] ?? $quizUserId) : '-';
+                                    $quizTermKey = $subjectTermsById[$quizSubjectId] ?? '';
+                                    ?>
+                                    <tr data-table="quizzes" data-id="<?php echo admin_h($quiz['id']); ?>" data-term="<?php echo admin_h($quizTermKey); ?>">
+                                        <td data-field="id"><?php echo admin_h($quiz['id']); ?></td>
+                                        <td data-field="user_id" data-value="<?php echo admin_h($quizUserId); ?>"><?php echo admin_h($quizUserLabel); ?></td>
+                                        <td data-field="subject_id" data-value="<?php echo admin_h($quizSubjectId); ?>"><?php echo admin_h($subjectsById[$quizSubjectId] ?? $quizSubjectId); ?></td>
+                                        <td data-field="title"><?php echo admin_h($quiz['title']); ?></td>
+                                        <td data-field="ai_model"><?php echo admin_h($quiz['ai_model'] ?: '-'); ?></td>
+                                        <td data-field="created_at"><?php echo admin_h(admin_format_short_date($quiz['created_at'] ?? '')); ?></td>
+                                        <td><span class="tools"><button type="button" class="tool gray">ดู</button></span></td>
+                                    </tr>
+                                <?php endforeach; endif; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="pager">
+                        <div class="page-btn">‹</div>
+                        <div class="page-current">1</div>
+                        <div class="page-btn">›</div>
+                    </div>
+                </div>
+
+                <div class="tab-panel" data-panel="goals">
+                    <div class="table-wrap">
+                        <div class="section-heading">
+                            
+                            <div class="section-metrics">
+                                <div class="mini-metric"><span class="mini-label">เป้าหมายทั้งหมด</span><strong><?php echo (int) $goalProgressCount; ?></strong></div>
+                                <div class="mini-metric"><span class="mini-label">สำเร็จแล้ว</span><strong><?php echo (int) $completedGoalsCount; ?></strong></div>
+                                <div class="mini-metric"><span class="mini-label">ความคืบหน้าเฉลี่ย</span><strong><?php echo (int) $averageGoalProgress; ?>%</strong></div>
+                            </div>
+                        </div>
+                        <table class="table" data-table="learning_goal_targets">
+                            <thead><tr><th>ผู้ใช้งาน</th><th>เป้าหมาย</th><th>วันที่บันทึก</th><th>ผลการทำ</th><th>ความคืบหน้า</th><th>สถานะ</th></tr></thead>
+                            <tbody>
+                                <?php if (count($learningGoals) === 0): ?>
+                                    <tr><td colspan="6">ยังไม่มีข้อมูลเป้าหมายการเรียน</td></tr>
+                                <?php else: foreach ($learningGoals as $goal): ?>
+                                    <?php
+                                    $goalUserId = (string) ($goal['user_id'] ?? '');
+                                    $goalSubjectId = (string) ($goal['subject_id'] ?? '');
+                                    $goalTermKey = $subjectTermsById[$goalSubjectId] ?? '';
+                                    $goalStatus = (string) ($goal['status'] ?? 'pending');
+                                    ?>
+                                    <tr data-id="<?php echo admin_h($goal['id']); ?>" data-term="<?php echo admin_h($goalTermKey); ?>">
+                                        <td data-field="user_id" data-value="<?php echo admin_h($goalUserId); ?>"><?php echo admin_h($usersById[$goalUserId] ?? $goalUserId); ?></td>
+                                        <td><?php echo admin_h(($goal['title'] ?? '') !== '' ? $goal['title'] : 'เป้าหมายการเรียน'); ?></td>
+                                        <td><?php echo admin_h(admin_format_short_date($goal['period_start'] ?? '')); ?></td>
+                                        <td><?php echo (int) ($goal['target_value'] ?? 0); ?> / <?php echo (int) ($goal['current_value'] ?? 0); ?></td>
+                                        <td><strong><?php echo (int) $goal['progress_percent']; ?>%</strong></td>
+                                        <td><span class="status-pill <?php echo $goalStatus === 'completed' ? 'on' : ''; ?>"><?php echo admin_h($goalStatus === 'completed' ? 'สำเร็จ' : ($goalStatus === 'failed' ? 'ไม่สำเร็จ' : 'กำลังดำเนินการ')); ?></span></td>
+                                    </tr>
+                                <?php endforeach; endif; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <div class="tab-panel" data-panel="settings">
                     <div class="table-wrap">
                         <div class="settings-shell">
@@ -1534,7 +1968,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                 <div class="settings-topbar">
                                     <div>
                                         <h3 class="settings-title">ตั้งค่าระบบผู้ดูแล</h3>
-                                    
+
                                     </div>
                                     <button class="settings-sync-btn" type="button" id="syncSettingsBtn">ซิงค์ข้อมูล</button>
                                 </div>
@@ -1557,7 +1991,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                             <span class="settings-maintenance-icon">⚡</span>
                                             <div>
                                                 <h4>โหมดซ่อมบำรุง</h4>
-                                            
+
                                             </div>
                                         </div>
                                         <button class="settings-switch" type="button" id="settingMaintenanceSwitch" aria-pressed="false" title="สลับโหมดซ่อมบำรุง">
@@ -1568,6 +2002,41 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                             <option value="1">เปิด</option>
                                         </select>
                                     </div>
+                                    <div class="field wide maintenance-schedule">
+                                        <h4 class="maintenance-schedule-title"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg>กำหนดช่วงเวลาซ่อมบำรุงระบบ</h4>
+                                        <div class="maintenance-schedule-grid">
+                                            <div class="maintenance-schedule-column" role="group" aria-labelledby="maintenanceStartTitle">
+                                                <h5 id="maintenanceStartTitle">เริ่มต้นการซ่อมบำรุง</h5>
+                                                <label for="settingMaintenanceStartDate">วันที่</label>
+                                                <div class="admin-date-picker">
+                                                    <input type="text" id="settingMaintenanceStartDate" inputmode="numeric" autocomplete="off" placeholder="dd/mm/yy" maxlength="8" aria-describedby="settingMaintenanceStartDateHint">
+                                                    <button type="button" class="admin-date-picker-button" id="settingMaintenanceStartDatePicker" aria-label="เลือกวันที่จากปฏิทิน" title="เลือกวันที่จากปฏิทิน">
+                                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="16" rx="2"/><path d="M8 2.5v4M16 2.5v4M3 9.5h18"/></svg>
+                                                    </button>
+                                                    <input type="date" id="settingMaintenanceStartNativeDate" class="admin-date-picker-native" tabindex="-1" aria-hidden="true">
+                                                </div>
+                                                
+                                                <label for="settingMaintenanceStartHour">เวลา</label>
+                                                <div class="admin-time-picker">
+                                                    <select id="settingMaintenanceStartHour" aria-label="ชั่วโมงเริ่มต้นการซ่อมบำรุง">
+                                                        <option value="">--</option>
+                                                        <?php for ($hour = 0; $hour < 24; $hour++): ?>
+                                                            <option value="<?php echo str_pad((string) $hour, 2, '0', STR_PAD_LEFT); ?>"><?php echo str_pad((string) $hour, 2, '0', STR_PAD_LEFT); ?></option>
+                                                        <?php endfor; ?>
+                                                    </select>
+                                                    <span aria-hidden="true">:</span>
+                                                    <select id="settingMaintenanceStartMinute" aria-label="นาทีเริ่มต้นการซ่อมบำรุง">
+                                                        <option value="">--</option>
+                                                        <?php for ($minute = 0; $minute < 60; $minute++): ?>
+                                                            <option value="<?php echo str_pad((string) $minute, 2, '0', STR_PAD_LEFT); ?>"><?php echo str_pad((string) $minute, 2, '0', STR_PAD_LEFT); ?></option>
+                                                        <?php endfor; ?>
+                                                    </select>
+                                                    <input type="hidden" id="settingMaintenanceStartTime">
+                                                </div>
+                                                <input type="hidden" id="settingMaintenanceStartAt">
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
 
                                 <div class="settings-actions">
@@ -1576,20 +2045,6 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                     <span id="settingsStatus" class="settings-status">พร้อมใช้งาน</span>
                                 </div>
 
-                                <div class="settings-summary-grid">
-                                    <div class="settings-summary-card">
-                                        <span class="label">ผู้ใช้งานที่มีการเรียน</span>
-                                        <strong><?php echo (int) $activeStudyUsersCount; ?> คน</strong>
-                                    </div>
-                                    <div class="settings-summary-card">
-                                        <span class="label">แบบฝึกหัดอัจฉริยะ</span>
-                                        <strong><?php echo (int) $countQuizzes; ?> รายการ</strong>
-                                    </div>
-                                    <div class="settings-summary-card">
-                                        <span class="label">กิจกรรมล่าสุด</span>
-                                        <strong><?php echo admin_h($latestActivityLabel); ?></strong>
-                                    </div>
-                                </div>
                             </div>
                         </div>
                     </div>
@@ -1764,6 +2219,48 @@ $recentActivities = array_slice($recentActivities, 0, 5);
         </div>
     </div>
 
+    <div class="modal-backdrop" id="deleteConfirmModal">
+        <div class="modal delete-confirm-modal">
+            <div class="modal-header">
+                <div class="modal-heading">
+                    <div class="modal-icon danger" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M3 6h18" />
+                            <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                            <path d="M10 11v6" />
+                            <path d="M14 11v6" />
+                        </svg>
+                    </div>
+                    <div>
+                        <div class="modal-title">ลบรายการ</div>
+                        <div class="modal-subtitle">ยืนยันก่อนลบข้อมูลที่เลือก</div>
+                    </div>
+                </div>
+                <button class="modal-close" type="button" id="closeDeleteConfirmModal" aria-label="ปิด">
+                    <span aria-hidden="true">×</span>
+                </button>
+            </div>
+            <div class="modal-body delete-confirm-body">
+                <div class="delete-confirm-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M3 6h18" />
+                        <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                    </svg>
+                </div>
+                <div class="delete-confirm-text">
+                    <h3>คุณต้องการลบรายการนี้หรือไม่?</h3>
+                    <p>การลบจะไม่สามารถกู้คืนได้หลังจากยืนยัน</p>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn secondary" type="button" id="cancelDeleteConfirm">ยกเลิก</button>
+                <button class="btn primary danger" type="button" id="confirmDeleteBtn">ลบเลย</button>
+            </div>
+        </div>
+    </div>
+
     <?php
     $semesterFieldOptions = [];
     if ($hasSubjectSemesterColumn) {
@@ -1813,60 +2310,97 @@ $recentActivities = array_slice($recentActivities, 0, 5);
         const mainPanelHeader = document.getElementById('mainPanelHeader');
         const mainPanelToolbar = document.getElementById('mainPanelToolbar');
         const userFilter = document.getElementById('userFilter');
-        const termFilter = document.getElementById('termFilter');
+        const semesterFilter = document.getElementById('semesterFilter');
         const trendRangeSelect = document.getElementById('trendRangeSelect');
         const selectOptions = {
+            user_id: <?php echo json_encode($userFieldOptions, JSON_UNESCAPED_UNICODE); ?>,
+            subject_id: <?php echo json_encode($subjectFieldOptions, JSON_UNESCAPED_UNICODE); ?>,
             semester_id: <?php echo json_encode($semesterFieldOptions, JSON_UNESCAPED_UNICODE); ?>,
-            role: [
-                { value: 'admin', label: 'ผู้ดูแลระบบ' },
-                { value: 'user', label: 'ผู้ใช้งานทั่วไป' }
+            role: [{
+                    value: 'admin',
+                    label: 'ผู้ดูแลระบบ'
+                },
+                {
+                    value: 'user',
+                    label: 'ผู้ใช้งานทั่วไป'
+                }
             ],
-            schedule_type: [
-                { value: 'class', label: 'คาบเรียน' },
-                { value: 'exam', label: 'สอบหรือกิจกรรมพิเศษ' }
+            schedule_type: [{
+                    value: 'class',
+                    label: 'คาบเรียน'
+                },
+                {
+                    value: 'exam',
+                    label: 'สอบหรือกิจกรรมพิเศษ'
+                }
             ]
         };
 
         const navConfig = {
             dashboard: {
-                title: 'ภาพรวมระบบ',
-              
-                kicker: 'ศูนย์ควบคุมผู้ดูแล',
+                title: 'ตารางแสดงรายการ (ผู้ดูแลระบบ)',
+                subtitle: 'ภาพรวมข้อมูลจริงของผู้ใช้ วิชา ตารางเรียน และบันทึกการเรียน',
+                kicker: 'ผู้ดูแลระบบ',
+
+
                 panel: 'dashboard',
                 showToolbar: true
             },
             users: {
                 title: 'ผู้ใช้งาน',
-            
-                kicker: 'จัดการผู้ใช้งาน',
+
+
                 panel: 'users',
                 showToolbar: true
             },
+            semesters: {
+                title: 'ภาคเรียน',
+                subtitle: 'ข้อมูลภาคเรียนและจำนวนวิชาที่อยู่ในแต่ละภาคเรียน',
+                panel: 'semesters',
+                showToolbar: false
+            },
             subjects: {
                 title: 'วิชาเรียน',
-               
-                kicker: 'คลังวิชาเรียน',
+
+
                 panel: 'subjects',
                 showToolbar: true
             },
             schedules: {
                 title: 'ตารางเรียน',
-              
-                kicker: 'ควบคุมตารางเรียน',
+
+
                 panel: 'schedules',
                 showToolbar: true
             },
             'study-logs': {
-                title: 'บันทึกการเรียน',
-              
-                kicker: 'กิจกรรมการเรียน',
+                title: 'สรุปการเรียน',
+
+
                 panel: 'study-logs',
                 showToolbar: true
             },
+            quizzes: {
+                title: 'แบบฝึกหัด',
+                panel: 'quizzes',
+                showToolbar: true
+            },
+            goals: {
+                title: 'เป้าหมายและความคืบหน้า',
+                subtitle: 'ติดตามเป้าหมายการเรียนของผู้ใช้แบบอ่านอย่างเดียว',
+                panel: 'goals',
+                showToolbar: true
+            },
+            profile: {
+                title: 'โปรไฟล์และข้อมูลระบบ',
+                subtitle: 'ข้อมูลบัญชีผู้ดูแลและภาพรวมภายในระบบ',
+                panel: 'profile',
+                showToolbar: false
+            },
             settings: {
                 title: 'ตั้งค่าระบบ',
-            
-                kicker: 'การตั้งค่าระบบ',
+
+
                 panel: 'settings',
                 showToolbar: false
             }
@@ -1879,17 +2413,21 @@ $recentActivities = array_slice($recentActivities, 0, 5);
         const dashboardSubjectsSub = document.getElementById('dashboardSubjectsSub');
         const dashboardSchedulesValue = document.getElementById('dashboardSchedulesValue');
         const dashboardSchedulesSub = document.getElementById('dashboardSchedulesSub');
-        const dashboardStudyLogsValue = document.getElementById('dashboardStudyLogsValue');
-        const dashboardStudyLogsSub = document.getElementById('dashboardStudyLogsSub');
         const dashboardChartTitle = document.getElementById('dashboardChartTitle');
         const dashboardUsersBarValue = document.getElementById('dashboardUsersBarValue');
         const dashboardSubjectsBarValue = document.getElementById('dashboardSubjectsBarValue');
         const dashboardSchedulesBarValue = document.getElementById('dashboardSchedulesBarValue');
-        const dashboardStudyLogsBarValue = document.getElementById('dashboardStudyLogsBarValue');
         const dashboardUsersBar = document.getElementById('dashboardUsersBar');
         const dashboardSubjectsBar = document.getElementById('dashboardSubjectsBar');
         const dashboardSchedulesBar = document.getElementById('dashboardSchedulesBar');
-        const dashboardStudyLogsBar = document.getElementById('dashboardStudyLogsBar');
+        const dashboardUsersMiniBar = document.getElementById('dashboardUsersMiniBar');
+        const dashboardSubjectsMiniBar = document.getElementById('dashboardSubjectsMiniBar');
+        const dashboardSchedulesMiniBar = document.getElementById('dashboardSchedulesMiniBar');
+        const dashboardMiniBars = [
+            dashboardUsersMiniBar,
+            dashboardSubjectsMiniBar,
+            dashboardSchedulesMiniBar
+        ].filter(Boolean);
 
         const getSelectedUserName = () => {
             if (!userFilter) return '';
@@ -1898,7 +2436,14 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             return (selectedOption.textContent || '').trim();
         };
 
-        const rowMatchesFilters = (row, selectedUser, selectedTerm) => {
+        const getSelectedSemesterName = () => {
+            if (!semesterFilter) return '';
+            const selectedOption = semesterFilter.options[semesterFilter.selectedIndex];
+            if (!selectedOption) return '';
+            return (selectedOption.textContent || '').trim();
+        };
+
+        const rowMatchesFilters = (row, selectedUser, selectedSemester) => {
             if (!row || !row.dataset || !row.dataset.id) {
                 return false;
             }
@@ -1906,21 +2451,21 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             if (selectedUser !== '') {
                 const userCell = row.querySelector('td[data-field="user_id"]');
                 const idCell = row.querySelector('td[data-field="id"]');
-                const cellValue = userCell ? (userCell.dataset.value || userCell.textContent.trim()) : (idCell ? idCell.textContent.trim() : '');
+                // const cellValue = userCell ? (userCell.dataset.value || userCell.textContent.trim()) : (idCell ? idCell.textContent.trim() : '');
+
+
+
+                const cellValue = userCell ?
+                    (userCell.dataset.value || userCell.textContent.trim()) :
+                    (idCell ? idCell.textContent.trim() : (row.dataset.id || ''));
+
+
+
+
                 matchesUser = cellValue === selectedUser;
             }
-            let matchesTerm = true;
-            if (selectedTerm !== '') {
-                const rowTerm = typeof row.dataset.term !== 'undefined' ? row.dataset.term : null;
-                if (rowTerm !== null) {
-                    if (selectedTerm.includes('-')) {
-                        matchesTerm = rowTerm === selectedTerm;
-                    } else {
-                        matchesTerm = rowTerm === selectedTerm || rowTerm.endsWith(`-${selectedTerm}`);
-                    }
-                }
-            }
-            return matchesUser && matchesTerm;
+            const matchesSemester = selectedSemester === '' || (row.dataset.term || '') === selectedSemester;
+            return matchesUser && matchesSemester;
         };
 
         const countMatchingRows = (panelKey) => {
@@ -1928,10 +2473,10 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             if (!panel) return 0;
             const rows = panel.querySelectorAll('tbody tr[data-id]');
             const selectedUser = userFilter ? userFilter.value : '';
-            const selectedTerm = termFilter ? termFilter.value : '';
+            const selectedSemester = semesterFilter ? semesterFilter.value : '';
             let count = 0;
             rows.forEach((row) => {
-                if (rowMatchesFilters(row, selectedUser, selectedTerm)) {
+                if (rowMatchesFilters(row, selectedUser, selectedSemester)) {
                     count += 1;
                 }
             });
@@ -1940,13 +2485,13 @@ $recentActivities = array_slice($recentActivities, 0, 5);
 
         const refreshDashboardOverview = () => {
             const selectedUser = userFilter ? userFilter.value : '';
-            const selectedTerm = termFilter ? termFilter.value : '';
             const selectedUserName = selectedUser !== '' ? getSelectedUserName() : '';
+            const selectedSemester = semesterFilter ? semesterFilter.value : '';
+            const selectedSemesterName = selectedSemester !== '' ? getSelectedSemesterName() : '';
 
             const usersCount = selectedUser !== '' ? 1 : <?php echo (int) $countUsers; ?>;
             const subjectsCount = countMatchingRows('subjects');
             const schedulesCount = countMatchingRows('schedules');
-            const studyLogsCount = countMatchingRows('study-logs');
 
             if (dashboardUsersLabel) {
                 dashboardUsersLabel.textContent = selectedUser !== '' ? 'ผู้ใช้งานที่เลือก' : 'ผู้ใช้ทั้งหมด';
@@ -1954,37 +2499,37 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             if (dashboardUsersValue) dashboardUsersValue.textContent = String(usersCount);
             if (dashboardSubjectsValue) dashboardSubjectsValue.textContent = String(subjectsCount);
             if (dashboardSchedulesValue) dashboardSchedulesValue.textContent = String(schedulesCount);
-            if (dashboardStudyLogsValue) dashboardStudyLogsValue.textContent = String(studyLogsCount);
 
             if (dashboardUsersSub) {
                 dashboardUsersSub.textContent = selectedUserName !== '' ? selectedUserName : 'คนในระบบ';
             }
             if (dashboardSubjectsSub) {
-                dashboardSubjectsSub.textContent = selectedUser !== '' || selectedTerm !== '' ? 'วิชาตามตัวกรอง' : 'วิชาที่บันทึกไว้';
+                dashboardSubjectsSub.textContent = selectedUser !== '' || selectedSemester !== '' ? 'วิชาตามตัวกรอง' : 'วิชาที่บันทึกไว้';
             }
             if (dashboardSchedulesSub) {
-                dashboardSchedulesSub.textContent = selectedUser !== '' || selectedTerm !== '' ? 'ตารางตามตัวกรอง' : 'รายการตารางทั้งหมด';
-            }
-            if (dashboardStudyLogsSub) {
-                dashboardStudyLogsSub.textContent = selectedUser !== '' || selectedTerm !== '' ? 'บันทึกตามตัวกรอง' : 'รายการบันทึกทั้งหมด';
+                dashboardSchedulesSub.textContent = selectedUser !== '' || selectedSemester !== '' ? 'ตารางตามตัวกรอง' : 'รายการตารางทั้งหมด';
             }
 
             if (dashboardChartTitle) {
-                dashboardChartTitle.textContent = selectedUserName !== '' ? `ภาพรวมข้อมูลของ ${selectedUserName}` : 'ภาพรวมข้อมูล';
+                const filterNames = [selectedUserName, selectedSemesterName].filter(Boolean);
+                dashboardChartTitle.textContent = filterNames.length > 0 ? `ภาพรวมข้อมูล: ${filterNames.join(' · ')}` : 'ภาพรวมข้อมูล';
             }
             if (dashboardUsersBarValue) dashboardUsersBarValue.textContent = String(usersCount);
             if (dashboardSubjectsBarValue) dashboardSubjectsBarValue.textContent = String(subjectsCount);
             if (dashboardSchedulesBarValue) dashboardSchedulesBarValue.textContent = String(schedulesCount);
-            if (dashboardStudyLogsBarValue) dashboardStudyLogsBarValue.textContent = String(studyLogsCount);
             if (dashboardUsersBar) dashboardUsersBar.dataset.value = String(usersCount);
             if (dashboardSubjectsBar) dashboardSubjectsBar.dataset.value = String(subjectsCount);
             if (dashboardSchedulesBar) dashboardSchedulesBar.dataset.value = String(schedulesCount);
-            if (dashboardStudyLogsBar) dashboardStudyLogsBar.dataset.value = String(studyLogsCount);
+            if (dashboardUsersMiniBar) dashboardUsersMiniBar.dataset.value = String(usersCount);
+            if (dashboardSubjectsMiniBar) dashboardSubjectsMiniBar.dataset.value = String(subjectsCount);
+            if (dashboardSchedulesMiniBar) dashboardSchedulesMiniBar.dataset.value = String(schedulesCount);
 
             if (cardTitle && document.querySelector('.tab-panel[data-panel="dashboard"]')?.classList.contains('active')) {
-                cardTitle.textContent = selectedUserName !== '' ? `ภาพรวมระบบ: ${selectedUserName}` : 'ภาพรวมระบบ';
+                const filterNames = [selectedUserName, selectedSemesterName].filter(Boolean);
+                cardTitle.textContent = filterNames.length > 0 ? `ตารางแสดงรายการ (${filterNames.join(' · ')})` : 'ตารางแสดงรายการ (ผู้ดูแลระบบ)';
             }
 
+            renderStatMiniCharts();
             renderBarChart();
         };
 
@@ -1992,7 +2537,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             const config = navConfig[key] || navConfig.users;
             if (cardTitle) cardTitle.textContent = config.title;
             if (cardSubtitle) cardSubtitle.textContent = config.subtitle || '';
-            if (panelKicker) panelKicker.textContent = config.kicker || 'ศูนย์ควบคุมผู้ดูแล';
+            if (panelKicker) panelKicker.textContent = config.kicker || 'ผู้ดูแลระบบ';
             if (mainPanelHeader) {
                 mainPanelHeader.style.display = '';
             }
@@ -2027,23 +2572,39 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 refreshDashboardOverview();
                 return;
             }
-            const selectedUser = userFilter ? userFilter.value : '';
-            const selectedTerm = termFilter ? termFilter.value : '';
+            const selectedUser = activePanel.dataset.ignoreUserFilter === '1' ? '' : (userFilter ? userFilter.value : '');
+            const selectedSemester = activePanel.dataset.ignoreSemesterFilter === '1' ? '' : (semesterFilter ? semesterFilter.value : '');
             const rows = table.querySelectorAll('tbody tr');
             rows.forEach((row) => {
                 const isDataRow = !!row.dataset.id;
                 if (!isDataRow) {
-                    row.style.display = selectedUser === '' && selectedTerm === '' ? '' : 'none';
+                    row.style.display = selectedUser === '' && selectedSemester === '' ? '' : 'none';
                     return;
                 }
-                row.style.display = rowMatchesFilters(row, selectedUser, selectedTerm) ? '' : 'none';
+                row.style.display = rowMatchesFilters(row, selectedUser, selectedSemester) ? '' : 'none';
             });
             refreshDashboardOverview();
         };
 
+        document.querySelectorAll('.mini-link-btn[data-view]').forEach((button) => {
+            button.addEventListener('click', () => {
+                const targetView = button.getAttribute('data-view');
+                if (targetView) {
+                    setActiveView(targetView);
+                }
+            });
+        });
+
         const setUserFilterValue = (value) => {
             if (userFilter) {
                 userFilter.value = value;
+            }
+            filterActiveTable();
+        };
+
+        const setSemesterFilterValue = (value) => {
+            if (semesterFilter) {
+                semesterFilter.value = value;
             }
             filterActiveTable();
         };
@@ -2058,11 +2619,39 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 if (value > maxValue) maxValue = value;
             });
             if (maxValue <= 0) maxValue = 1;
+            // Keep six evenly spaced horizontal intervals, as in the dashboard
+            // summary chart, while leaving enough headroom above the tallest bar.
+            const axisMax = Math.max(6, Math.ceil(maxValue / 6) * 6);
+            const axisMid = Math.round(axisMax / 2);
+            const axisMaxLabel = document.getElementById('dashboardChartTickMax');
+            const axisMidLabel = document.getElementById('dashboardChartTickMid');
+            if (axisMaxLabel) axisMaxLabel.textContent = String(axisMax);
+            if (axisMidLabel) axisMidLabel.textContent = String(axisMid);
+            const axisTicks = chart.closest('.mockup-summary-chart')?.querySelectorAll('.bar-y-axis span') || [];
+            axisTicks.forEach((tick, index) => {
+                const value = Math.round(axisMax - (axisMax * index) / Math.max(axisTicks.length - 1, 1));
+                tick.textContent = String(value);
+            });
             bars.forEach((bar, index) => {
                 const value = Number(bar.dataset.value || 0);
-                const percent = value <= 0 ? 6 : Math.max(10, Math.round((value / maxValue) * 100));
+                const percent = value <= 0 ? 0 : Math.round((value / axisMax) * 100);
                 bar.style.height = `${percent}%`;
                 bar.style.animationDelay = `${index * 80}ms`;
+            });
+        };
+
+        const renderStatMiniCharts = () => {
+            if (!dashboardMiniBars.length) return;
+            let maxValue = 0;
+            dashboardMiniBars.forEach((bar) => {
+                const value = Number(bar.dataset.value || 0);
+                if (value > maxValue) maxValue = value;
+            });
+            if (maxValue <= 0) maxValue = 1;
+            dashboardMiniBars.forEach((bar) => {
+                const value = Number(bar.dataset.value || 0);
+                const percent = value <= 0 ? 8 : Math.max(12, Math.round((value / maxValue) * 100));
+                bar.style.height = `${percent}%`;
             });
         };
 
@@ -2072,13 +2661,29 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             const svg = chart.querySelector('svg');
             if (!svg) return;
             const raw = chart.dataset.trend || '{}';
-            let trends = { week: { labels: [], users: [], logs: [] } };
+            let trends = {
+                week: {
+                    labels: [],
+                    users: [],
+                    logs: []
+                }
+            };
             try {
                 trends = JSON.parse(raw);
             } catch (error) {
-                trends = { week: { labels: [], users: [], logs: [] } };
+                trends = {
+                    week: {
+                        labels: [],
+                        users: [],
+                        logs: []
+                    }
+                };
             }
-            const trend = trends[rangeKey] || trends.week || { labels: [], users: [], logs: [] };
+            const trend = trends[rangeKey] || trends.week || {
+                labels: [],
+                users: [],
+                logs: []
+            };
             const labels = Array.isArray(trend.labels) ? trend.labels : [];
             const users = Array.isArray(trend.users) ? trend.users : [];
             const logs = Array.isArray(trend.logs) ? trend.logs : [];
@@ -2090,7 +2695,12 @@ $recentActivities = array_slice($recentActivities, 0, 5);
 
             const width = 920;
             const height = 320;
-            const pad = { top: 20, right: 26, bottom: 52, left: 50 };
+            const pad = {
+                top: 20,
+                right: 26,
+                bottom: 52,
+                left: 50
+            };
             const chartWidth = width - pad.left - pad.right;
             const chartHeight = height - pad.top - pad.bottom;
             const maxRaw = Math.max(...users, ...logs, 1);
@@ -2210,9 +2820,9 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             });
         }
 
-        if (termFilter) {
-            termFilter.addEventListener('change', () => {
-                filterActiveTable();
+        if (semesterFilter) {
+            semesterFilter.addEventListener('change', () => {
+                setSemesterFilterValue(semesterFilter.value);
             });
         }
 
@@ -2220,6 +2830,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
         renderBarChart();
         renderTrendChart(trendRangeSelect ? trendRangeSelect.value : 'week');
         setUserFilterValue(userFilter ? userFilter.value : '');
+        setSemesterFilterValue(semesterFilter ? semesterFilter.value : '');
 
         if (trendRangeSelect) {
             trendRangeSelect.addEventListener('change', () => {
@@ -2231,7 +2842,9 @@ $recentActivities = array_slice($recentActivities, 0, 5);
         const callApi = async (params) => {
             const response = await fetch(apiUrl, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
                 body: new URLSearchParams(params)
             });
             let data = null;
@@ -2265,6 +2878,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             if (settingWelcomeMessage) settingWelcomeMessage.value = String(settings.admin_welcome_message ?? '');
             if (settingContactEmail) settingContactEmail.value = String(settings.contact_email ?? '');
             if (settingMaintenanceMode) settingMaintenanceMode.value = String(settings.maintenance_mode ?? '0');
+            setMaintenanceStartAtValue(String(settings.maintenance_start_at ?? ''));
             syncMaintenanceSwitchUi();
         };
 
@@ -2281,7 +2895,9 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             try {
                 saveSettingsBtn.disabled = true;
                 setSettingsStatus('กำลังโหลดการตั้งค่า...', false, 'loading');
-                const data = await callApi({ action: 'settings_get' });
+                const data = await callApi({
+                    action: 'settings_get'
+                });
                 applySettingsToForm(data.settings || {});
                 settingsLoaded = true;
                 setSettingsStatus('โหลดการตั้งค่าแล้ว', false, 'success');
@@ -2307,6 +2923,10 @@ $recentActivities = array_slice($recentActivities, 0, 5);
         const closeAddModal = document.getElementById('closeAddModal');
         const cancelAdd = document.getElementById('cancelAdd');
         const saveAdd = document.getElementById('saveAdd');
+        const deleteConfirmModal = document.getElementById('deleteConfirmModal');
+        const closeDeleteConfirmModal = document.getElementById('closeDeleteConfirmModal');
+        const cancelDeleteConfirm = document.getElementById('cancelDeleteConfirm');
+        const confirmDeleteBtn = document.getElementById('confirmDeleteBtn');
         const saveSettingsBtn = document.getElementById('saveSettingsBtn');
         const syncSettingsBtn = document.getElementById('syncSettingsBtn');
         const resetSettingsBtn = document.getElementById('resetSettingsBtn');
@@ -2316,8 +2936,100 @@ $recentActivities = array_slice($recentActivities, 0, 5);
         const settingContactEmail = document.getElementById('settingContactEmail');
         const settingMaintenanceMode = document.getElementById('settingMaintenanceMode');
         const settingMaintenanceSwitch = document.getElementById('settingMaintenanceSwitch');
+        const settingMaintenanceStartAt = document.getElementById('settingMaintenanceStartAt');
+        const settingMaintenanceStartDate = document.getElementById('settingMaintenanceStartDate');
+        const settingMaintenanceStartNativeDate = document.getElementById('settingMaintenanceStartNativeDate');
+        const settingMaintenanceStartDatePicker = document.getElementById('settingMaintenanceStartDatePicker');
+        const settingMaintenanceStartTime = document.getElementById('settingMaintenanceStartTime');
+        const settingMaintenanceStartHour = document.getElementById('settingMaintenanceStartHour');
+        const settingMaintenanceStartMinute = document.getElementById('settingMaintenanceStartMinute');
         let settingsLoaded = false;
         let activeRow = null;
+
+        const maintenanceControls = [
+            [settingMaintenanceStartDate, settingMaintenanceStartHour, settingMaintenanceStartMinute, settingMaintenanceStartAt]
+        ];
+        const parseMaintenanceDate = (value) => {
+            const match = String(value || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{2})$/);
+            if (!match) return '';
+            const day = Number(match[1]);
+            const month = Number(match[2]);
+            const year = 2000 + Number(match[3]);
+            const parsed = new Date(year, month - 1, day);
+            if (parsed.getFullYear() !== year || parsed.getMonth() !== month - 1 || parsed.getDate() !== day) {
+                return '';
+            }
+            return `${year}-${match[2]}-${match[1]}`;
+        };
+
+        const formatMaintenanceDate = (value) => {
+            const match = String(value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            return match ? `${match[3]}/${match[2]}/${match[1].slice(-2)}` : '';
+        };
+
+        const syncMaintenanceStartAtValue = () => {
+            maintenanceControls.forEach(([date, hour, minute, value]) => {
+                settingMaintenanceStartTime.value = hour.value && minute.value ? hour.value + ':' + minute.value : '';
+                const isoDate = parseMaintenanceDate(date.value);
+                if (settingMaintenanceStartNativeDate) settingMaintenanceStartNativeDate.value = isoDate;
+                value.value = isoDate && settingMaintenanceStartTime.value ? isoDate + 'T' + settingMaintenanceStartTime.value : '';
+            });
+        };
+        const validateMaintenanceDate = () => {
+            syncMaintenanceStartAtValue();
+            maintenanceControls.forEach(([date, hour, minute]) => {
+                const hasTime = hour.value || minute.value;
+                const hasDate = date.value.trim() !== '';
+                const isoDate = parseMaintenanceDate(date.value);
+                date.setCustomValidity(hasDate && !isoDate ? 'กรุณากรอกวันที่ในรูปแบบ dd/mm/yy' : (hasTime && !hasDate ? 'กรุณาเลือกวันที่' : ''));
+                hour.setCustomValidity(hasDate && !hour.value ? 'กรุณาเลือกเวลา' : '');
+                minute.setCustomValidity(hasDate && !minute.value ? 'กรุณาเลือกเวลา' : '');
+            });
+            return maintenanceControls.every(([date, hour, minute]) => (
+                date.reportValidity() && hour.reportValidity() && minute.reportValidity()
+            ));
+        };
+        const setMaintenanceValue = (value, controls) => {
+            const match = String(value || '').trim().match(/^(\d{4}-\d{2}-\d{2})[T\s]+(\d{1,2}):(\d{2})/);
+            const [date, hour, minute] = controls;
+            date.value = match ? formatMaintenanceDate(match[1]) : '';
+            if (settingMaintenanceStartNativeDate) settingMaintenanceStartNativeDate.value = match ? match[1] : '';
+            hour.value = match ? match[2].padStart(2, '0') : '';
+            minute.value = match ? match[3] : '';
+            date.setCustomValidity('');
+            hour.setCustomValidity('');
+            minute.setCustomValidity('');
+            syncMaintenanceStartAtValue();
+        };
+        const setMaintenanceStartAtValue = (value) => setMaintenanceValue(value, maintenanceControls[0]);
+        maintenanceControls.forEach(([date, hour, minute]) => {
+            [date, hour, minute].forEach((control) => control.addEventListener('input', () => {
+                maintenanceControls.forEach(([date, hour, minute]) => {
+                    date.setCustomValidity('');
+                    hour.setCustomValidity('');
+                    minute.setCustomValidity('');
+                });
+                syncMaintenanceStartAtValue();
+            }));
+        });
+
+        if (settingMaintenanceStartNativeDate) {
+            settingMaintenanceStartNativeDate.addEventListener('change', () => {
+                settingMaintenanceStartDate.value = formatMaintenanceDate(settingMaintenanceStartNativeDate.value);
+                settingMaintenanceStartDate.setCustomValidity('');
+                syncMaintenanceStartAtValue();
+            });
+        }
+
+        if (settingMaintenanceStartDatePicker && settingMaintenanceStartNativeDate) {
+            settingMaintenanceStartDatePicker.addEventListener('click', () => {
+                if (typeof settingMaintenanceStartNativeDate.showPicker === 'function') {
+                    settingMaintenanceStartNativeDate.showPicker();
+                } else {
+                    settingMaintenanceStartNativeDate.click();
+                }
+            });
+        }
 
         const closeEditModal = () => {
             editModal.classList.remove('active');
@@ -2366,6 +3078,25 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             }
         });
 
+        let pendingDeleteRow = null;
+
+        const closeDeleteConfirm = () => {
+            deleteConfirmModal.classList.remove('active');
+            pendingDeleteRow = null;
+            confirmDeleteBtn.disabled = false;
+            confirmDeleteBtn.textContent = 'ลบเลย';
+        };
+
+        [closeDeleteConfirmModal, cancelDeleteConfirm].forEach((btn) => {
+            btn.addEventListener('click', closeDeleteConfirm);
+        });
+
+        deleteConfirmModal.addEventListener('click', (event) => {
+            if (event.target === deleteConfirmModal) {
+                closeDeleteConfirm();
+            }
+        });
+
         const getTableMeta = (table) => {
             return Array.from(table.querySelectorAll('thead th')).map((th) => ({
                 label: th.textContent.trim(),
@@ -2391,6 +3122,16 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             return cell ? cell.textContent.trim() : '';
         };
 
+        const subjectColorPalette = [
+            '#3B82F6',
+            '#22C55E',
+            '#F97316',
+            '#EC4899',
+            '#8B5CF6',
+            '#14B8A6',
+            '#EF4444'
+        ];
+
         const buildEditForm = (row) => {
             const table = row.closest('table');
             const meta = getTableMeta(table);
@@ -2404,6 +3145,9 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 const value = getCellValue(row, col.field);
                 const field = document.createElement('div');
                 field.className = 'field';
+                if (tableName === 'subjects' && col.field === 'color') {
+                    field.classList.add('color-picker-field', 'wide');
+                }
 
                 const fieldLabel = document.createElement('label');
                 fieldLabel.textContent = col.label;
@@ -2412,6 +3156,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 field.appendChild(createFieldControl(col.field, value, tableName));
                 editForm.appendChild(field);
             });
+            wireUserSubjectSelects(editForm);
         };
 
         const buildAddForm = (table) => {
@@ -2425,6 +3170,9 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 }
                 const field = document.createElement('div');
                 field.className = 'field';
+                if (tableName === 'subjects' && col.field === 'color') {
+                    field.classList.add('color-picker-field', 'wide');
+                }
 
                 const fieldLabel = document.createElement('label');
                 fieldLabel.textContent = col.label;
@@ -2433,9 +3181,14 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 field.appendChild(createFieldControl(col.field, '', tableName));
                 addForm.appendChild(field);
             });
+            wireUserSubjectSelects(addForm);
         };
 
         const createFieldControl = (fieldName, value, tableName) => {
+            if (tableName === 'subjects' && fieldName === 'color') {
+                return createColorPickerControl(fieldName, value);
+            }
+
             const options = selectOptions[fieldName];
             const shouldUseSelect = Array.isArray(options) && (options.length > 0 || (tableName === 'subjects' && fieldName === 'semester_id'));
             if (shouldUseSelect) {
@@ -2451,6 +3204,9 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                     const optionEl = document.createElement('option');
                     optionEl.value = String(option.value ?? '');
                     optionEl.textContent = String(option.label ?? optionEl.value);
+                    if (typeof option.user_id !== 'undefined') {
+                        optionEl.dataset.userId = String(option.user_id ?? '');
+                    }
                     select.appendChild(optionEl);
                 });
 
@@ -2468,6 +3224,90 @@ $recentActivities = array_slice($recentActivities, 0, 5);
             input.value = String(value ?? '');
             input.dataset.field = fieldName;
             return input;
+        };
+
+        const createColorPickerControl = (fieldName, value) => {
+            const selectedValue = String(value || '').trim().toUpperCase();
+            const initialColor = /^#[0-9A-F]{3,8}$/i.test(selectedValue) ? selectedValue : subjectColorPalette[0];
+            const wrapper = document.createElement('div');
+            wrapper.className = 'subject-color-picker';
+
+            const hiddenInput = document.createElement('input');
+            hiddenInput.type = 'hidden';
+            hiddenInput.value = initialColor;
+            hiddenInput.dataset.field = fieldName;
+
+            const title = document.createElement('div');
+            title.className = 'subject-color-picker-title';
+            title.textContent = 'สีทั้งหมด';
+
+            const hint = document.createElement('div');
+            hint.className = 'subject-color-picker-hint';
+            hint.textContent = 'เลือกสีวงกลมเพื่อเปลี่ยนสีทันที';
+
+            const grid = document.createElement('div');
+            grid.className = 'subject-color-options';
+
+            const setSelectedColor = (color) => {
+                hiddenInput.value = color;
+                Array.from(grid.querySelectorAll('.subject-color-option')).forEach((button) => {
+                    const isSelected = button.dataset.color === color;
+                    button.classList.toggle('selected', isSelected);
+                    button.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+                });
+            };
+
+            subjectColorPalette.forEach((color) => {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'subject-color-option';
+                button.dataset.color = color;
+                button.style.setProperty('--subject-option-color', color);
+                button.setAttribute('aria-label', `เลือกสี ${color}`);
+                button.setAttribute('aria-pressed', 'false');
+                button.innerHTML = '<span class="subject-color-check">✓</span>';
+                button.addEventListener('click', () => setSelectedColor(color));
+                grid.appendChild(button);
+            });
+
+            wrapper.appendChild(hiddenInput);
+            wrapper.appendChild(title);
+            wrapper.appendChild(hint);
+            wrapper.appendChild(grid);
+            if (subjectColorPalette.includes(initialColor)) {
+                setSelectedColor(initialColor);
+            }
+
+            return wrapper;
+        };
+
+        const syncSubjectOptionsByUser = (form) => {
+            if (!form) return;
+            const userSelect = form.querySelector('select[data-field="user_id"]');
+            const subjectSelect = form.querySelector('select[data-field="subject_id"]');
+            if (!userSelect || !subjectSelect) return;
+            const selectedUser = String(userSelect.value || '');
+            Array.from(subjectSelect.options).forEach((option) => {
+                if (option.value === '') {
+                    option.hidden = false;
+                    return;
+                }
+                const optionUser = String(option.dataset.userId || '');
+                option.hidden = selectedUser !== '' && optionUser !== '' && optionUser !== selectedUser;
+            });
+            const selectedOption = subjectSelect.options[subjectSelect.selectedIndex];
+            if (selectedOption && selectedOption.hidden) {
+                subjectSelect.value = '';
+            }
+        };
+
+        const wireUserSubjectSelects = (form) => {
+            if (!form) return;
+            syncSubjectOptionsByUser(form);
+            const userSelect = form.querySelector('select[data-field="user_id"]');
+            if (userSelect) {
+                userSelect.addEventListener('change', () => syncSubjectOptionsByUser(form));
+            }
         };
 
         const buildViewDetails = (row) => {
@@ -2550,21 +3390,37 @@ $recentActivities = array_slice($recentActivities, 0, 5);
         document.querySelectorAll('.tool.red').forEach((tool) => {
             tool.style.cursor = 'pointer';
             tool.title = 'ลบข้อมูล';
-            tool.addEventListener('click', async () => {
+            tool.addEventListener('click', () => {
                 const row = tool.closest('tr');
                 if (!row) return;
-                const table = row.dataset.table;
-                const id = row.dataset.id;
-                if (!table || !id) return;
-                const ok = confirm('คุณต้องการลบรายการนี้หรือไม่?');
-                if (!ok) return;
-                try {
-                    await callApi({ action: 'delete', table: table, id: id });
-                    row.remove();
-                } catch (error) {
-                    alert(error.message);
-                }
+                pendingDeleteRow = row;
+                deleteConfirmModal.classList.add('active');
             });
+        });
+
+        confirmDeleteBtn.addEventListener('click', async () => {
+            if (!pendingDeleteRow) return;
+            const table = pendingDeleteRow.dataset.table;
+            const id = pendingDeleteRow.dataset.id;
+            if (!table || !id) {
+                closeDeleteConfirm();
+                return;
+            }
+            confirmDeleteBtn.disabled = true;
+            confirmDeleteBtn.textContent = 'กำลังลบ...';
+            try {
+                await callApi({
+                    action: 'delete',
+                    table: table,
+                    id: id
+                });
+                pendingDeleteRow.remove();
+                closeDeleteConfirm();
+            } catch (error) {
+                confirmDeleteBtn.disabled = false;
+                confirmDeleteBtn.textContent = 'ลบเลย';
+                alert(error.message);
+            }
         });
 
         document.querySelectorAll('tr[data-table="users"]').forEach((row) => {
@@ -2620,7 +3476,11 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 return;
             }
             try {
-                await callApi({ action: 'create', table: tableName, fields: JSON.stringify(fields) });
+                await callApi({
+                    action: 'create',
+                    table: tableName,
+                    fields: JSON.stringify(fields)
+                });
                 closeAddNew();
                 window.location.reload();
             } catch (error) {
@@ -2651,7 +3511,12 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 return;
             }
             try {
-                await callApi({ action: 'update', table: table, id: id, fields: JSON.stringify(fields) });
+                await callApi({
+                    action: 'update',
+                    table: table,
+                    id: id,
+                    fields: JSON.stringify(fields)
+                });
                 closeEditModal();
                 window.location.reload();
             } catch (error) {
@@ -2661,16 +3526,23 @@ $recentActivities = array_slice($recentActivities, 0, 5);
 
         if (saveSettingsBtn) {
             saveSettingsBtn.addEventListener('click', async () => {
+                if (!validateMaintenanceDate()) {
+                    return;
+                }
                 const fields = {
                     system_name: settingSystemName ? settingSystemName.value.trim() : '',
                     admin_welcome_message: settingWelcomeMessage ? settingWelcomeMessage.value.trim() : '',
                     contact_email: settingContactEmail ? settingContactEmail.value.trim() : '',
-                    maintenance_mode: settingMaintenanceMode ? settingMaintenanceMode.value : '0'
+                    maintenance_mode: settingMaintenanceMode ? settingMaintenanceMode.value : '0',
+                    maintenance_start_at: settingMaintenanceStartAt ? settingMaintenanceStartAt.value : ''
                 };
                 try {
                     saveSettingsBtn.disabled = true;
                     setSettingsStatus('กำลังบันทึก...', false, 'loading');
-                    await callApi({ action: 'settings_save', fields: JSON.stringify(fields) });
+                    await callApi({
+                        action: 'settings_save',
+                        fields: JSON.stringify(fields)
+                    });
                     settingsLoaded = true;
                     setSettingsStatus('บันทึกการตั้งค่าเรียบร้อย', false, 'success');
                 } catch (error) {
@@ -2682,10 +3554,32 @@ $recentActivities = array_slice($recentActivities, 0, 5);
         }
 
         if (settingMaintenanceSwitch && settingMaintenanceMode) {
-            settingMaintenanceSwitch.addEventListener('click', () => {
+            settingMaintenanceSwitch.addEventListener('click', async () => {
+                if (!validateMaintenanceDate()) {
+                    return;
+                }
                 const current = String(settingMaintenanceMode.value) === '1';
                 settingMaintenanceMode.value = current ? '0' : '1';
                 syncMaintenanceSwitchUi();
+                try {
+                    settingMaintenanceSwitch.disabled = true;
+                    setSettingsStatus('กำลังเปลี่ยนโหมดซ่อมบำรุง...', false, 'loading');
+                    await callApi({
+                        action: 'settings_save',
+                        fields: JSON.stringify({
+                            maintenance_mode: settingMaintenanceMode.value,
+                            maintenance_start_at: settingMaintenanceStartAt ? settingMaintenanceStartAt.value : ''
+                        })
+                    });
+                    settingsLoaded = true;
+                    setSettingsStatus(settingMaintenanceMode.value === '1' ? 'เปิดโหมดซ่อมบำรุงแล้ว' : 'ปิดโหมดซ่อมบำรุงแล้ว', false, 'success');
+                } catch (error) {
+                    settingMaintenanceMode.value = current ? '1' : '0';
+                    syncMaintenanceSwitchUi();
+                    setSettingsStatus(error.message || 'เปลี่ยนโหมดซ่อมบำรุงไม่สำเร็จ', true);
+                } finally {
+                    settingMaintenanceSwitch.disabled = false;
+                }
             });
             settingMaintenanceMode.addEventListener('change', syncMaintenanceSwitchUi);
             syncMaintenanceSwitchUi();
@@ -2704,7 +3598,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 await loadSettings(true);
             });
         }
-
     </script>
 </body>
+
 </html>

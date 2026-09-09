@@ -1,4 +1,7 @@
+import { TimePicker } from '../../components/TimePicker';
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties } from 'react';
+import { createPortal } from 'react-dom';
 import { format, isValid, parseISO } from 'date-fns';
 import { api, apiFallbackClients } from '../../services/api';
 import { useAppAlert } from '../../context/AppAlertContext';
@@ -6,14 +9,17 @@ import { useAuth } from '../../context/AuthContext';
 import { getLastQuizResultKey } from '../../constants/storage';
 import { useSemesterOptions } from '../../hooks/useSemesterOptions';
 import { filterBySemester, toNumberOrNull } from '../../utils/semester';
-import { emitSubjectsUpdated } from '../../utils/subjectSync';
-import { subscribeSubjectsUpdated } from '../../utils/subjectSync';
+import { consumeScheduleRevealRequest, emitSubjectsUpdated, subscribeSubjectsUpdated } from '../../utils/subjectSync';
 
 interface OverviewStats {
   subjects: number;
   study_logs: number;
   quizzes: number;
   quiz_attempts: number;
+  users?: number;
+  users_count?: number;
+  schedules?: number;
+  schedule_count?: number;
 }
 
 interface TrendPoint {
@@ -35,6 +41,7 @@ type ScheduleSlot = {
   date: string;
   period: number;
   source?: string | null;
+  eventType?: 'class' | 'exam' | 'other' | null;
   eventId?: number | null;
   subjectId?: number | null;
   ownerUserId?: number | null;
@@ -169,25 +176,6 @@ const toDisplayDateGregorian = (value?: string | null) => {
   return `${day}/${month}/${year}`;
 };
 
-const buildTimeOptions = (stepMinutes = 5) => {
-  const safeStep = Number.isFinite(stepMinutes) && stepMinutes > 0 ? Math.round(stepMinutes) : 5;
-  const result: string[] = [];
-  for (let minutes = 0; minutes < 24 * 60; minutes += safeStep) {
-    const hours = Math.floor(minutes / 60);
-    const mins = minutes % 60;
-    result.push(`${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}`);
-  }
-  return result;
-};
-
-const overviewTimeOptions = buildTimeOptions(5);
-
-const formatThaiTimeOptionLabel = (value: string) => {
-  const normalized = value.trim();
-  if (!/^\d{2}:\d{2}$/.test(normalized)) return value;
-  return `${normalized.replace(':', '.')} น.`;
-};
-
 const formatSubjectDate = (value?: string | null) => {
   if (!value) return null;
   return toDisplayDate(value) ?? value;
@@ -233,12 +221,14 @@ const formatSubjectDayLabel = (value?: string | null) => {
 
 const formatSemesterLabel = (semester?: number | null, academicYear?: number | null) => {
   if (!semester || !academicYear) return null;
-  return `${semester}-${academicYear}`;
+  return `ภาคเรียนที่ ${semester} ปีการศึกษา ${academicYear}`;
 };
 
 const getHideScheduleKey = (userId?: number) => `slt::hideScheduleOverview::${userId ?? 'guest'}`;
 const unscheduledDayLabel = 'ไม่ระบุวัน';
 const maxSchedulePeriods = 24;
+const timetablePeriodCount = 12;
+const timetablePeriods = Array.from({ length: timetablePeriodCount }, (_, index) => index + 1);
 const scheduleCardWidth = 208;
 const scheduleCardHeight = 130;
 const scheduleCardGap = 12;
@@ -308,7 +298,6 @@ const resolveNextPeriod = (slots: ScheduleSlot[]) => {
   const period = Math.floor((normalized - 8 * 60) / 60) + 1;
   return Math.max(1, Math.min(maxSchedulePeriods, period));
 };
-const formatPeriodRange = (period: number) => formatTimeRangeCompact(periodToStartTime(period), periodToEndTime(period));
 const normalizeLabelText = (value: string) =>
   value
     // remove common "invisible" characters that make strings look empty in the UI
@@ -334,6 +323,8 @@ const resolveSubjectLabel = (...candidates: Array<unknown>) => {
   }
   return placeholder;
 };
+
+const getHourlyTimetableSlots = (slots: ScheduleSlot[]) => slots.slice(0, timetablePeriodCount);
 
 const resolveSubjectId = (value: any) =>
   toNumberOrNull(value?.id ?? value?.subject_id ?? value?.subjectId ?? value?.subjectID);
@@ -478,7 +469,6 @@ const fetchCalendarEventsFromDatabase = async () => {
   }
   throw lastError ?? new Error('โหลดตารางเรียนไม่สำเร็จ');
 };
-const isDeleteFallbackStatus = (status?: number) => !status || status === 404 || status === 405 || status === 500;
 const normalizeEventTypeValue = (value?: string | null) => {
   const normalized = String(value ?? '').trim().toLowerCase();
   if (!normalized) return null;
@@ -580,16 +570,16 @@ export const OverviewPage = () => {
   const lastQuizResultKey = useMemo(() => getLastQuizResultKey(user?.id), [user?.id]);
   const showAllSubjects = user?.role === 'admin';
 
-  const [, setStats] = useState<OverviewStats | null>(null);
+  const [stats, setStats] = useState<OverviewStats | null>(null);
   const [, setStudyTrend] = useState<TrendPoint[]>([]);
   const [, setQuizTrend] = useState<TrendPoint[]>([]);
   const [schedule, setSchedule] = useState<Record<string, ScheduleSlot[]>>({});
   const [subjects, setSubjects] = useState<SubjectSummary[]>([]);
-  const [selectedSemesterKey, setSelectedSemesterKey] = useState('all');
+  const [selectedSemesterKey, setSelectedSemesterKey] = useState('');
+  const [selectedUserScope, setSelectedUserScope] = useState('all');
   const [, setLastQuizResult] = useState<LastQuizResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [, setNotifications] = useState<StudyNotification[]>([]);
-  const [deletingSlotKey, setDeletingSlotKey] = useState<string | null>(null);
   const [scheduleEditingSlot, setScheduleEditingSlot] = useState<ScheduleSlot | null>(null);
   const [scheduleEditForm, setScheduleEditForm] = useState({
     subjectId: '',
@@ -610,16 +600,7 @@ export const OverviewPage = () => {
   const [subjectEditorOpen, setSubjectEditorOpen] = useState(false);
   const [subjectEditorSaving, setSubjectEditorSaving] = useState(false);
   const [subjectCatalogOpen, setSubjectCatalogOpen] = useState(false);
-  const [deletingSubjectId, setDeletingSubjectId] = useState<number | null>(null);
   const [subjectEditorError, setSubjectEditorError] = useState<string | null>(null);
-  const [activeDay, setActiveDay] = useState('จันทร์');
-  const [pendingDeleteDialog, setPendingDeleteDialog] = useState<{
-    title: string;
-    message: string;
-    confirmLabel: string;
-    action: () => Promise<void> | void;
-  } | null>(null);
-  const [pendingDeleteBusy, setPendingDeleteBusy] = useState(false);
   const [subjectEditor, setSubjectEditor] = useState({
     subjectId: null as number | null,
     sourceSubjectId: '' as string,
@@ -640,11 +621,11 @@ export const OverviewPage = () => {
   const draggingSlotDataRef = useRef<ScheduleSlot | null>(null);
   const dropPreviewRef = useRef<{ day: string; index: number } | null>(null);
   const dropCommittingRef = useRef(false);
-  const daySectionRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const subjectEditorDatePickerRef = useRef<HTMLInputElement | null>(null);
 
   const hideKey = useMemo(() => getHideScheduleKey(user?.id), [user?.id]);
-  const semesterOptions = useSemesterOptions();
+  const allSemesterOptions = useSemesterOptions();
+  const semesterOptions = allSemesterOptions;
   const subjectNameById = useMemo(() => {
     const map = new Map<number, string>();
     subjects.forEach(subject => {
@@ -665,7 +646,7 @@ export const OverviewPage = () => {
   const filteredSubjects = useMemo(() => filterBySemester(subjects, selectedSemesterKey), [subjects, selectedSemesterKey]);
   const filteredSubjectIdSet = useMemo(() => new Set(filteredSubjects.map(subject => subject.id)), [filteredSubjects]);
   const scheduleBySemester = useMemo(() => {
-    if (selectedSemesterKey === 'all') return schedule;
+    if (!selectedSemesterKey) return {};
     return Object.fromEntries(
       Object.entries(schedule).map(([day, slots]) => [
         day,
@@ -696,7 +677,17 @@ export const OverviewPage = () => {
     if (cached.stats) setStats(cached.stats);
     if (Array.isArray(cached.studyTrend)) setStudyTrend(cached.studyTrend);
     if (Array.isArray(cached.quizTrend)) setQuizTrend(cached.quizTrend);
-    if (cached.schedule && typeof cached.schedule === 'object') setSchedule(cached.schedule);
+    // ตารางหน้านี้มีไว้แสดงคาบเรียนเท่านั้น จึงไม่ hydrate รายการสอบเก่าจาก cache
+    // ระหว่างที่กำลังโหลดข้อมูลล่าสุดจาก server.
+    if (cached.schedule && typeof cached.schedule === 'object') {
+      const classOnlySchedule = Object.fromEntries(
+        Object.entries(cached.schedule).map(([day, slots]) => [
+          day,
+          (Array.isArray(slots) ? slots : []).filter(slot => slot?.eventType !== 'exam'),
+        ])
+      ) as Record<string, ScheduleSlot[]>;
+      setSchedule(classOnlySchedule);
+    }
     if (Array.isArray(cached.subjects)) setSubjects(cached.subjects as any);
     if (Array.isArray(cached.notifications)) setNotifications(cached.notifications);
     if (Array.isArray(cached.semesterChoices)) setSemesterChoices(cached.semesterChoices);
@@ -713,12 +704,21 @@ export const OverviewPage = () => {
   // ✅ สำคัญ: เมื่อ user เปลี่ยน ต้องรีเซ็ตตารางทันที
   useEffect(() => {
     setSchedule({});
+    if (consumeScheduleRevealRequest()) {
+      localStorage.removeItem(hideKey);
+      setScheduleHidden(false);
+      return;
+    }
     setScheduleHidden(localStorage.getItem(hideKey) === '1');
   }, [hideKey]);
 
   useEffect(() => subscribeSubjectsUpdated(() => {
+    if (consumeScheduleRevealRequest()) {
+      localStorage.removeItem(hideKey);
+      setScheduleHidden(false);
+    }
     setSubjectRefreshKey(prev => prev + 1);
-  }), []);
+  }), [hideKey]);
 
   useEffect(() => {
     dropPreviewRef.current = dropPreview;
@@ -735,7 +735,7 @@ export const OverviewPage = () => {
               semester_id: toNumberOrNull(item?.semester_id) ?? 0,
               semester: toNumberOrNull(item?.semester),
               academic_year: toNumberOrNull(item?.academic_year),
-              label: `เทอม ${toNumberOrNull(item?.semester) ?? '-'} / ${toNumberOrNull(item?.academic_year) ?? '-'}`
+              label: formatSemesterLabel(toNumberOrNull(item?.semester), toNumberOrNull(item?.academic_year))
             }))
             .filter((item: SemesterChoice) => Number.isFinite(item.semester_id) && item.semester_id > 0);
           setSemesterChoices(nextChoices);
@@ -750,6 +750,12 @@ export const OverviewPage = () => {
 
     void loadSemesters();
   }, []);
+
+  useEffect(() => {
+    if (selectedSemesterKey || semesterOptions.length === 0) return;
+    setSelectedSemesterKey(semesterOptions[0].key);
+  }, [selectedSemesterKey, semesterOptions]);
+
   const displayWeekOrder = useMemo(() => {
     const hasUnscheduled = (scheduleBySemester[unscheduledDayLabel] ?? []).length > 0;
     return hasUnscheduled ? [...weekOrder, unscheduledDayLabel] : weekOrder;
@@ -817,33 +823,9 @@ export const OverviewPage = () => {
     return warningMap;
   }, [scheduleDisplayByDay]);
 
-  const dayNavigationItems = useMemo(() => {
-    const shortNameMap: Record<string, string> = {
-      จันทร์: 'จ',
-      อังคาร: 'อ',
-      พุธ: 'พ',
-      พฤหัสบดี: 'พฤ',
-      ศุกร์: 'ศ',
-      เสาร์: 'ส',
-      อาทิตย์: 'อา',
-      [unscheduledDayLabel]: '?',
-    };
-
-    return displayWeekOrder.map(day => ({
-      day,
-      shortName: shortNameMap[day] ?? day.slice(0, 1),
-      accent: scheduleDayToneMap[day]?.accent ?? 'var(--accent)',
-    }));
-  }, [displayWeekOrder]);
-
   const showScheduleView = () => {
     setScheduleHidden(false);
     localStorage.removeItem(hideKey);
-  };
-
-  const scrollToDay = (day: string) => {
-    setActiveDay(day);
-    daySectionRefs.current[day]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
   const createSemester = async () => {
@@ -878,7 +860,8 @@ export const OverviewPage = () => {
             semester_id: Number(created.semester_id),
             semester: toNumberOrNull(created.semester),
             academic_year: toNumberOrNull(created.academic_year),
-            label: `เทอม ${toNumberOrNull(created.semester) ?? '-'} / ${toNumberOrNull(created.academic_year) ?? '-'}`,
+            label: formatSemesterLabel(toNumberOrNull(created.semester), toNumberOrNull(created.academic_year))
+              ?? `ภาคเรียนที่ ${semester} ปีการศึกษา ${academicYear}`,
           }
         : null;
 
@@ -915,7 +898,7 @@ export const OverviewPage = () => {
     setSchedule({}); // ✅ เคลียร์ก่อนโหลด กันค้าง
 
     Promise.allSettled([
-      api.get('/dashboard/overview'),
+      api.get(user?.role === 'admin' ? '/admin/overview' : '/dashboard/overview'),
       api.get('/dashboard/progress'),
       fetchSubjectsFromDatabase(showAllSubjects),
       fetchCalendarEventsFromDatabase(),
@@ -925,7 +908,8 @@ export const OverviewPage = () => {
         if (reqIdRef.current !== myReqId) return;
 
         if (overviewRes.status === 'fulfilled') {
-          setStats(overviewRes.value.data?.data ?? overviewRes.value.data);
+          const overviewPayload = overviewRes.value.data?.data ?? overviewRes.value.data;
+          setStats(overviewPayload?.counts ?? overviewPayload);
         } else {
           setStats(null);
         }
@@ -983,6 +967,8 @@ export const OverviewPage = () => {
         if (Array.isArray(eventsPayload)) {
           eventsPayload.forEach((event: any) => {
             const eventType = resolveCalendarEventType(event);
+            // หน้าตารางเรียนไม่ควรนำตารางสอบมาปะปนกับคาบเรียน
+            if (eventType === 'exam') return;
             const linkedSubjectId = toNumberOrNull(
               event?.subject?.id ??
                 event?.subject_id ??
@@ -995,7 +981,10 @@ export const OverviewPage = () => {
             const normalizedSource = String(eventSource ?? '').trim().toLowerCase();
             const linkedStudyLogId = toNumberOrNull(event?.study_log_id ?? event?.studyLogId ?? event?.metadata?.study_log_id);
             if (normalizedSource === 'study_log' || linkedStudyLogId) return;
-            if (eventType && eventType !== 'class' && !linkedSubjectId) return;
+            // Exams are standalone calendar items as well as subject-linked
+            // items.  Do not discard a standalone exam here: doing so also
+            // discarded its saved start/end times before the overview could
+            // render them.
 
             const parsedDate = parseScheduleDate(event?.start_time);
             if (!parsedDate) return;
@@ -1030,6 +1019,7 @@ export const OverviewPage = () => {
               date: format(parsedDate, 'yyyy-MM-dd'),
               period: 0,
               source: linkedSubjectId ? (String(eventSource ?? '').trim().toLowerCase() === 'subject' ? 'subject' : 'subject-event') : 'manual',
+              eventType,
               eventId: Number(event?.id) > 0 ? Number(event.id) : null,
               subjectId: linkedSubjectId,
               ownerUserId: Number.isFinite(Number(subject?.user_id)) ? Number(subject.user_id) : null,
@@ -1037,6 +1027,32 @@ export const OverviewPage = () => {
             pushSlot(slot);
           });
         }
+
+        // รายวิชาที่ผู้ใช้เพิ่มจะมีวันและเวลาอยู่ที่ subject โดยตรงได้ แม้ยังไม่มี
+        // calendar-event จึงสร้างคาบเรียนจากข้อมูลวิชาด้วย เพื่อให้ขึ้นทันทีตามตารางเรียน.
+        (normalizedSubjects as any[]).forEach(subject => {
+          const date = toIsoDate(subject?.start_date);
+          if (!date) return;
+
+          const startTime = normalizeTimeInput(subject?.start_time);
+          const endTime = normalizeTimeInput(subject?.end_time);
+          const allDay = !startTime;
+          pushSlot({
+            id: Number(subject.id),
+            subject: resolveSubjectLabel(subject?.name, subject?.subject_name, subject?.title),
+            color: subject?.color ?? null,
+            startTime: allDay ? null : startTime,
+            endTime: allDay ? null : endTime,
+            room: typeof subject?.classroom === 'string' ? subject.classroom : subject?.room ?? null,
+            allDay,
+            date,
+            period: 0,
+            source: 'subject',
+            eventType: 'class',
+            subjectId: Number(subject.id),
+            ownerUserId: Number.isFinite(Number(subject?.user_id)) ? Number(subject.user_id) : null,
+          });
+        });
 
         Object.keys(map).forEach(key => {
           map[key] = map[key]
@@ -1058,43 +1074,12 @@ export const OverviewPage = () => {
   }, [user?.id, scheduleHidden, showAllSubjects, subjectRefreshKey]);
 
   useEffect(() => {
-    if (displayWeekOrder.length === 0) return;
-    setActiveDay(prev => (displayWeekOrder.includes(prev) ? prev : displayWeekOrder[0]));
-  }, [displayWeekOrder]);
-
-  useEffect(() => {
     const currentAcademicYear = new Date().getFullYear() + 543;
     setNewSemester(prev => ({
       ...prev,
       academic_year: prev.academic_year || String(currentAcademicYear),
     }));
   }, []);
-
-  useEffect(() => {
-    if (scheduleHidden || displayWeekOrder.length === 0) return;
-
-    const observer = new IntersectionObserver(
-      entries => {
-        const visibleEntry = entries
-          .filter(entry => entry.isIntersecting)
-          .sort((left, right) => right.intersectionRatio - left.intersectionRatio)[0];
-        const day = visibleEntry?.target.getAttribute('data-day');
-        if (day) setActiveDay(day);
-      },
-      {
-        root: null,
-        rootMargin: '-15% 0px -65% 0px',
-        threshold: [0, 0.2, 0.45, 0.7],
-      }
-    );
-
-    displayWeekOrder.forEach(day => {
-      const element = daySectionRefs.current[day];
-      if (element) observer.observe(element);
-    });
-
-    return () => observer.disconnect();
-  }, [displayWeekOrder, scheduleHidden, scheduleDisplayByDay]);
 
   const reindexScheduleSlots = (slots: ScheduleSlot[]) =>
     slots
@@ -1129,8 +1114,8 @@ export const OverviewPage = () => {
     setScheduleEditForm({
       subjectId: slot.subjectId ? String(slot.subjectId) : '',
       date: nextDate,
-      startTime: normalizeTimeForInput(slot.startTime),
-      endTime: normalizeTimeForInput(slot.endTime),
+      startTime: normalizeTimeForInput(resolveDisplayStartTime(slot)),
+      endTime: normalizeTimeForInput(resolveDisplayEndTime(slot)),
       room: slot.room ?? '',
       allDay: slot.allDay ?? false,
       color: slot.color ?? resolveScheduleAccent(slot),
@@ -1238,107 +1223,26 @@ export const OverviewPage = () => {
     setSubjectCatalogOpen(false);
   };
 
-  const closePendingDeleteDialog = () => {
-    if (pendingDeleteBusy) return;
-    setPendingDeleteDialog(null);
-  };
-
-  const deleteSubjectById = async (id: number) => {
-    const clients = apiFallbackClients;
-    let lastError: any = null;
-
-    for (const client of clients) {
-      try {
-        const form = new URLSearchParams();
-        form.set('subject_id', String(id));
-        form.set('id', String(id));
-        await client.post('/subjects/delete', form, {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        });
-        return;
-      } catch (err: any) {
-        lastError = err;
-        const status = err?.response?.status;
-        if (!isDeleteFallbackStatus(status)) throw err;
-      }
-
-      try {
-        const form = new URLSearchParams();
-        form.set('subject_id', String(id));
-        await client.post(`/subjects/${id}/delete`, form, {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        });
-        return;
-      } catch (err: any) {
-        lastError = err;
-        const status = err?.response?.status;
-        if (!isDeleteFallbackStatus(status)) throw err;
-      }
-
-      try {
-        const form = new URLSearchParams();
-        form.set('_method', 'DELETE');
-        form.set('subject_id', String(id));
-        await client.post(`/subjects/${id}`, form, {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-HTTP-Method-Override': 'DELETE' },
-        });
-        return;
-      } catch (err: any) {
-        lastError = err;
-        const status = err?.response?.status;
-        if (!isDeleteFallbackStatus(status)) throw err;
-      }
-
-      try {
-        await client.delete(`/subjects/${id}`);
-        return;
-      } catch (err: any) {
-        lastError = err;
-        const status = err?.response?.status;
-        if (!isDeleteFallbackStatus(status)) throw err;
-      }
+  const deleteSubject = async (subject: SubjectSummary) => {
+    if (!window.confirm(`ต้องการลบวิชา "${subject.name}" ใช่หรือไม่?\n\nลบได้เฉพาะวิชาที่ไม่มีข้อมูลอื่นเชื่อมโยงอยู่`)) {
+      return;
     }
 
-    throw lastError ?? new Error('ลบวิชาไม่สำเร็จ');
-  };
-
-  const requestDeleteSubject = (subject: SubjectSummary) => {
-    setPendingDeleteDialog({
-      title: 'ยืนยันการลบ',
-      message: `ต้องการลบวิชา "${subject.name}" ใช่หรือไม่?`,
-      confirmLabel: 'ลบวิชา',
-      action: async () => {
-        setDeletingSubjectId(subject.id);
-        try {
-          await deleteSubjectById(subject.id);
-          setSubjects(prev => prev.filter(item => item.id !== subject.id));
-          setSchedule(prev =>
-            Object.fromEntries(
-              Object.entries(prev)
-                .map(([day, slots]) => [day, slots.filter(slot => slot.subjectId !== subject.id)] as const)
-                .filter(([, slots]) => slots.length > 0)
-            )
-          );
-          emitSubjectsUpdated();
-          success('ลบรายวิชาเรียบร้อยแล้ว');
-        } catch (err: any) {
-          error(err?.response?.data?.message || err?.message || 'ลบวิชาไม่สำเร็จ');
-          return;
-        } finally {
-          setDeletingSubjectId(null);
-        }
-      },
-    });
-  };
-
-  const runPendingDeleteAction = async () => {
-    if (!pendingDeleteDialog) return;
-    setPendingDeleteBusy(true);
     try {
-      await pendingDeleteDialog.action();
-      setPendingDeleteDialog(null);
-    } finally {
-      setPendingDeleteBusy(false);
+      await api.delete(`/subjects/${subject.id}`);
+      setSubjects(prev => prev.filter(item => item.id !== subject.id));
+      setSchedule(prev => {
+        const next: Record<string, ScheduleSlot[]> = {};
+        Object.entries(prev).forEach(([day, slots]) => {
+          const remaining = slots.filter(slot => slot.subjectId !== subject.id);
+          if (remaining.length > 0) next[day] = reindexScheduleSlots(remaining);
+        });
+        return next;
+      });
+      emitSubjectsUpdated();
+      success(`ลบวิชา ${subject.name} เรียบร้อยแล้ว`);
+    } catch (requestError: any) {
+      error(requestError?.response?.data?.message ?? 'ลบวิชาไม่สำเร็จ');
     }
   };
 
@@ -1450,6 +1354,7 @@ export const OverviewPage = () => {
       subject?: string | null;
       allDay: boolean;
       color?: string | null;
+      semesterId?: string | number | null;
     },
     placement?: { day: string; index: number }
   ) => {
@@ -1467,7 +1372,8 @@ export const OverviewPage = () => {
         patch.allDay ? null : startTime,
         patch.allDay ? null : endTime,
         patch.room ?? slot.room ?? null,
-        patch.color ?? slot.color ?? null
+        patch.color ?? slot.color ?? null,
+        patch.semesterId
       );
     } else if (slot.eventId) {
       await api.put(`/calendar-events/${slot.eventId}`, {
@@ -1601,9 +1507,8 @@ export const OverviewPage = () => {
     color?: string | null,
     semesterId?: string | number | null
   ) => {
-    const payload = {
+    const payload: Record<string, string | number | null> = {
       name,
-      semester_id: semesterId ? Number(semesterId) : null,
       start_date: startDate,
       start_time: startTime,
       end_time: endTime,
@@ -1611,11 +1516,16 @@ export const OverviewPage = () => {
       classroom: room,
       color: color ?? null,
     };
+    if (semesterId !== undefined) {
+      payload.semester_id = semesterId ? Number(semesterId) : null;
+    }
 
     const form = new URLSearchParams();
     form.set('_method', 'PUT');
     form.set('name', name);
-    form.set('semester_id', semesterId ? String(semesterId) : '');
+    if (semesterId !== undefined) {
+      form.set('semester_id', semesterId ? String(semesterId) : '');
+    }
     form.set('start_date', startDate ?? '');
     form.set('start_time', startTime ?? '');
     form.set('end_time', endTime ?? '');
@@ -1628,11 +1538,15 @@ export const OverviewPage = () => {
         return await client.put(`/subjects/${subjectId}`, payload);
       } catch (err: any) {
         const status = err?.response?.status;
-        if (status && status !== 404 && status !== 405) {
+        if (status && status !== 404 && status !== 405 && status !== 500) {
           throw err;
         }
         return client.post(`/subjects/${subjectId}`, form, {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-HTTP-Method-Override': 'PUT',
+          },
+          params: { _method: 'PUT' },
         });
       }
     };
@@ -1647,7 +1561,7 @@ export const OverviewPage = () => {
       } catch (err: any) {
         lastError = err;
         const status = err?.response?.status;
-        if (status && status !== 404 && status !== 405) {
+        if (status && status !== 404 && status !== 405 && status !== 500) {
           throw err;
         }
       }
@@ -1758,6 +1672,7 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
         subject: activeSubjectName,
         allDay: false,
         color: activeColor,
+        semesterId: selectedSubject?.semester_id ?? undefined,
       });
 
       closeScheduleEditor();
@@ -1793,41 +1708,6 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
     }
   };
 
-  const deleteScheduleSlot = (slot: ScheduleSlot) => {
-    setPendingDeleteDialog({
-      title: 'ยืนยันการลบ',
-      message: `ต้องการลบคาบ "${slot.subject}" ใช่หรือไม่?`,
-      confirmLabel: 'ลบคาบ',
-      action: async () => {
-        const slotKey = getSlotKey(slot);
-        setDeletingSlotKey(slotKey);
-
-        try {
-          if (slot.eventId) {
-            await deleteScheduleEvent(slot.eventId);
-            return;
-          }
-
-          if (slot.subjectId && slot.source === 'subject') {
-            await updateSubjectSchedule(slot.subjectId, slot.subject, null, null, null, null, slot.color ?? null);
-            setSchedule(prev => {
-              const next: Record<string, ScheduleSlot[]> = {};
-              Object.entries(prev).forEach(([day, slots]) => {
-                const filtered = slots.filter(item => !(item.subjectId === slot.subjectId && item.source === 'subject'));
-                if (filtered.length > 0) next[day] = reindexScheduleSlots(filtered);
-              });
-              return next;
-            });
-          }
-        } catch {
-          error('ลบคาบไม่สำเร็จ');
-        } finally {
-          setDeletingSlotKey(null);
-        }
-      },
-    });
-  };
-
   const saveSubjectEditor = async () => {
     const name = subjectEditor.name.trim();
     if (!name) {
@@ -1837,6 +1717,16 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
 
     if (!subjectEditor.semesterId) {
       setSubjectEditorError('กรุณาเลือกภาคเรียน');
+      return;
+    }
+
+    const duplicateSubject = subjects.find(subject => {
+      if (subjectEditor.subjectId && subject.id === subjectEditor.subjectId) return false;
+      return Number(subject.semester_id ?? 0) === Number(subjectEditor.semesterId) &&
+        normalizeLabelText(subject.name).toLocaleLowerCase('th-TH') === normalizeLabelText(name).toLocaleLowerCase('th-TH');
+    });
+    if (duplicateSubject) {
+      setSubjectEditorError('วิชาซ้ำในภาคเรียนนี้ กรุณาใช้ชื่อวิชาอื่นหรือแก้ไขวิชาเดิม');
       return;
     }
 
@@ -1938,7 +1828,8 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
             },
             ...prev
           ]);
-          emitSubjectsUpdated();
+          // เมื่อเพิ่มวิชา ให้เปิดตารางและโหลดคาบเรียนของวิชานั้นทันที
+          emitSubjectsUpdated({ revealSchedule: true });
         }
       }
 
@@ -1978,6 +1869,31 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
   }, [lastQuizResultKey]);
 
   const selectedSemesterOption = semesterOptions.find(option => option.key === selectedSemesterKey) ?? semesterOptions[0];
+  const overviewSummary = useMemo(() => {
+    const numericValue = (...values: unknown[]) => {
+      for (const value of values) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+      }
+      return 0;
+    };
+
+    const scheduleCount = new Set(
+      Object.values(schedule).flat().map(slot => slot.eventId ?? `${slot.subjectId ?? slot.subject}-${slot.date}-${slot.startTime ?? ''}`)
+    ).size;
+
+    return {
+      users: numericValue((stats as any)?.users, (stats as any)?.users_count, (stats as any)?.total_users),
+      subjects: numericValue((stats as any)?.subjects, filteredSubjects.length),
+      schedules: numericValue((stats as any)?.schedules, (stats as any)?.schedule_count, scheduleCount),
+    };
+  }, [filteredSubjects.length, schedule, stats]);
+  const summaryItems = [
+    { key: 'users', label: 'ผู้ใช้ทั้งหมด', value: overviewSummary.users, detail: 'คนในระบบ', color: '#367cf2' },
+    { key: 'subjects', label: 'วิชาเรียน', value: overviewSummary.subjects, detail: 'วิชาที่บันทึกไว้', color: '#16bc8a' },
+    { key: 'schedules', label: 'ตารางเรียน', value: overviewSummary.schedules, detail: 'รายการตารางทั้งหมด', color: '#f6a609' },
+  ];
+  const summaryChartMax = Math.max(5, ...summaryItems.map(item => item.value));
 
   if (loading) {
     return (
@@ -1987,9 +1903,78 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
     );
   }
 
+  // Overview is the entry point for creating AI summaries.  Keep the existing
   return (
     <div className="space-y-6 sm:space-y-8">
-      {/* ... ส่วนบนเหมือนเดิมของคุณทั้งหมด ... */}
+      <section className="hidden rounded-xl border border-slate-200 bg-white p-3 shadow-sm sm:p-4">
+        <div className="rounded-lg bg-gradient-to-r from-blue-600 to-cyan-400 px-4 py-2 text-base font-bold text-white sm:text-lg">
+          ตารางแสดงรายการ (ผู้ดูแลระบบ)
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <select
+            value={selectedUserScope}
+            onChange={event => setSelectedUserScope(event.target.value)}
+            className="h-9 min-w-[198px] rounded border border-slate-300 bg-white px-3 text-sm text-slate-700 outline-none focus:border-blue-500"
+            aria-label="กรองผู้ใช้งาน"
+          >
+            <option value="all">ทุกผู้ใช้งาน</option>
+            <option value="student">นักเรียน</option>
+            <option value="teacher">ผู้สอน</option>
+          </select>
+          <select
+            value={selectedSemesterKey}
+            onChange={event => setSelectedSemesterKey(event.target.value)}
+            className="h-9 min-w-[132px] rounded border border-slate-300 bg-white px-3 text-sm text-slate-700 outline-none focus:border-blue-500"
+            aria-label="กรองภาคเรียน"
+          >
+            <option value="">ทุกเทอม</option>
+            {semesterOptions.map(option => (
+              <option key={option.key} value={option.key}>{option.label}</option>
+            ))}
+          </select>
+        </div>
+
+        <h2 className="mt-2 text-base font-bold text-slate-800">สถิติภาพรวม</h2>
+        <div className="mt-2 grid gap-3 md:grid-cols-3">
+          {summaryItems.map(item => (
+            <article key={item.key} className="overflow-hidden rounded-lg border border-slate-200 bg-slate-50/50">
+              <div className="px-4 py-3">
+                <p className="text-base font-semibold text-slate-700">{item.label}</p>
+                <p className="text-3xl font-extrabold leading-none text-slate-900">{item.value}</p>
+                <p className="mt-1 text-sm text-slate-500">{item.detail}</p>
+              </div>
+              <div className="h-1" style={{ backgroundColor: item.color }} />
+            </article>
+          ))}
+        </div>
+
+        <div className="mt-4 rounded-xl border border-blue-200 bg-sky-50 p-4 sm:p-5">
+          <h2 className="text-lg font-bold text-slate-900">ภาพรวมข้อมูล</h2>
+          <div className="mt-4 rounded-lg border border-blue-100 bg-white/75 px-3 pb-2 pt-5 sm:px-6">
+            <div className="relative flex h-56 items-end border-b border-l border-blue-300 pt-7">
+              <div className="pointer-events-none absolute inset-x-0 top-[20%] border-t border-dashed border-slate-200" />
+              <div className="pointer-events-none absolute inset-x-0 top-[60%] border-t border-dashed border-slate-200" />
+              {summaryItems.map(item => {
+                const height = item.value > 0 ? `${(item.value / summaryChartMax) * 82}%` : '0%';
+                return (
+                  <div key={`chart-${item.key}`} className="relative flex h-full flex-1 flex-col items-center justify-end px-1 sm:px-3">
+                    <span
+                      className="absolute rounded-full border border-blue-200 bg-white px-3 py-1 text-sm font-bold text-slate-900 shadow"
+                      style={{ bottom: `calc(${height} + 8px)` }}
+                    >
+                      {item.value}
+                    </span>
+                    <div className="w-full rounded-t-md shadow-[0_3px_8px_rgba(15,23,42,0.18)]" style={{ height, backgroundColor: item.color }} />
+                    <span className="mt-2 text-sm font-semibold text-slate-800">{item.label}</span>
+                  </div>
+                );
+              })}
+            </div>
+            <p className="mt-4 text-center text-xs font-semibold text-slate-700">แกนนอน: ประเภทข้อมูล</p>
+          </div>
+        </div>
+      </section>
 
       <section
         className="timetable-shell rounded-none border-0 bg-transparent text-[color:var(--text)] shadow-none sm:rounded-[28px] sm:border sm:border-slate-200 sm:bg-white sm:shadow-none"
@@ -1998,7 +1983,7 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
           <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
             <div>
               <h2 className="timetable-title text-[2.1rem] font-extrabold tracking-tight text-slate-900 sm:text-3xl">ตารางเรียน</h2>
-              <p className="mt-1 text-xs font-medium text-slate-500 sm:text-sm">{selectedSemesterOption?.label ?? 'ทุกเทอม'}</p>
+              <p className="mt-1 text-xs font-medium text-slate-500 sm:text-sm">{selectedSemesterOption?.label ?? 'กรุณาเลือกภาคเรียน'}</p>
             </div>
 
             <div className="flex flex-wrap items-center gap-3 lg:justify-end">
@@ -2101,19 +2086,13 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
                           <div className="min-w-0">
                             <p className="truncate text-sm font-bold text-slate-800">{subject.name}</p>
                             <p className="mt-1 text-xs text-slate-500">
-                              {formatSemesterLabel(subject.semester, subject.academic_year)
-                                ? `เทอม ${formatSemesterLabel(subject.semester, subject.academic_year)}`
-                                : 'ยังไม่ระบุเทอม'}
+                              {formatSemesterLabel(subject.semester, subject.academic_year) ?? 'ยังไม่ระบุภาคเรียน'}
                             </p>
                           </div>
                           <span
                             className="mt-0.5 inline-flex h-3 w-3 rounded-full"
                             style={{ backgroundColor: resolveSubjectColor(subject.color) }}
                           />
-                        </div>
-                        <div className="mt-3 space-y-1.5 text-xs text-slate-500">
-                          <p>พร้อมนำไปจัดลงตารางเรียน</p>
-                          <p>{subject.study_log_count ?? 0} บันทึกการเรียน</p>
                         </div>
                       </article>
                     );
@@ -2152,40 +2131,54 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
             ตารางสอนถูกล้าง/ซ่อนไว้แล้ว (กด “แสดงตาราง” เพื่อดูอีกครั้ง)
           </div>
         ) : (
-          <div className="bg-transparent px-5 pb-32 sm:px-6 md:px-8 md:pb-16">
-            <div className="space-y-8">
+          <div className="bg-transparent px-3 pb-32 sm:px-6 md:px-8 md:pb-16">
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.42em] text-[color:var(--accent)]">Classroom Schedule</p>
+                <p className="mt-1 text-lg font-extrabold leading-tight text-[color:var(--text)] sm:text-xl">{selectedSemesterOption?.label ?? 'กรุณาเลือกภาคเรียน'}</p>
+              </div>
+            </div>
+
+            <div className="timetable-board schedule-scroll overflow-x-auto rounded-[1.35rem] border p-1.5 sm:p-2">
+              <div className="min-w-[1660px] space-y-2">
               {displayWeekOrder.map(day => {
                   const daySlots = scheduleDisplayByDay[day] ?? [];
+                  const hourlySlots = getHourlyTimetableSlots(daySlots);
+                  const slotsByPeriod = new Map(hourlySlots.map((slot, index) => [index + 1, slot] as const));
                   const dayDistinctSubjects = countDistinctSubjects(daySlots);
                   const dayTone = scheduleDayToneMap[day] ?? scheduleDayToneMap.default;
-                  const nextPeriod = resolveNextPeriod(daySlots);
 
                   return (
                     <div
                       key={`schedule-day-${day}`}
-                      data-day={day}
-                      ref={element => {
-                        daySectionRefs.current[day] = element;
-                      }}
-                      className="relative scroll-mt-28"
+                      className="timetable-row grid grid-cols-[86px_repeat(12,minmax(126px,1fr))] gap-1.5 scroll-mt-28"
                     >
-                      <div className="mb-3 flex items-center gap-3">
-                        <h3 className="text-[1.9rem] font-extrabold tracking-tight sm:text-[2.1rem]" style={{ color: dayTone.accent }}>
+                      <div
+                        className="day-label-column flex min-h-[76px] flex-col items-center justify-center rounded-[1rem] border px-2 py-2 text-center"
+                        style={{
+                          borderColor: hexToRgba(dayTone.accent, 0.22),
+                          backgroundColor: hexToRgba(dayTone.accent, 0.11),
+                        }}
+                      >
+                        <h3 className="text-sm font-extrabold leading-tight" style={{ color: dayTone.accent }}>
                           {day}
                         </h3>
                         <span
-                          className="inline-flex items-center rounded-md px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.16em]"
+                          className="mt-1 inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-bold"
                           style={{
-                            backgroundColor: hexToRgba(dayTone.accent, 0.14),
+                            backgroundColor: hexToRgba(dayTone.accent, 0.16),
                             color: dayTone.accent,
                           }}
                         >
-                          {dayDistinctSubjects} classes
+                          {dayDistinctSubjects} วิชา
                         </span>
                       </div>
 
-                      <div className="space-y-3 pl-1">
-                        {daySlots.length > 0 ? daySlots.map((slot, slotIndex) => {
+                      {timetablePeriods.map(period => {
+                        const slot = slotsByPeriod.get(period) ?? null;
+                        const nextPeriod = period;
+
+                        if (slot) {
                           const accent = resolveScheduleAccent(slot);
                           const isContinuationSegment = (slot.hourSegment ?? 1) > 1;
                           const isOwner = Number(slot.ownerUserId ?? user?.id) === Number(user?.id);
@@ -2197,133 +2190,62 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
                             ? subjectNameById.get(Number(slot.subjectId)) ?? null
                             : null;
                           const displaySubject = resolveSubjectLabel(subjectFromMap, slot.subject);
+                          const displayTitle = displaySubject;
                           const roomLabel = slot.room?.trim() || 'ไม่ระบุห้อง';
+                          const hourRangeLabel = slot.allDay
+                            ? 'ทั้งวัน'
+                            : formatTimeRangeCompact(slot.startTime, slot.endTime);
 
                           return (
                             <div
-                              key={`schedule-stack-${day}-${slotKey}-${slotIndex}`}
-                              className="group rounded-[1.35rem] border border-slate-100 bg-white p-4 shadow-[0_2px_10px_-4px_rgba(0,0,0,0.05)] transition-all hover:border-slate-200"
+                              key={`schedule-cell-${day}-${period}-${slotKey}`}
+                              className="timetable-cell subject-card group relative min-h-[76px] overflow-hidden rounded-[1rem] border px-2.5 py-2.5 shadow-sm transition"
+                              style={{ '--glow-color': accent } as CSSProperties}
                             >
-                              <div className="flex gap-4">
-                                <div className="flex min-w-[68px] flex-col items-center justify-center border-r border-slate-100 pr-3">
-                                  <span className="text-[14px] font-extrabold leading-none text-slate-700 sm:text-[15px]">
-                                    {slot.allDay ? 'ทั้งวัน' : normalizeTimeForInput(slot.startTime) || '--:--'}
-                                  </span>
-                                  <span className="mt-1 text-[10px] font-medium text-slate-400 sm:text-[11px]">
-                                    {slot.allDay ? 'ไม่มีเวลาเลิก' : normalizeTimeForInput(slot.endTime) || '--:--'}
-                                  </span>
-                                </div>
-
-                                <div className="min-w-0 flex-1 py-0.5">
-                                  <div className="mb-1.5 flex items-start justify-between gap-3">
-                                    <div className="min-w-0">
-                                      <div className="flex items-center gap-2">
-                                        <span className="h-2 w-2 rounded-full" style={{ backgroundColor: warning ? '#f43f5e' : accent }} />
-                                        <h4 className="truncate text-sm font-bold leading-none text-slate-800">{displaySubject || 'ไม่ระบุวิชา'}</h4>
-                                      </div>
-                                      <div className="ml-4 mt-2 flex items-center gap-1.5 text-[10px] text-slate-500">
-                                        <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 text-slate-400" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                                          <path d="M12 21s-6-4.35-6-10a6 6 0 1 1 12 0c0 5.65-6 10-6 10Z" />
-                                          <circle cx="12" cy="11" r="2.5" />
-                                        </svg>
-                                        <span>{roomLabel}</span>
-                                      </div>
-                                      <div className="ml-4 mt-1.5 flex items-center gap-2 text-[10px] text-slate-400">
-                                        <span>{slot.subjectId ? 'เชื่อมกับวิชาในระบบ' : 'รายการทั่วไป'}</span>
-                                      </div>
-                                    </div>
-
-                                    {canManagePrimary ? (
-                                      <div className="flex items-center gap-1">
-                                        <button
-                                          type="button"
-                                          onClick={() => openScheduleEditor(slot)}
-                                          className="rounded-lg p-1.5 text-amber-500 transition-colors hover:bg-amber-50 hover:text-amber-600"
-                                          title="แก้ไขวิชา"
-                                        >
-                                          <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                                            <path d="M12 20h9" />
-                                            <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
-                                          </svg>
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={() => deleteScheduleSlot(slot)}
-                                          disabled={deletingSlotKey === slotKey}
-                                          className="rounded-lg p-1.5 text-red-500 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50"
-                                          title="ลบวิชา"
-                                        >
-                                          <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                                            <path d="M3 6h18" />
-                                            <path d="M8 6V4h8v2" />
-                                            <path d="m19 6-1 14H6L5 6" />
-                                            <path d="M10 11v6" />
-                                            <path d="M14 11v6" />
-                                          </svg>
-                                        </button>
-                                      </div>
-                                    ) : null}
-                                  </div>
-
-                                  {warning ? (
-                                    <div className="ml-4 mt-2 rounded-xl border border-rose-200 bg-rose-50 px-2.5 py-2 text-[11px] font-semibold text-rose-500">
-                                      {warning.message}
+                              <div className="subject-card-content flex h-full flex-col">
+                                <div className="mb-1.5 flex items-start justify-between gap-1.5">
+                                  <span className="text-[10px] font-bold text-[color:var(--muted)]">{hourRangeLabel}</span>
+                                  {canManagePrimary ? (
+                                    <div className="flex shrink-0 items-center gap-1 opacity-100">
+                                      <button
+                                        type="button"
+                                        onClick={() => openScheduleEditor(slot)}
+                                        className="inline-flex h-5 items-center rounded-full bg-blue-500 px-2 text-[9px] font-bold text-white transition hover:bg-blue-600"
+                                        title="แก้ไขวิชา"
+                                      >
+                                        แก้ไข
+                                      </button>
                                     </div>
                                   ) : null}
                                 </div>
+
+                                <h4 className="schedule-subject mt-1 line-clamp-2 text-[13px] font-extrabold leading-[1.18]">
+                                  {displayTitle || 'ไม่ระบุวิชา'}
+                                </h4>
+                                <p className="mt-1.5 truncate text-[10px] font-semibold text-[color:var(--muted)]">
+                                  ห้อง: {roomLabel}
+                                </p>
+                                {warning ? (
+                                  <p className="mt-1 truncate text-[10px] font-semibold text-rose-500">{warning.message}</p>
+                                ) : null}
                               </div>
                             </div>
                           );
-                        }) : (
-                          <div className="mb-3 mt-1 h-0.5 w-8 rounded-full bg-slate-200" />
-                        )}
+                        }
 
-                        <button
-                          type="button"
-                          onClick={() => openScheduleEditorForCreate(day, nextPeriod)}
-                          className="flex w-full items-center justify-center gap-2 rounded-2xl border-2 border-dashed py-3 text-xs font-bold text-[color:var(--muted)] transition-colors hover:text-[color:var(--text)]"
-                          style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}
-                        >
-                          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-                            <path d="M12 5v14" strokeLinecap="round" />
-                            <path d="M5 12h14" strokeLinecap="round" />
-                          </svg>
-                          เพิ่มวิชาเรียน
-                        </button>
-                      </div>
+                        return (
+                          <button
+                            key={`schedule-empty-${day}-${period}`}
+                            type="button"
+                            onClick={() => openScheduleEditorForCreate(day, nextPeriod)}
+                            className="timetable-cell empty-timetable-cell flex min-h-[76px] flex-col items-center justify-center rounded-[1rem] border border-dashed px-2 py-2 text-center transition hover:border-[color:var(--accent)] hover:text-[color:var(--accent)]"
+                            style={{ borderColor: 'var(--border)', background: 'rgba(255,255,255,0.02)', color: 'var(--muted)' }}
+                          >
+                            <span className="mt-auto mb-auto text-[11px] font-semibold">ว่าง</span>
+                          </button>
+                        );
+                      })}
                     </div>
-                  );
-                })}
-            </div>
-
-            <div className="fixed bottom-[5.75rem] left-0 right-0 z-30 flex px-1 md:hidden">
-              <div
-                className="flex w-full items-center justify-between gap-3 overflow-x-auto border-t px-4 py-4 shadow-[0_-4px_20px_rgba(0,0,0,0.06)] backdrop-blur-md"
-                style={{ borderColor: 'var(--border)', background: 'color-mix(in srgb, var(--surface) 96%, transparent)' }}
-              >
-                {dayNavigationItems.map(item => {
-                  const isActive = activeDay === item.day;
-                  return (
-                    <button
-                      key={`schedule-nav-${item.day}`}
-                      type="button"
-                      onClick={() => scrollToDay(item.day)}
-                      className={`relative flex h-10 w-10 flex-shrink-0 select-none items-center justify-center rounded-full outline-none transition-all duration-300 ease-[cubic-bezier(0.175,0.885,0.32,1.275)] ${
-                        isActive
-                          ? 'scale-110 -translate-y-1.5 text-white shadow-md active:scale-90'
-                          : 'hover:-translate-y-0.5 hover:scale-110 active:scale-75'
-                      }`}
-                      style={
-                        isActive
-                          ? { backgroundColor: item.accent, color: 'var(--on-accent)' }
-                          : { backgroundColor: 'var(--surface-2)', color: 'var(--text)' }
-                      }
-                      title={`ไปวัน${item.day}`}
-                    >
-                      <span className={isActive ? 'text-[14px] font-bold' : 'text-[13px] font-medium'}>
-                        {item.shortName}
-                      </span>
-                    </button>
                   );
                 })}
               </div>
@@ -2337,10 +2259,24 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 py-6">
           <div className="surface w-full max-w-2xl rounded-3xl border border-slate-200 bg-white p-5 shadow-glow">
             <div className="flex items-start justify-between gap-3">
-              <div>
+              <div className="min-w-0">
                 <p className="text-xs uppercase tracking-[0.35em] text-emerald-600">Subjects</p>
                 <h3 className="mt-2 text-lg font-semibold text-slate-900">รายวิชาทั้งหมด</h3>
-               
+                <label className="mt-3 block text-xs font-semibold text-slate-500" htmlFor="subject-catalog-semester">
+                  ภาคเรียน
+                </label>
+                <select
+                  id="subject-catalog-semester"
+                  value={selectedSemesterKey}
+                  onChange={event => setSelectedSemesterKey(event.target.value)}
+                  className="mt-1 w-full max-w-sm rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-medium text-slate-700 outline-none transition focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+                >
+                  {semesterOptions.map(option => (
+                    <option key={option.key} value={option.key}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
               </div>
               <button
                 type="button"
@@ -2362,19 +2298,13 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
                       <div className="min-w-0">
                         <p className="truncate text-sm font-bold text-slate-800">{subject.name}</p>
                         <p className="mt-1 text-xs text-slate-500">
-                          {formatSemesterLabel(subject.semester, subject.academic_year)
-                            ? `เทอม ${formatSemesterLabel(subject.semester, subject.academic_year)}`
-                            : 'ยังไม่ระบุเทอม'}
+                          {formatSemesterLabel(subject.semester, subject.academic_year) ?? 'ยังไม่ระบุภาคเรียน'}
                         </p>
                       </div>
                       <span
                         className="mt-0.5 inline-flex h-3.5 w-3.5 shrink-0 rounded-full"
                         style={{ backgroundColor: resolveSubjectColor(subject.color) }}
                       />
-                    </div>
-                    <div className="mt-3 space-y-1.5 text-xs text-slate-500">
-                      <p>พร้อมนำไปจัดลงตารางเรียน</p>
-                      <p>{subject.study_log_count ?? 0} บันทึกการเรียน</p>
                     </div>
                     <div className="mt-4 flex justify-end gap-2">
                       <button
@@ -2397,21 +2327,18 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
                         type="button"
                         onClick={event => {
                           event.stopPropagation();
-                          requestDeleteSubject(subject);
+                          void deleteSubject(subject);
                         }}
-                        disabled={deletingSubjectId === subject.id || pendingDeleteBusy}
-                        className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-600 transition hover:bg-rose-100 disabled:opacity-50"
-                        title="ลบวิชา"
+                        className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-600 transition hover:bg-rose-100"
+                        title="ลบวิชา (ลบได้เมื่อไม่มีข้อมูลที่เชื่อมโยง)"
                         aria-label={`ลบวิชา ${subject.name}`}
                       >
                         <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                           <path d="M3 6h18" />
-                          <path d="M8 6V4h8v2" />
-                          <path d="m19 6-1 14H6L5 6" />
-                          <path d="M10 11v6" />
-                          <path d="M14 11v6" />
+                          <path d="M8 6V4h8v2M19 6l-1 14H6L5 6" />
+                          <path d="M10 11v5M14 11v5" />
                         </svg>
-                        <span>{deletingSubjectId === subject.id && pendingDeleteBusy ? 'กำลังลบ...' : 'ลบวิชา'}</span>
+                        <span>ลบ</span>
                       </button>
                     </div>
                   </article>
@@ -2422,8 +2349,8 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
         </div>
       )}
 
-      {subjectEditorOpen && (
-        <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-950/55 px-4 py-2 backdrop-blur-sm sm:py-4">
+      {subjectEditorOpen && typeof document !== 'undefined' && createPortal(
+        <div className="fixed inset-0 z-[70] overflow-y-auto bg-slate-950/55 px-4 py-2 backdrop-blur-sm sm:py-4">
           <div className="flex min-h-full items-start justify-center pt-1 sm:pt-2">
             <div
               className="surface my-2 w-full max-w-lg overflow-hidden rounded-[1.75rem] border p-0 shadow-[0_28px_80px_rgba(15,23,42,0.30)]"
@@ -2481,7 +2408,7 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
                       className="mt-3 rounded-xl border p-3"
                       style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
                     >
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[color:var(--muted)]">เพิ่มเทอมเอง</p>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[color:var(--muted)]">เพิ่มภาคเรียน</p>
                       <div className="mt-3 grid gap-2 sm:grid-cols-[120px,minmax(0,1fr),120px]">
                         <select
                           value={newSemester.semester}
@@ -2520,14 +2447,12 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
                             color: 'var(--accent)',
                           }}
                         >
-                          {isCreatingSemester ? 'กำลังเพิ่ม...' : 'เพิ่มเทอม'}
+                          {isCreatingSemester ? 'กำลังเพิ่ม...' : 'เพิ่มภาคเรียน'}
                         </button>
                       </div>
                       {createSemesterError ? (
                         <p className="mt-2 text-xs text-rose-500">{createSemesterError}</p>
-                      ) : (
-                        <p className="mt-2 text-xs text-[color:var(--muted)]">สร้างแล้วระบบจะเลือกเทอมให้อัตโนมัติ</p>
-                      )}
+                      ) : null}
                     </div>
                   </div>
 
@@ -2569,7 +2494,7 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
                       <input
                         type="text"
                         inputMode="numeric"
-                        placeholder="dd/mm/yyyy"
+                        placeholder="วัน/เดือน/ปี"
                         value={toDisplayDateGregorian(subjectEditor.date) ?? subjectEditor.date}
                         onChange={event => setSubjectEditor(prev => ({ ...prev, date: event.target.value }))}
                         className="w-full rounded-xl border px-3.5 py-3 pr-11 text-[color:var(--text)] shadow-sm outline-none transition placeholder:text-[color:var(--muted)] focus:ring-2"
@@ -2598,6 +2523,7 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
                       <input
                         ref={subjectEditorDatePickerRef}
                         type="date"
+                        lang="th-TH"
                         value={toIsoDate(subjectEditor.date) ?? ''}
                         onChange={event => {
                           const nextIso = event.target.value;
@@ -2613,43 +2539,23 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">เวลาเริ่ม</label>
-                      <select
-                        value={subjectEditor.startTime}
-                        onChange={event => setSubjectEditor(prev => ({ ...prev, startTime: event.target.value }))}
-                        className="w-full rounded-xl border px-3.5 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:ring-2 font-mono tabular-nums"
-                        style={{
-                          borderColor: 'var(--border)',
-                          background: 'var(--surface-2)',
-                          ['--tw-ring-color' as string]: 'rgba(var(--accent-rgb),0.24)',
-                        }}
-                      >
-                        <option value="">เลือกเวลา</option>
-                        {overviewTimeOptions.map(option => (
-                          <option key={option} value={option}>
-                            {formatThaiTimeOptionLabel(option)}
-                          </option>
-                        ))}
-                      </select>
+                      <TimePicker
+                      value={subjectEditor.startTime}
+                      onChange={value => setSubjectEditor(prev => ({ ...prev, startTime: value }))}
+                      allowEmpty
+                      label="เวลาเริ่ม"
+                      className="w-full"
+                    />
                     </div>
                     <div>
                       <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">เวลาเลิก</label>
-                      <select
-                        value={subjectEditor.endTime}
-                        onChange={event => setSubjectEditor(prev => ({ ...prev, endTime: event.target.value }))}
-                        className="w-full rounded-xl border px-3.5 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:ring-2 font-mono tabular-nums"
-                        style={{
-                          borderColor: 'var(--border)',
-                          background: 'var(--surface-2)',
-                          ['--tw-ring-color' as string]: 'rgba(var(--accent-rgb),0.24)',
-                        }}
-                      >
-                        <option value="">เลือกเวลา</option>
-                        {overviewTimeOptions.map(option => (
-                          <option key={option} value={option}>
-                            {formatThaiTimeOptionLabel(option)}
-                          </option>
-                        ))}
-                      </select>
+                      <TimePicker
+                      value={subjectEditor.endTime}
+                      onChange={value => setSubjectEditor(prev => ({ ...prev, endTime: value }))}
+                      allowEmpty
+                      label="เวลาเลิก"
+                      className="w-full"
+                    />
                     </div>
                   </div>
 
@@ -2715,7 +2621,8 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
               </div>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {scheduleEditingSlot && (
@@ -2798,27 +2705,25 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">เวลาเริ่ม</label>
-                  <input
-                    type="time"
-                    step={300}
-                    value={scheduleEditForm.startTime}
-                    onChange={event => setScheduleEditForm(prev => ({ ...prev, startTime: event.target.value }))}
-                    disabled={scheduleEditForm.allDay}
-                    className="w-full rounded-xl border px-4 py-3 font-mono text-base tabular-nums text-[color:var(--text)] shadow-sm outline-none transition focus:border-[color:var(--accent)] focus:ring-4 focus:ring-[color:rgba(var(--accent-rgb),0.10)] disabled:opacity-50"
-                    style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
-                  />
+                  <TimePicker
+                      value={scheduleEditForm.startTime}
+                      onChange={value => setScheduleEditForm(prev => ({ ...prev, startTime: value }))}
+                      disabled={scheduleEditForm.allDay}
+                      allowEmpty
+                      label="เวลาเริ่ม"
+                      className="w-full"
+                    />
                 </div>
                 <div>
                   <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">เวลาเลิก</label>
-                  <input
-                    type="time"
-                    step={300}
-                    value={scheduleEditForm.endTime}
-                    onChange={event => setScheduleEditForm(prev => ({ ...prev, endTime: event.target.value }))}
-                    disabled={scheduleEditForm.allDay}
-                    className="w-full rounded-xl border px-4 py-3 font-mono text-base tabular-nums text-[color:var(--text)] shadow-sm outline-none transition focus:border-[color:var(--accent)] focus:ring-4 focus:ring-[color:rgba(var(--accent-rgb),0.10)] disabled:opacity-50"
-                    style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
-                  />
+                  <TimePicker
+                      value={scheduleEditForm.endTime}
+                      onChange={value => setScheduleEditForm(prev => ({ ...prev, endTime: value }))}
+                      disabled={scheduleEditForm.allDay}
+                      allowEmpty
+                      label="เวลาเลิก"
+                      className="w-full"
+                    />
                 </div>
               </div>
             </div>
@@ -2846,47 +2751,6 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
           </div>
         </div>
       )}
-
-      {pendingDeleteDialog ? (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 px-4 py-6">
-          <div className="w-full max-w-md rounded-3xl border border-rose-100 bg-white p-5 shadow-[0_20px_80px_rgba(15,23,42,0.22)]">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-xs uppercase tracking-[0.35em] text-rose-500">Delete</p>
-                <h3 className="mt-2 text-lg font-semibold text-slate-900">{pendingDeleteDialog.title}</h3>
-                <p className="mt-1 text-sm text-slate-500">{pendingDeleteDialog.message}</p>
-              </div>
-              <button
-                type="button"
-                onClick={closePendingDeleteDialog}
-                disabled={pendingDeleteBusy}
-                className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-500 hover:text-slate-800 disabled:opacity-60"
-              >
-                ปิด
-              </button>
-            </div>
-
-            <div className="mt-5 flex items-center justify-between gap-2">
-              <button
-                type="button"
-                onClick={closePendingDeleteDialog}
-                disabled={pendingDeleteBusy}
-                className="rounded-full border border-slate-200 bg-slate-50 px-4 py-2 text-xs font-semibold text-slate-500 hover:text-slate-800 disabled:opacity-60"
-              >
-                ยกเลิก
-              </button>
-              <button
-                type="button"
-                onClick={runPendingDeleteAction}
-                disabled={pendingDeleteBusy}
-                className="rounded-full bg-rose-500 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-rose-600 disabled:opacity-60"
-              >
-                {pendingDeleteBusy ? 'กำลังลบ...' : pendingDeleteDialog.confirmLabel}
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
 
       {draggingSlot && dragPointer && draggingSlotDataRef.current ? (
         <div
@@ -3019,9 +2883,38 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
         }
 
         .theme-dark .day-label-column {
-          width: 176px;
+          width: auto;
           background: rgba(255, 255, 255, 0.02) !important;
           border-right-color: rgba(255, 255, 255, 0.06) !important;
+        }
+
+        .timetable-cell {
+          box-shadow: none !important;
+        }
+
+        .theme-dark .timetable-cell {
+          border-color: rgba(255, 255, 255, 0.07) !important;
+          background: rgba(15, 23, 42, 0.36) !important;
+        }
+
+        .theme-light .timetable-cell {
+          border-color: rgba(15, 23, 42, 0.08) !important;
+          background: rgba(255, 255, 255, 0.88) !important;
+        }
+
+        .theme-dark .empty-timetable-cell {
+          background: rgba(15, 23, 42, 0.24) !important;
+          border-color: rgba(255, 255, 255, 0.06) !important;
+        }
+
+        .theme-light .empty-timetable-cell {
+          background: rgba(248, 250, 252, 0.76) !important;
+          border-color: rgba(15, 23, 42, 0.08) !important;
+        }
+
+        .theme-light .timetable-cell.subject-card:hover,
+        .theme-dark .timetable-cell.subject-card:hover {
+          transform: translateY(-2px);
         }
 
         .theme-dark .subject-card {

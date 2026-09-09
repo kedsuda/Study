@@ -18,6 +18,7 @@ use Illuminate\Support\Str;
 class StudyCalendarEventController extends Controller
 {
     private const EVENT_TYPES = ['class', 'exam', 'other'];
+    private const CALENDAR_TIMEZONE = 'Asia/Bangkok';
 
     public function __construct()
     {
@@ -37,8 +38,12 @@ class StudyCalendarEventController extends Controller
         }
 
         // ✅ parse ช่วงเวลา (ถ้ามี) แล้ว sync log -> event
-        $start = $request->filled('start') ? Carbon::parse($request->input('start'))->startOfDay() : null;
-        $end   = $request->filled('end') ? Carbon::parse($request->input('end'))->endOfDay() : null;
+        $start = $request->filled('start')
+            ? Carbon::parse($request->input('start'), self::CALENDAR_TIMEZONE)->startOfDay()
+            : null;
+        $end = $request->filled('end')
+            ? Carbon::parse($request->input('end'), self::CALENDAR_TIMEZONE)->endOfDay()
+            : null;
 
         // ✅ สำคัญ: อัปเดต event จาก study_log ให้ล่าสุด ก่อนส่งกลับ
         // (ถ้าไม่ต้องการ behavior นี้ สามารถคอมเมนต์บรรทัดนี้ได้)
@@ -86,13 +91,30 @@ class StudyCalendarEventController extends Controller
         $source = $requestedSource === 'subject' ? 'subject' : 'manual';
         $shouldSyncSubject = $subjectId && $eventType === 'class' && $source === 'subject';
 
-        $startAt = Carbon::parse($validated['start_time']);
+        $startAt = Carbon::parse($validated['start_time'], self::CALENDAR_TIMEZONE);
         $endAt = array_key_exists('end_time', $validated) && $validated['end_time']
-            ? Carbon::parse($validated['end_time'])
+            ? Carbon::parse($validated['end_time'], self::CALENDAR_TIMEZONE)
             : null;
 
-        if ($endAt && $endAt->lessThan($startAt)) {
-            return response()->json(['message' => 'เวลาเลิกต้องไม่ก่อนเวลาเริ่ม'], 422);
+        if ($endAt && $endAt->lessThanOrEqualTo($startAt)) {
+            return response()->json(['message' => 'เวลาเลิกต้องมากกว่าเวลาเริ่ม'], 422);
+        }
+
+        $conflict = $this->findClassTimeConflict($user->id, $startAt, $endAt, $allDay, $eventType);
+        if ($conflict) {
+            return response()->json(['message' => $this->classTimeConflictMessage($conflict)], 422);
+        }
+
+        $subjectConflict = $this->findSubjectTimeConflict(
+            $user->id,
+            $startAt,
+            $endAt,
+            $allDay,
+            $eventType,
+            $shouldSyncSubject ? (int) $subjectId : null
+        );
+        if ($subjectConflict) {
+            return response()->json(['message' => $this->subjectTimeConflictMessage($subjectConflict)], 422);
         }
 
         // ✅ metadata เป็น array ตรง ๆ (model cast จะจัดการให้)
@@ -173,16 +195,18 @@ class StudyCalendarEventController extends Controller
         }
 
         $startTime = array_key_exists('start_time', $validated)
-            ? Carbon::parse($validated['start_time'])
+            ? Carbon::parse($validated['start_time'], self::CALENDAR_TIMEZONE)
             : $calendar_event->start_time;
 
         $endTime = $calendar_event->end_time;
         if (array_key_exists('end_time', $validated)) {
-            $endTime = $validated['end_time'] ? Carbon::parse($validated['end_time']) : null;
+            $endTime = $validated['end_time']
+                ? Carbon::parse($validated['end_time'], self::CALENDAR_TIMEZONE)
+                : null;
         }
 
-        if ($endTime && $endTime->lessThan($startTime)) {
-            return response()->json(['message' => 'เวลาเลิกต้องไม่ก่อนเวลาเริ่ม'], 422);
+        if ($endTime && $endTime->lessThanOrEqualTo($startTime)) {
+            return response()->json(['message' => 'เวลาเลิกต้องมากกว่าเวลาเริ่ม'], 422);
         }
 
         $metadata = is_array($calendar_event->metadata) ? $calendar_event->metadata : [];
@@ -195,6 +219,23 @@ class StudyCalendarEventController extends Controller
         $currentSource = is_string($metadata['source'] ?? null) ? Str::lower((string) $metadata['source']) : 'manual';
         $source = $requestedSource === 'subject' ? 'subject' : ($requestedSource === 'manual' ? 'manual' : $currentSource);
         $shouldSyncSubject = $subjectId && $eventType === 'class' && $source === 'subject';
+
+        $conflict = $this->findClassTimeConflict($user->id, $startTime, $endTime, $allDay, $eventType, $calendar_event->id);
+        if ($conflict) {
+            return response()->json(['message' => $this->classTimeConflictMessage($conflict)], 422);
+        }
+
+        $subjectConflict = $this->findSubjectTimeConflict(
+            $user->id,
+            $startTime,
+            $endTime,
+            $allDay,
+            $eventType,
+            $shouldSyncSubject ? (int) $subjectId : null
+        );
+        if ($subjectConflict) {
+            return response()->json(['message' => $this->subjectTimeConflictMessage($subjectConflict)], 422);
+        }
 
         if (array_key_exists('type', $validated) || array_key_exists('event_type', $validated)) {
             $metadata['type'] = $eventType;
@@ -586,6 +627,166 @@ class StudyCalendarEventController extends Controller
 
         $allowed = $this->eventTypeColumnAllowedValues();
         return $allowed === null || in_array($eventType, $allowed, true);
+    }
+
+    private function findClassTimeConflict(
+        int $userId,
+        Carbon $startTime,
+        ?Carbon $endTime,
+        bool $allDay,
+        string $eventType,
+        ?int $ignoreEventId = null
+    ): ?StudyCalendarEvent {
+        if ($eventType !== 'class' || $allDay || ! $endTime) {
+            return null;
+        }
+
+        $query = StudyCalendarEvent::with('subject')
+            ->where('user_id', $userId)
+            ->whereNotNull('end_time')
+            ->where('start_time', '<', $endTime)
+            ->where('end_time', '>', $startTime);
+
+        if ($ignoreEventId) {
+            $query->where('id', '<>', $ignoreEventId);
+        }
+
+        foreach ($query->get() as $event) {
+            $metadata = is_array($event->metadata) ? $event->metadata : [];
+            if ((bool) ($metadata['all_day'] ?? false)) {
+                continue;
+            }
+
+            if ($this->resolveEventType([], $event) !== 'class') {
+                continue;
+            }
+
+            return $event;
+        }
+
+        return null;
+    }
+
+    private function classTimeConflictMessage(StudyCalendarEvent $conflict): string
+    {
+        $timezone = config('app.timezone', 'Asia/Bangkok');
+        $title = trim((string) ($conflict->subject?->name ?: $conflict->title));
+        $timeRange = trim(
+            ($conflict->start_time ? $conflict->start_time->copy()->timezone($timezone)->format('H:i') : '')
+            . '-'
+            . ($conflict->end_time ? $conflict->end_time->copy()->timezone($timezone)->format('H:i') : ''),
+            '-'
+        );
+        $detail = $timeRange !== '' ? " เวลา {$timeRange}" : '';
+
+        return "เวลานี้ซ้อนกับวิชา {$title}{$detail} กรุณาเลือกเวลาอื่น";
+    }
+
+    private function findSubjectTimeConflict(
+        int $userId,
+        Carbon $startTime,
+        ?Carbon $endTime,
+        bool $allDay,
+        string $eventType,
+        ?int $ignoreSubjectId = null
+    ): ?Subject {
+        if ($eventType !== 'class' || $allDay || ! $endTime) {
+            return null;
+        }
+
+        if (! Schema::hasTable((new Subject())->getTable())) {
+            return null;
+        }
+
+        foreach (['start_date', 'start_time', 'end_time'] as $column) {
+            if (! Schema::hasColumn('subjects', $column)) {
+                return null;
+            }
+        }
+
+        $query = Subject::withoutGlobalScopes()
+            ->where('user_id', $userId)
+            ->whereNotNull('start_date')
+            ->whereNotNull('start_time')
+            ->whereNotNull('end_time');
+
+        if ($ignoreSubjectId) {
+            $query->where('id', '<>', $ignoreSubjectId);
+        }
+
+        $timezone = config('app.timezone', 'Asia/Bangkok');
+        $newDate = $startTime->copy()->timezone($timezone)->startOfDay();
+        $newStart = $startTime->copy()->timezone($timezone)->format('H:i:s');
+        $newEnd = $endTime->copy()->timezone($timezone)->format('H:i:s');
+
+        foreach ($query->get() as $subject) {
+            try {
+                $existingDate = Carbon::parse((string) $subject->start_date, $timezone)->startOfDay();
+            } catch (\Throwable $e) {
+                continue;
+            }
+
+            if (! $existingDate->isSameDay($newDate)) {
+                continue;
+            }
+
+            $existingStart = $this->normalizeSubjectTime($subject->start_time);
+            $existingEnd = $this->normalizeSubjectTime($subject->end_time);
+            if (! $existingStart || ! $existingEnd) {
+                continue;
+            }
+
+            if ($newStart < $existingEnd && $existingStart < $newEnd) {
+                return $subject;
+            }
+        }
+
+        return null;
+    }
+
+    private function subjectTimeConflictMessage(Subject $conflict): string
+    {
+        $timeRange = trim(($this->formatSubjectTime($conflict->start_time) ?? '') . '-' . ($this->formatSubjectTime($conflict->end_time) ?? ''), '-');
+        $detail = $timeRange !== '' ? " เวลา {$timeRange}" : '';
+
+        return "เวลานี้ซ้อนกับวิชา {$conflict->name}{$detail} กรุณาเลือกเวลาอื่น";
+    }
+
+    private function normalizeSubjectTime(mixed $value): ?string
+    {
+        if ($value instanceof Carbon) {
+            return $value->format('H:i:s');
+        }
+
+        $raw = is_string($value) ? trim($value) : (string) $value;
+        if ($raw === '') {
+            return null;
+        }
+
+        if (str_contains($raw, ' ')) {
+            $raw = explode(' ', $raw)[1] ?? $raw;
+        }
+
+        if (str_contains($raw, 'T')) {
+            $raw = explode('T', $raw)[1] ?? $raw;
+        }
+
+        $raw = str_replace('.', ':', preg_replace('/Z$|[+-]\d{2}:?\d{2}$/', '', $raw) ?? $raw);
+        if (! preg_match('/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/', $raw, $matches)) {
+            return null;
+        }
+
+        return sprintf('%02d:%02d:%02d', (int) $matches[1], (int) $matches[2], (int) ($matches[3] ?? 0));
+    }
+
+    private function formatSubjectTime(mixed $value): ?string
+    {
+        $time = $this->normalizeSubjectTime($value);
+        if (! $time) {
+            return null;
+        }
+
+        return substr($time, 0, 5);
     }
 
     private function eventTypeColumnAllowedValues(): ?array

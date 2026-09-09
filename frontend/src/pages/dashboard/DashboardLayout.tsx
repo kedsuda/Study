@@ -1,16 +1,16 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type SyntheticEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react';
 import { createPortal } from 'react-dom';
-import { House, BookOpen, ClipboardText, CalendarBlank, Target, Bell, Microphone, Suitcase, Robot, FileText, User, Archive, DotsThree, Sun, Moon, Palette, X } from 'phosphor-react';
+import { House, BookOpen, ClipboardText, CalendarBlank, Target, Bell, Microphone, Suitcase, Robot, FileText, User, Archive, DotsThree, Sun, Moon, X } from 'phosphor-react';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import { api, assetBaseURL } from '../../services/api';
 import robotImage from '../../img/robot.png';
-import { CalendarPage } from './CalendarPage';
 import {
   LOCAL_NOTIFICATIONS_EVENT,
   REMOTE_NOTIFICATIONS_EVENT,
   deleteLocalNotification,
   markLocalNotificationAsRead,
+  markLocalNotificationAsDelivered,
   readLocalNotifications
 } from '../../services/localNotifications';
 
@@ -80,7 +80,7 @@ const backgroundThemes = [
   }
 ];
 
-const themeSwatches = ['#f472b6', '#fb7185', '#fdba74', '#facc15', '#bef264', '#5eead4', '#67e8f9', '#60a5fa', '#818cf8', '#a78bfa'];
+const themeSwatches = ['#3b82f6', '#22c55e', '#f97316', '#ec4899', '#8b5cf6', '#14b8a6', '#ef4444'] as const;
 
 const ThemeModeSwitch = ({
   theme,
@@ -126,13 +126,58 @@ const sidebarDarkPalette = [
   '99, 102, 241',  // indigo
 ] as const;
 
+type IconName =
+  | 'overview'
+  | 'subjects'
+  | 'quizzes'
+  | 'calendar'
+  | 'more'
+  | 'profile'
+  | 'goals'
+  | 'stats'
+  | 'voiceSummary'
+  | 'careerAdvisor'
+  | 'assistant'
+  | 'studyDigest'
+  | 'studyStorage'
+  | 'documentSummary'
+  | 'archive'
+  | 'admin'
+  | 'notifications';
+
+type NavItem = {
+  to: string;
+  label: string;
+  icon: IconName;
+  accent: string;
+  showOnMobile?: boolean;
+};
+
+type StudyNotification = {
+  id: number;
+  title: string;
+  message: string;
+  type: string;
+  notify_at: string;
+  delivered_at?: string | null;
+  is_read: boolean;
+};
+
+type InAppToast = {
+  key: string;
+  title: string;
+  message: string;
+};
+
 const MobileIcon = ({
   name,
   active = false,
   className = 'h-6 w-6',
   accent
 }: {
+  
   name: IconName;
+  
   active?: boolean;
   className?: string;
   accent: string;
@@ -307,6 +352,26 @@ const MobileIcon = ({
           )}
         </svg>
       );
+    case 'stats': // สถิติ
+      return (
+        <svg viewBox="0 0 24 24" className={className} fill="none">
+          {active ? (
+            <>
+              <rect x="4" y="12" width="3.8" height="7" rx="1.3" fill={accentColor} />
+              <rect x="10.1" y="7" width="3.8" height="12" rx="1.3" fill={accentColor} />
+              <rect x="16.2" y="4" width="3.8" height="15" rx="1.3" fill={accentColor} />
+              <path d="M4 20h16" stroke={accentColor} strokeWidth={1.8} strokeLinecap="round" />
+            </>
+          ) : (
+            <>
+              <rect x="4" y="12" width="3.8" height="7" rx="1.3" stroke={accentColor} strokeWidth={1.8} />
+              <rect x="10.1" y="7" width="3.8" height="12" rx="1.3" stroke={accentColor} strokeWidth={1.8} />
+              <rect x="16.2" y="4" width="3.8" height="15" rx="1.3" stroke={accentColor} strokeWidth={1.8} />
+              <path d="M4 20h16" stroke={accentColor} strokeWidth={1.8} strokeLinecap="round" />
+            </>
+          )}
+        </svg>
+      );
     case 'voiceSummary': // ไมโครโฟน
       return (
         <svg viewBox="0 0 24 24" className={className} fill="none">
@@ -391,6 +456,40 @@ const MobileIcon = ({
           <rect x="8" y="6" width="8" height="2" rx="1" fill={accentColor} />
         </svg>
       );
+    case 'studyDigest': // สรุปการเรียน
+      return (
+        <svg viewBox="0 0 24 24" className={className} fill="none">
+          {active ? (
+            <>
+              <rect x="4.5" y="4.5" width="15" height="15" rx="3" fill={accentColor} />
+              <path d="M8 8h8M8 12h8M8 16h4.8" stroke="#fff" strokeWidth={1.8} strokeLinecap="round" />
+              <path d="M16.2 14.8v3M14.7 16.3h3" stroke="#fff" strokeWidth={1.8} strokeLinecap="round" />
+            </>
+          ) : (
+            <>
+              <rect x="4.5" y="4.5" width="15" height="15" rx="3" stroke={accentColor} strokeWidth={1.8} />
+              <path d="M8 8h8M8 12h8M8 16h4.8" stroke={accentColor} strokeWidth={1.7} strokeLinecap="round" />
+              <path d="M16.2 14.8v3M14.7 16.3h3" stroke={accentColor} strokeWidth={1.7} strokeLinecap="round" />
+            </>
+          )}
+        </svg>
+      );
+    case 'studyStorage': // กระเป๋าเก็บไฟล์
+      return (
+        <svg viewBox="0 0 24 24" className={className} fill="none">
+          {active ? (
+            <>
+              <path d="M4.5 8.2A2.2 2.2 0 0 1 6.7 6h3.6l2 2.2h5A2.2 2.2 0 0 1 19.5 10v7.2a2.2 2.2 0 0 1-2.2 2.2H6.7a2.2 2.2 0 0 1-2.2-2.2v-9Z" fill={accentColor} />
+              <path d="M8 13h8M8 16h5" stroke="#fff" strokeWidth={1.8} strokeLinecap="round" />
+            </>
+          ) : (
+            <>
+              <path d="M4.5 8.2A2.2 2.2 0 0 1 6.7 6h3.6l2 2.2h5A2.2 2.2 0 0 1 19.5 10v7.2a2.2 2.2 0 0 1-2.2 2.2H6.7a2.2 2.2 0 0 1-2.2-2.2v-9Z" stroke={accentColor} strokeWidth={1.8} strokeLinejoin="round" />
+              <path d="M8 13h8M8 16h5" stroke={accentColor} strokeWidth={1.7} strokeLinecap="round" />
+            </>
+          )}
+        </svg>
+      );
     case 'documentSummary': // สรุปด้วย AI (ประกาย)
       return (
         <svg viewBox="0 0 24 24" className={className} fill="none">
@@ -418,6 +517,13 @@ const MobileIcon = ({
             strokeLinejoin="round"
           />
           <path d="M10 19a2 2 0 0 0 4 0" stroke={accentColor} strokeWidth={1.6} strokeLinecap="round" />
+        </svg>
+      );
+    case 'admin': // ผู้ดูแล
+      return (
+        <svg viewBox="0 0 24 24" className={className} fill="none">
+          <path d="M12 3.6 18.5 6v5.2c0 4.2-2.5 7.4-6.5 9.2-4-1.8-6.5-5-6.5-9.2V6L12 3.6Z" fill={active ? accentColor : 'none'} stroke={accentColor} strokeWidth={1.8} strokeLinejoin="round" />
+          <path d="M9.2 12.1 11 13.9l3.9-4.1" stroke={active ? '#fff' : accentColor} strokeWidth={1.9} strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       );
     default:
@@ -469,71 +575,6 @@ const getAccentInkColor = (hex: string, mode: 'dark' | 'light') => {
     return brightness < 150 ? shadeColor(hex, 38) : hex;
   }
   return brightness > 175 ? shadeColor(hex, -48) : brightness > 135 ? shadeColor(hex, -28) : hex;
-};
-
-const hexToHue = (hex: string) => {
-  const [r, g, b] = hexToRgbString(hex).split(',').map(value => Number(value) / 255);
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const delta = max - min;
-  if (delta === 0) return 0;
-  let hue = max === r
-    ? ((g - b) / delta) % 6
-    : max === g
-      ? (b - r) / delta + 2
-      : (r - g) / delta + 4;
-  hue *= 60;
-  return hue < 0 ? hue + 360 : hue;
-};
-
-const hslToHex = (hue: number, saturation = 82, lightness = 56) => {
-  const s = saturation / 100;
-  const l = lightness / 100;
-  const chroma = (1 - Math.abs(2 * l - 1)) * s;
-  const x = chroma * (1 - Math.abs(((hue / 60) % 2) - 1));
-  const m = l - chroma / 2;
-  const [r, g, b] =
-    hue < 60 ? [chroma, x, 0]
-      : hue < 120 ? [x, chroma, 0]
-        : hue < 180 ? [0, chroma, x]
-          : hue < 240 ? [0, x, chroma]
-            : hue < 300 ? [x, 0, chroma]
-              : [chroma, 0, x];
-  return `#${[r, g, b].map(channel => Math.round((channel + m) * 255).toString(16).padStart(2, '0')).join('')}`;
-};
-
-const hexToHsl = (hex: string) => {
-  const normalized = normalizeHexColor(hex).slice(1);
-  const value = Number.parseInt(normalized, 16);
-  const r = ((value >> 16) & 255) / 255;
-  const g = ((value >> 8) & 255) / 255;
-  const b = (value & 255) / 255;
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const delta = max - min;
-  let hue = 0;
-  let saturation = 0;
-  const lightness = (max + min) / 2;
-  if (delta !== 0) {
-    saturation = delta / (1 - Math.abs(2 * lightness - 1));
-    switch (max) {
-      case r:
-        hue = 60 * (((g - b) / delta) % 6);
-        break;
-      case g:
-        hue = 60 * ((b - r) / delta + 2);
-        break;
-      default:
-        hue = 60 * ((r - g) / delta + 4);
-        break;
-    }
-  }
-  if (hue < 0) hue += 360;
-  return {
-    hue,
-    saturation: Math.round(saturation * 100),
-    lightness: Math.round(lightness * 100),
-  };
 };
 
 const resolveProfileUrl = (value?: string | null, fallbackBase?: string) => {
@@ -624,6 +665,14 @@ const parseNotificationDate = (value?: string | null) => {
   const trimmed = String(value).trim();
   if (!trimmed) return null;
 
+  // New API responses are ISO 8601 with an explicit offset.  Parse those
+  // first; otherwise the pattern below would discard `+07:00` and turn the
+  // instant into a browser-local time.
+  if (/[zZ]|[+-]\d{2}:\d{2}$/.test(trimmed)) {
+    const parsedIso = new Date(trimmed);
+    if (!Number.isNaN(parsedIso.getTime())) return parsedIso;
+  }
+
   const match = trimmed.match(/^(\d{4})[-/](\d{2})[-/](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
   if (match) {
     const [, year, month, day, hour, minute, second] = match;
@@ -638,13 +687,26 @@ const parseNotificationDate = (value?: string | null) => {
     if (!Number.isNaN(parsed.getTime())) return parsed;
   }
 
-  if (/[zZ]|[+-]\d{2}:\d{2}$/.test(trimmed)) {
-    const parsedIso = new Date(trimmed);
-    if (!Number.isNaN(parsedIso.getTime())) return parsedIso;
-  }
-
   const fallback = new Date(trimmed);
   return Number.isNaN(fallback.getTime()) ? null : fallback;
+};
+
+const formatNotificationTimestamp = (value?: string | Date | null) => {
+  const date = value instanceof Date ? value : parseNotificationDate(value);
+  if (!date) return '';
+
+  return date.toLocaleString('th-TH', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+};
+
+const withDeliveredTime = (message: string, deliveredAt: Date) => {
+  const timestamp = formatNotificationTimestamp(deliveredAt);
+  return timestamp ? `${message}\n\nแจ้งเตือนเมื่อ ${timestamp} น.` : message;
 };
 
 export const DashboardLayout = () => {
@@ -707,7 +769,6 @@ export const DashboardLayout = () => {
   const [desktopThemeOpen, setDesktopThemeOpen] = useState(false);
   const [mobileThemeOpen, setMobileThemeOpen] = useState(false);
   const [logoPreviewOpen, setLogoPreviewOpen] = useState(false);
-  const [calendarOpen, setCalendarOpen] = useState(false);
   const [webToasts, setWebToasts] = useState<InAppToast[]>([]);
   const [notifyLoading, setNotifyLoading] = useState(false);
   const [browserNotifyEnabled, setBrowserNotifyEnabled] = useState(() => {
@@ -734,12 +795,14 @@ export const DashboardLayout = () => {
   const mobileNotificationDialogRef = useRef<HTMLDivElement | null>(null);
   const mobileMenuRef = useRef<HTMLDivElement | null>(null);
   const mobileMenuDialogRef = useRef<HTMLDivElement | null>(null);
+  const bottomNavScrollRef = useRef<HTMLElement | null>(null);
   const desktopThemeRef = useRef<HTMLDivElement | null>(null);
   const mobileThemeRef = useRef<HTMLDivElement | null>(null);
   const notifiedKeysRef = useRef<Set<string>>(new Set());
   const toastTimersRef = useRef<Map<string, number>>(new Map());
   const requestedBrowserPermissionRef = useRef(false);
   const hasLoadedNotificationsRef = useRef(false);
+  const hasAutoOpenedNotificationsRef = useRef(false);
 
   const unreadCount = useMemo(
     () => (Array.isArray(notifications) ? notifications.filter(n => !n.is_read).length : 0),
@@ -794,8 +857,23 @@ export const DashboardLayout = () => {
     if (notifiedKeysRef.current.has(key) || hasSeenNotificationKey(user?.id, key)) return;
     notifiedKeysRef.current.add(key);
     persistSeenNotificationKey(user?.id, key);
-    pushWebToast(key, item.title, item.message);
-    tryDesktopNotify(item.title, item.message, item.id);
+    const deliveredAtDate = new Date();
+    const deliveredAt = deliveredAtDate.toISOString();
+    setNotifications(prev => prev.map(notification => (
+      notification.id === item.id && !notification.delivered_at
+        ? { ...notification, delivered_at: deliveredAt }
+        : notification
+    )));
+    if (item.id < 0) {
+      markLocalNotificationAsDelivered(user?.id, item.id, deliveredAt);
+    } else if (!item.delivered_at) {
+      void api.patch(`/notifications/${item.id}/delivered`).catch(() =>
+        api.post(`/notifications/${item.id}/delivered`).catch(() => undefined)
+      );
+    }
+    const deliveredMessage = withDeliveredTime(item.message, deliveredAtDate);
+    pushWebToast(key, item.title, deliveredMessage);
+    tryDesktopNotify(item.title, deliveredMessage, item.id);
     setNotifyOpen(true);
   };
 
@@ -886,6 +964,13 @@ export const DashboardLayout = () => {
         const merged = sortByNotifyAtDesc([...localItems, ...remoteItems]);
         if (!alive) return;
         setNotifications(merged);
+
+        // When the dashboard is opened after sign-in, show unread items before
+        // the user starts interacting with the current page.
+        if (!hasAutoOpenedNotificationsRef.current && merged.some(item => !item.is_read)) {
+          hasAutoOpenedNotificationsRef.current = true;
+          setNotifyOpen(true);
+        }
 
         // Notify only when due time has arrived.
         const nowMs = Date.now();
@@ -1098,84 +1183,52 @@ export const DashboardLayout = () => {
     () => [
       { to: '/ai-assistant', label: 'หน้าหลัก', icon: 'assistant', accent: activeAccentTheme.accent },
       { to: '/overview', label: 'ตารางเรียน', icon: 'subjects', accent: activeAccentTheme.accent },
+      { to: '/calendar', label: 'ปฏิทิน', icon: 'calendar', accent: activeAccentTheme.accent },
+      { to: '/document-summary', label: 'สรุปจากเนื้อหา', icon: 'documentSummary', accent: activeAccentTheme.accent },
+      { to: '/study-storage', label: 'กระเป๋าเก็บไฟล์', icon: 'studyStorage', accent: activeAccentTheme.accent },
+      { to: '/archived-summaries', label: 'เก็บถาวร', icon: 'archive', accent: activeAccentTheme.accent },
       { to: '/quizzes', label: 'แบบฝึกหัด', icon: 'quizzes', accent: activeAccentTheme.accent },
+      { to: '/goals', label: 'เป้าหมายกิจกรรม', icon: 'goals', accent: activeAccentTheme.accent },
+      { to: '/learning-stats', label: 'สถิติ', icon: 'stats', accent: activeAccentTheme.accent },
+      { to: '/career-advisor', label: 'อาชีพแนะนำ', icon: 'careerAdvisor', accent: activeAccentTheme.accent },
       { to: '/profile', label: 'โปรไฟล์', icon: 'profile', accent: activeAccentTheme.accent },
-      { to: '/career-advisor', label: 'อาชีพแนะนำ', icon: 'careerAdvisor', accent: activeAccentTheme.accent }
       ],
       [activeAccentTheme.accent]
     );
 
+  // The account actions below are intentionally kept separate from the main navigation.
+  // Keep this list defined even while the desktop account section is visually hidden.
+  const secondaryNavItems: NavItem[] = [];
   const latestNotifications = useMemo(() => notifications.slice(0, 3), [notifications]);
-  const thaiDateTimeLabel = useMemo(() => {
-    const thaiWeekdays = ['วันอาทิตย์', 'วันจันทร์', 'วันอังคาร', 'วันพุธ', 'วันพฤหัสบดี', 'วันศุกร์', 'วันเสาร์'];
-    const thaiMonths = [
-      'มกราคม',
-      'กุมภาพันธ์',
-      'มีนาคม',
-      'เมษายน',
-      'พฤษภาคม',
-      'มิถุนายน',
-      'กรกฎาคม',
-      'สิงหาคม',
-      'กันยายน',
-      'ตุลาคม',
-      'พฤศจิกายน',
-      'ธันวาคม',
-    ];
-    const dayName = thaiWeekdays[now.getDay()] ?? '';
-    const day = String(now.getDate()).padStart(2, '0');
-    const monthName = thaiMonths[now.getMonth()] ?? '';
-    const year = now.getFullYear() + 543;
-    const hh = String(now.getHours()).padStart(2, '0');
-    const mm = String(now.getMinutes()).padStart(2, '0');
-    const ss = String(now.getSeconds()).padStart(2, '0');
-    return `${dayName}ที่ ${day} ${monthName} ${year} เวลา ${hh}:${mm}:${ss} น.`;
-  }, [now]);
   const mobileNavItems = navItems.filter(item => item.showOnMobile !== false);
-  const primaryNavItems = navItems.filter(item => item.to !== '/profile' && item.to !== '/career-advisor');
-  const mobileQuickActionRoutes = useMemo(
-    () => new Set(['/quizzes', '/career-advisor']),
-    []
+  const bottomNavItems = mobileNavItems.map(item =>
+    item.to === '/ai-assistant'
+      ? { ...item, label: 'หน้าหลัก', icon: 'overview' as IconName }
+      : item.to === '/overview'
+        ? { ...item, label: 'ตารางเรียน', icon: 'subjects' as IconName }
+        : item
   );
-  const bottomNavItems = [
-    mobileNavItems.find(item => item.to === '/ai-assistant')
-      ? {
-          ...mobileNavItems.find(item => item.to === '/ai-assistant')!,
-          label: 'หน้าหลัก',
-          icon: 'overview' as IconName,
-        }
-      : null,
-    mobileNavItems.find(item => item.to === '/overview')
-      ? {
-          ...mobileNavItems.find(item => item.to === '/overview')!,
-          label: 'ตารางเรียน',
-          icon: 'subjects' as IconName,
-        }
-      : null,
-    mobileNavItems.find(item => item.to === '/quizzes')
-      ? { ...mobileNavItems.find(item => item.to === '/quizzes')!, label: 'แบบฝึกหัด' }
-      : null,
-    mobileNavItems.find(item => item.to === '/profile') ? { ...mobileNavItems.find(item => item.to === '/profile')!, label: 'ฉัน' } : null,
-  ].filter((item): item is NavItem => Boolean(item));
-  const topNavItems = mobileNavItems.filter(
-      item =>
-      item.to !== '/overview' &&
-      item.to !== '/ai-assistant' &&
-      item.to !== '/calendar' &&
-      item.to !== '/profile' &&
-      !mobileQuickActionRoutes.has(item.to)
-  );
+  const mobileBottomNavItems = bottomNavItems.slice(0, 5);
+  const topNavItems = bottomNavItems.slice(5);
   const pageTitle = useMemo(() => {
     if (location.pathname === '/' || location.pathname === '/overview' || location.pathname.startsWith('/overview/')) return 'ตารางเรียน';
     if (location.pathname === '/ai-assistant' || location.pathname.startsWith('/ai-assistant/')) return 'หน้าหลัก';
     if (location.pathname === '/notifications' || location.pathname.startsWith('/notifications/')) return 'การแจ้งเตือน';
-    if (location.pathname === '/study-capture' || location.pathname.startsWith('/study-capture/')) return 'บันทึกการเรียน';
+    if (location.pathname === '/document-summary' || location.pathname.startsWith('/document-summary/')) return 'สรุปจากเนื้อหา';
+    if (location.pathname === '/voice-summary' || location.pathname.startsWith('/voice-summary/')) return 'สรุปจากเสียง';
     if (location.pathname === '/study-digest' || location.pathname.startsWith('/study-digest/')) return 'สรุปการเรียน';
     if (location.pathname === '/study-storage' || location.pathname.startsWith('/study-storage/')) return 'กระเป๋าเก็บไฟล์';
+    if (location.pathname === '/learning-stats' || location.pathname.startsWith('/learning-stats/')) return 'สถิติ';
+    if (location.pathname === '/admin' || location.pathname.startsWith('/admin/')) return 'ผู้ดูแลระบบ';
     const match = navItems.find(item => location.pathname === item.to || location.pathname.startsWith(`${item.to}/`));
     return match?.label ?? 'Home';
   }, [location.pathname, navItems]);
   const isAiPage = location.pathname.startsWith('/ai-assistant');
+  const isLearningStatsPage = location.pathname.startsWith('/learning-stats');
+  useEffect(() => {
+    const activeLink = bottomNavScrollRef.current?.querySelector<HTMLAnchorElement>('a[aria-current="page"]');
+    activeLink?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+  }, [location.pathname]);
   const profileImageCandidates = useMemo(
     () => buildProfileImageCandidates([user?.profile_pic, user?.avatar], assetBaseURL || api.defaults.baseURL),
     [user?.profile_pic, user?.avatar]
@@ -1190,64 +1243,137 @@ export const DashboardLayout = () => {
       current + 1 < profileImageCandidates.length ? current + 1 : profileImageCandidates.length
     );
   };
-  const customAccentHue = useMemo(() => hexToHue(customAccent), [customAccent]);
-  const customAccentHsl = useMemo(() => hexToHsl(customAccent), [customAccent]);
-  const customAccentMarker = useMemo(() => {
-    const angle = ((customAccentHue - 90) * Math.PI) / 180;
-    return {
-      left: `${50 + Math.cos(angle) * 42}%`,
-      top: `${50 + Math.sin(angle) * 42}%`,
-    };
-  }, [customAccentHue]);
-  const customAccentSliderLeft = useMemo(() => `${Math.max(0, Math.min(100, (customAccentHue / 360) * 100))}%`, [customAccentHue]);
-  const customAccentLightnessLeft = useMemo(
-    () => `${Math.max(0, Math.min(100, customAccentHsl.lightness))}%`,
-    [customAccentHsl.lightness]
-  );
-  const updateCustomAccentFromPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const wheel = event.currentTarget;
-    const rect = wheel.getBoundingClientRect();
-    const centerX = rect.left + rect.width / 2;
-    const centerY = rect.top + rect.height / 2;
-    const distance = Math.hypot(event.clientX - centerX, event.clientY - centerY);
-    if (distance < rect.width * 0.2) return;
-    const angle = Math.atan2(event.clientY - centerY, event.clientX - centerX) * (180 / Math.PI);
-    const hue = (angle + 90 + 360) % 360;
-    setCustomAccent(hslToHex(hue));
-    setAccentThemeId('custom');
-  };
-  const updateCustomAccentFromSlider = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const bar = event.currentTarget;
-    const rect = bar.getBoundingClientRect();
-    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
-    setCustomAccent(hslToHex(ratio * 360));
-    setAccentThemeId('custom');
-  };
-  const updateCustomAccentLightness = (lightness: number) => {
-    const nextLightness = Math.max(18, Math.min(86, lightness));
-    setCustomAccent(hslToHex(customAccentHsl.hue, customAccentHsl.saturation || 85, nextLightness));
-    setAccentThemeId('custom');
-  };
   const applyCustomAccent = (value: string) => {
     setCustomAccent(normalizeHexColor(value, customAccent));
     setAccentThemeId('custom');
   };
+  const renderBottomNavigation = (
+    items: NavItem[],
+    responsiveClassName: string,
+    attachScrollRef = false
+  ) => {
+    const itemCount = items.length;
+    const slotPct = 100 / itemCount;
+    const activeIndex = items.findIndex(
+      item => location.pathname === item.to || location.pathname.startsWith(`${item.to}/`)
+    );
+    const activeColor = activeAccentTheme.accent;
+    const activeStrongColor = activeAccentTheme.accentStrong;
+    const navItemColor = '#ffffff';
+    const notchColor = theme === 'dark' ? '#020617' : '#f8fafc';
+
+    return (
+      <nav
+        ref={attachScrollRef ? bottomNavScrollRef : undefined}
+        className={`mobile-bottom-nav pointer-events-auto mx-auto w-full max-w-[1100px] overflow-x-auto ${responsiveClassName}`}
+        style={{ scrollbarWidth: 'none' }}
+      >
+        <div className="mobile-bottom-nav__content relative overflow-visible">
+          <div
+            className="mobile-bottom-nav__pill absolute inset-x-0 bottom-0"
+            style={{
+              background: `linear-gradient(145deg, color-mix(in srgb, ${activeStrongColor} 58%, #06111f), color-mix(in srgb, ${activeColor} 38%, #071426))`,
+              boxShadow: `0 14px 34px rgba(${activeAccentTheme.accentRgb},0.28), inset 0 1px 0 rgba(255,255,255,0.10)`
+            }}
+          />
+
+          {activeIndex >= 0 ? (
+            <div
+              className="pointer-events-none absolute left-0 top-0 h-full transition-transform duration-[450ms] ease-[cubic-bezier(0.34,1.56,0.64,1)]"
+              style={{ width: `${slotPct}%`, transform: `translateX(${activeIndex * 100}%)` }}
+            >
+              <div
+                className="mobile-bottom-nav__notch absolute left-1/2 -translate-x-1/2"
+                style={{ color: notchColor }}
+              >
+                <svg width="100%" height="100%" viewBox="0 0 108 34" fill="currentColor" preserveAspectRatio="none">
+                  <path d="M0 0 C 28 0, 27 34, 54 34 C 81 34, 80 0, 108 0 Z" />
+                </svg>
+              </div>
+            </div>
+          ) : null}
+
+          <div className="relative z-10 flex h-full w-full">
+            {items.map(item => (
+              <NavLink
+                key={item.to}
+                to={item.to}
+                aria-label={item.label}
+                className="relative h-full outline-none"
+                style={{ width: `${slotPct}%` }}
+                onClick={() => {
+                  if (item.to === '/ai-assistant' && typeof window !== 'undefined') {
+                    window.dispatchEvent(new Event('smartroom:home-menu-pressed'));
+                  }
+                }}
+              >
+                {({ isActive }) => (
+                  <span className="relative flex h-full w-full items-end justify-center">
+                    <span
+                      className="absolute left-1/2 flex items-center justify-center rounded-full transition-all duration-[450ms] ease-[cubic-bezier(0.34,1.56,0.64,1)]"
+                      style={{
+                        transform: 'translateX(-50%)',
+                        top: isActive
+                          ? 'calc(var(--mobile-bottom-nav-pill-top) - var(--mobile-bottom-nav-active-lift))'
+                          : 'calc(var(--mobile-bottom-nav-pill-top) + var(--mobile-bottom-nav-inactive-offset))',
+                        height: isActive
+                          ? 'var(--mobile-bottom-nav-active-size)'
+                          : 'var(--mobile-bottom-nav-inactive-size)',
+                        width: isActive
+                          ? 'var(--mobile-bottom-nav-active-size)'
+                          : 'var(--mobile-bottom-nav-inactive-size)',
+                        backgroundColor: isActive ? activeColor : 'transparent',
+                        zIndex: 1,
+                        boxShadow: isActive
+                          ? `0 7px 20px rgba(${activeAccentTheme.accentRgb},0.36)`
+                          : 'none'
+                      }}
+                    >
+                      <MobileIcon
+                        name={item.icon}
+                        active={false}
+                        accent={navItemColor}
+                        className={isActive ? 'h-6 w-6' : 'h-5 w-5'}
+                      />
+                    </span>
+
+                    <span
+                      className={`mobile-bottom-nav__label ${isActive ? 'is-active' : ''} pointer-events-none absolute inset-x-0 truncate px-1 text-center text-[11px] font-bold leading-none transition-colors duration-300`}
+                      style={{ bottom: '10px', color: navItemColor }}
+                    >
+                      {item.label}
+                    </span>
+                  </span>
+                )}
+              </NavLink>
+            ))}
+          </div>
+        </div>
+      </nav>
+    );
+  };
   return (
     <div
-      className={`relative min-h-screen overflow-x-hidden lg:h-screen ${
+      className={`relative min-h-screen overflow-x-hidden ${
         theme === 'dark' ? 'text-slate-100' : 'text-slate-900'
       }`}
-      style={{ background: theme === 'dark' ? 'var(--bg-gradient)' : '#f8fafc' }}
+      style={{ background: theme === 'dark' ? 'var(--bg-gradient)' : isLearningStatsPage ? '#ffffff' : '#f8fafc' }}
     >
-      <div className="relative flex min-h-screen w-full flex-col lg:h-screen lg:flex-row lg:overflow-hidden">
+      <div className="relative flex min-h-screen w-full flex-col md:flex-row">
         <aside
-          className={`hidden w-full max-w-[256px] flex-col gap-6 border-r pb-6 pt-8 lg:sticky lg:top-0 lg:flex lg:h-screen lg:shrink-0 lg:overflow-y-auto ${
+          className={`hidden h-screen w-[184px] shrink-0 flex-col gap-4 overflow-y-auto border-r pb-5 md:flex ${
             theme === 'dark'
               ? 'border-white/10 bg-slate-950/70 text-white'
               : 'border-slate-200 bg-white text-slate-800'
           }`}
         >
-            <div className={`px-6 pb-5 ${theme === 'dark' ? 'border-b border-white/10' : 'border-b border-slate-100'}`}>
+            <div
+              className={`sticky top-0 z-20 px-6 py-5 ${
+                theme === 'dark'
+                  ? 'border-b border-white/10 bg-slate-950/95'
+                  : 'border-b border-slate-100 bg-white/95'
+              } backdrop-blur`}
+            >
               <Link to="/" className="flex items-center gap-3 text-lg font-semibold">
                 <button
                   type="button"
@@ -1278,15 +1404,15 @@ export const DashboardLayout = () => {
                 <span className={theme === 'dark' ? 'text-white' : 'text-slate-900'}>Smart Room</span>
               </Link>
           </div>
-          <nav className="mt-4 space-y-1.5 px-4">
-            {primaryNavItems.map((item, index) => {
+          <nav className="mt-1 space-y-1.5 px-3">
+            {navItems.map((item, index) => {
               const itemAccentRgb = sidebarDarkPalette[index % sidebarDarkPalette.length];
               return (
                 <NavLink
                   key={item.to}
                   to={item.to}
                     className={({ isActive }) =>
-                      `group flex items-center gap-3 rounded-xl px-4 py-3 text-sm font-medium transition ${
+                      `group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition ${
                         theme === 'dark'
                           ? isActive
                             ? 'text-white shadow-soft'
@@ -1316,7 +1442,7 @@ export const DashboardLayout = () => {
                   {({ isActive }) => (
                     <>
                       <span
-                        className={`relative flex h-10 w-10 items-center justify-center rounded-xl transition ${
+                        className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition ${
                           theme === 'dark'
                             ? isActive
                               ? 'bg-slate-900/45 text-white shadow-[0_10px_22px_rgba(0,0,0,0.26)]'
@@ -1347,7 +1473,7 @@ export const DashboardLayout = () => {
                           name={item.to === '/ai-assistant' ? 'overview' : item.icon}
                           active={isActive}
                           accent={theme === 'dark' ? '#ffffff' : activeAccentTheme.accent}
-                          className="h-6 w-6"
+                          className="h-5 w-5"
                         />
                       </span>
 	                      <span
@@ -1370,7 +1496,50 @@ export const DashboardLayout = () => {
               );
             })}
           </nav>
-          <div className={`mt-auto px-4 pt-4 ${theme === 'dark' ? 'border-t border-white/10' : 'border-t border-slate-100'}`}>
+          <div className={`mt-auto hidden px-4 pt-4 ${theme === 'dark' ? 'border-t border-white/10' : 'border-t border-slate-100'}`}>
+            <nav className="mb-4 space-y-2" aria-label="เมนูผู้ใช้">
+              {secondaryNavItems.map(item => (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  className={({ isActive }) =>
+                    `group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold transition ${
+                      theme === 'dark'
+                        ? isActive
+                          ? 'bg-white/20 text-white shadow-[0_10px_24px_rgba(0,0,0,0.24)]'
+                          : 'text-white/90 hover:bg-white/10 hover:text-white'
+                        : isActive
+                          ? 'bg-slate-100 text-slate-950 shadow-sm'
+                          : 'text-slate-600 hover:bg-slate-50 hover:text-slate-950'
+                    }`
+                  }
+                >
+                  {({ isActive }) => (
+                    <>
+                      <span
+                        className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border transition ${
+                          theme === 'dark'
+                            ? isActive
+                              ? 'border-white/80 bg-slate-950/30 text-white'
+                              : 'border-white/15 bg-slate-950/25 text-white/85 group-hover:border-white/30'
+                            : isActive
+                              ? 'border-[color:rgba(var(--accent-rgb),0.18)] bg-white text-[color:var(--accent)]'
+                              : 'border-slate-200 bg-white text-slate-500 group-hover:text-[color:var(--accent)]'
+                        }`}
+                      >
+                        <MobileIcon
+                          name={item.icon}
+                          active={isActive}
+                          accent={theme === 'dark' ? '#ec4899' : activeAccentTheme.accent}
+                          className="h-6 w-6"
+                        />
+                      </span>
+                      <span className="truncate">{item.label}</span>
+                    </>
+                  )}
+                </NavLink>
+              ))}
+            </nav>
             <Link
               to="/profile"
               className={`flex items-center gap-3 rounded-2xl border px-3 py-3 transition ${
@@ -1420,16 +1589,14 @@ export const DashboardLayout = () => {
         </aside>
 
         <div
-          className={`mobile-app-shell relative flex-1 px-0 pb-0 pt-0 ${isAiPage ? 'sm:px-0' : 'sm:px-6'} lg:h-screen lg:px-10 ${
-            isAiPage ? 'lg:overflow-hidden lg:pb-0' : 'lg:overflow-y-auto lg:pb-20'
-          }`}
+          className={`mobile-app-shell relative flex-1 px-0 pb-0 pt-0 ${isAiPage ? 'sm:px-0' : 'sm:px-6'}`}
           style={{
             paddingBottom: 'env(safe-area-inset-bottom, 0px)',
             paddingTop: 'env(safe-area-inset-top, 0px)'
           }}
         >
           <header
-            className={`relative z-30 ml-auto hidden h-20 items-center justify-end overflow-visible px-2 lg:flex ${
+            className={`relative z-30 ml-auto hidden h-20 items-center justify-end overflow-visible px-2 ${
               theme === 'dark'
                 ? 'text-white'
                 : 'text-slate-900'
@@ -1437,15 +1604,6 @@ export const DashboardLayout = () => {
           >
             <div className="relative z-10 flex w-full items-center justify-end">
               <div className="flex flex-wrap items-center justify-end gap-3">
-                <div
-                  className={`inline-flex items-center rounded-full border px-4 py-2 text-sm font-semibold shadow-sm ${
-                    theme === 'dark'
-                      ? 'border-sky-400/35 bg-sky-400/10 text-sky-100'
-                      : 'border-sky-200 bg-[linear-gradient(180deg,#eaf4ff_0%,#dcecff_100%)] text-[#24407a]'
-                  }`}
-                >
-                  <span className="whitespace-nowrap">{thaiDateTimeLabel}</span>
-                </div>
                 <ThemeModeSwitch theme={theme} onChange={nextTheme => setTheme(nextTheme)} />
                   <div className="relative" ref={desktopThemeRef}>
                     <button
@@ -1471,208 +1629,63 @@ export const DashboardLayout = () => {
                     </button>
                     {desktopThemeOpen && (
                       <div
-                        className="fixed inset-0 z-[60] flex items-center justify-center bg-[radial-gradient(circle_at_top_left,rgba(236,72,153,0.18),transparent_30%),radial-gradient(circle_at_top_right,rgba(96,165,250,0.18),transparent_28%),linear-gradient(180deg,rgba(255,255,255,0.58),rgba(255,255,255,0.72))] p-4 backdrop-blur-md"
+                        className="fixed inset-0 z-[60] flex items-start justify-end bg-[linear-gradient(180deg,rgba(255,255,255,0.20),rgba(255,255,255,0.58))] px-6 pt-20 backdrop-blur-sm"
                         onClick={() => setDesktopThemeOpen(false)}
                         role="presentation"
                       >
                         <div
-                          className="relative w-[min(92vw,64rem)] overflow-hidden rounded-[2.5rem] border border-white/80 bg-[linear-gradient(135deg,rgba(255,255,255,0.96),rgba(255,255,255,0.88))] px-5 py-5 shadow-[0_34px_90px_rgba(114,95,255,0.18)] sm:px-7 sm:py-6"
+                          className="relative w-[min(92vw,27rem)] overflow-hidden rounded-[1.35rem] border border-white/80 bg-white/95 px-8 py-7 shadow-[0_22px_58px_rgba(15,23,42,0.14)] backdrop-blur"
                           role="dialog"
                           aria-modal="true"
                           aria-label="เลือกสีธีม"
                           onClick={event => event.stopPropagation()}
                         >
-                          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_20%,rgba(236,72,153,0.08),transparent_24%),radial-gradient(circle_at_80%_20%,rgba(96,165,250,0.08),transparent_24%),radial-gradient(circle_at_15%_80%,rgba(168,85,247,0.08),transparent_22%),radial-gradient(circle_at_85%_82%,rgba(59,130,246,0.08),transparent_22%)]" />
-                          <div className="pointer-events-none absolute inset-x-0 top-0 h-1 bg-[linear-gradient(90deg,#f6a0d7,#c4d8ff,#c6e6ff)] opacity-90" />
-                          <div className="relative flex items-start justify-between gap-4">
-                            <div className="flex items-start gap-3 sm:gap-4">
-                              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-white text-violet-500 shadow-[0_14px_26px_rgba(156,105,255,0.16)] ring-1 ring-violet-100 sm:h-14 sm:w-14">
-                                <Palette size={24} weight="duotone" />
-                              </div>
-                              <div className="pt-0.5">
-                                <p className="text-[1.7rem] font-extrabold leading-none tracking-tight text-slate-800 sm:text-[2.15rem]">
-                                  เลือกสี
-                                </p>
-                                <p className="mt-1.5 max-w-[34rem] text-xs text-slate-500 sm:text-sm">
-                                  คลิกหรือลากบนวงล้อเพื่อเลือกสีที่ต้องการ
-                                </p>
-                              </div>
-                            </div>
+                          <div className="relative">
                             <button
                               type="button"
                               onClick={() => setDesktopThemeOpen(false)}
-                              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-white text-violet-500 shadow-[0_12px_24px_rgba(156,105,255,0.15)] ring-1 ring-violet-100 transition hover:scale-105 hover:text-violet-600 sm:h-12 sm:w-12"
+                              className="absolute -right-1.5 -top-1.5 flex h-9 w-9 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-100 hover:text-slate-800"
                               aria-label="ปิด"
                             >
-                              <X size={24} weight="bold" />
+                              <X size={19} weight="regular" />
                             </button>
-                          </div>
-
-                          <div className="relative mt-6 grid gap-6 lg:grid-cols-[minmax(0,1.05fr)_minmax(17rem,0.82fr)] lg:items-center lg:gap-10">
-                            <div className="relative mx-auto flex w-full max-w-[34rem] items-center justify-center">
-                              <div className="absolute inset-0 rounded-full bg-[radial-gradient(circle,rgba(255,255,255,0.92),rgba(255,255,255,0.14)_68%,transparent_74%)] blur-[8px]" />
-                              <div
-                                className="relative aspect-square w-full max-w-[29rem] touch-none rounded-full border-[6px] border-white bg-[conic-gradient(from_0deg,#ff3b3b,#ff8a00,#ffe600,#b6ff3b,#19d36b,#17c7df,#1f8eff,#6b4bf5,#b13df6,#ff3b3b)] shadow-[0_20px_42px_rgba(89,72,194,0.16)]"
-                                role="slider"
-                                aria-label="เลือกสีธีม"
-                                aria-valuetext={activeAccentTheme.accent.toUpperCase()}
-                                tabIndex={0}
-                                onPointerDown={event => {
-                                  event.currentTarget.setPointerCapture(event.pointerId);
-                                  updateCustomAccentFromPointer(event);
-                                }}
-                                onPointerMove={event => {
-                                  if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-                                    updateCustomAccentFromPointer(event);
-                                  }
-                                }}
-                                style={{
-                                  boxShadow: '0 20px 54px rgba(70, 54, 160, 0.16), inset 0 0 0 1px rgba(255,255,255,0.35)'
-                                }}
-                              >
-                                <span
-                                  className="pointer-events-none absolute h-6 w-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-[4px] border-white shadow-[0_8px_18px_rgba(79,70,229,0.25)]"
-                                  style={{ ...customAccentMarker, background: customAccent }}
-                                />
-                              </div>
+                            <div className="pr-8">
+                              <p className="text-[1.7rem] font-extrabold leading-none text-slate-950">สีทั้งหมด</p>
+                         
                             </div>
-
-                            <div className="flex flex-col justify-center gap-5">
-                              <div>
-                                <p className="text-xl font-bold text-slate-800">สีที่เลือก</p>
-                                <label className="mt-4 block cursor-pointer">
-                                  <input
-                                    type="color"
-                                    value={activeAccentTheme.accent}
-                                    onChange={event => applyCustomAccent(event.target.value)}
-                                    className="sr-only"
-                                    aria-label="เลือกสีแบบละเอียด"
-                                  />
-                                  <div
-                                    className="relative h-40 overflow-hidden rounded-[1.6rem] border border-white/80 shadow-[0_16px_30px_rgba(122,102,220,0.16)]"
-                                    style={{
-                                      background: `linear-gradient(135deg, ${activeAccentTheme.accent} 0%, ${activeAccentTheme.accentStrong} 56%, ${activeAccentTheme.accentSoft} 100%)`
-                                    }}
-                                  >
-                                    <div className="absolute inset-0 bg-[radial-gradient(circle_at_25%_30%,rgba(255,255,255,0.22),transparent_28%),radial-gradient(circle_at_78%_32%,rgba(255,255,255,0.18),transparent_16%),radial-gradient(circle_at_70%_70%,rgba(255,255,255,0.14),transparent_22%)]" />
-                                    <div className="absolute inset-x-4 bottom-4 rounded-[1rem] bg-white/85 px-4 py-2.5 text-center shadow-[0_10px_24px_rgba(148,163,184,0.12)] backdrop-blur-sm">
-                                      <p className="text-xs font-medium text-slate-500">แตะเพื่อเลือกสีตรงนี้ได้</p>
-                                      <p className="font-mono text-sm font-semibold text-slate-700">
-                                        {activeAccentTheme.accent.toUpperCase()}
-                                      </p>
-                                    </div>
-                                  </div>
-                                </label>
-
-                                <div className="mt-3 rounded-[1.1rem] border border-white/80 bg-white/85 px-4 py-2.5 shadow-[0_10px_24px_rgba(148,163,184,0.12)]">
-                                  <div className="mb-2 flex items-center justify-between gap-3">
-                                    <p className="text-xs font-medium text-slate-500">โทนสีอ่อน</p>
-                                    <p className="font-mono text-xs font-semibold text-slate-600">{customAccentHsl.lightness}%</p>
-                                  </div>
-                                  <input
-                                    type="range"
-                                    min={18}
-                                    max={86}
-                                    value={customAccentHsl.lightness}
-                                    onChange={event => updateCustomAccentLightness(Number(event.target.value))}
-                                  className="h-2.5 w-full cursor-pointer appearance-none rounded-full"
-                                    style={{
-                                      background: `linear-gradient(90deg, ${shadeColor(customAccent, -38)}, ${customAccent}, ${shadeColor(customAccent, 28)})`
-                                    }}
-                                    aria-label="ปรับโทนสีอ่อน"
-                                  />
-                                </div>
-                                <div className="mt-3 flex items-center gap-3 rounded-[1.1rem] border border-white/80 bg-white/85 px-3 py-2 shadow-[0_10px_24px_rgba(148,163,184,0.12)]">
-                                  <input
-                                    type="color"
-                                    value={activeAccentTheme.accent}
-                                    onChange={event => applyCustomAccent(event.target.value)}
-                                    className="h-10 w-10 cursor-pointer rounded-full border-0 bg-transparent p-0"
-                                    aria-label="เลือกสีแบบละเอียด"
-                                  />
-                                  <div className="min-w-0 flex-1">
-                                    <p className="text-xs font-medium text-slate-500">เลือกสีได้ทุกเฉด</p>
-                                    <p className="truncate font-mono text-sm font-semibold text-slate-700">
-                                      {activeAccentTheme.accent.toUpperCase()}
-                                    </p>
-                                  </div>
-                                </div>
-                              </div>
-
-                              <div className="flex items-center gap-4">
-                              <div className="h-px flex-1 bg-[linear-gradient(90deg,transparent,rgba(148,163,184,0.25),transparent)]" />
-                                <span className="text-2xl leading-none text-violet-500">✦</span>
-                                <div className="h-px flex-1 bg-[linear-gradient(90deg,transparent,rgba(148,163,184,0.25),transparent)]" />
-                              </div>
-
-                              <div>
-                                <p className="text-xl font-bold text-slate-800">สีแนะนำ</p>
-                                <div className="mt-4 grid grid-cols-5 gap-2.5">
-                                  {themeSwatches.map(color => (
+                            <div className="mt-6 grid grid-cols-4 gap-x-8 gap-y-7">
+                              {themeSwatches.map(color => {
+                                const isSelected = activeAccentTheme.accent.toLowerCase() === color;
+                                return (
                                   <button
-                                      key={color}
-                                      type="button"
-                                      onClick={() => {
-                                        applyCustomAccent(color);
-                                      }}
-                                      className="h-12 rounded-2xl border border-white/70 shadow-[0_10px_20px_rgba(148,163,184,0.16)] transition hover:-translate-y-0.5 hover:scale-[1.02]"
-                                      style={{ background: color }}
-                                      aria-label={`เลือกสี ${color}`}
-                                    />
-                                  ))}
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-
-                          <div className="relative mt-6 rounded-[1.6rem] border border-white/80 bg-white/75 px-4 py-3 shadow-[0_14px_26px_rgba(148,163,184,0.14)] backdrop-blur-sm sm:px-5">
-                            <div className="flex items-center gap-4">
-                              <span className="text-2xl leading-none text-violet-500">☼</span>
-                              <div
-                                className="relative h-3.5 flex-1 cursor-pointer rounded-full bg-[linear-gradient(90deg,#ff4d7d,#ff9f43,#ffe84d,#92f25f,#39d3cb,#3c8cff,#7c5cff,#ff6fd8)]"
-                                role="slider"
-                                aria-label="ปรับสีธีม"
-                                aria-valuetext={activeAccentTheme.accent.toUpperCase()}
-                                tabIndex={0}
-                                onPointerDown={event => {
-                                  event.currentTarget.setPointerCapture(event.pointerId);
-                                  updateCustomAccentFromSlider(event);
-                                }}
-                                onPointerMove={event => {
-                                  if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-                                    updateCustomAccentFromSlider(event);
-                                  }
-                                }}
-                                >
-                                <span
-                                  className="pointer-events-none absolute top-1/2 h-6 w-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-[4px] border-white bg-violet-500 shadow-[0_10px_20px_rgba(124,58,237,0.35)]"
-                                  style={{ left: customAccentSliderLeft }}
-                                />
-                              </div>
-                              <span className="text-2xl leading-none text-violet-500">☼</span>
+                                    key={color}
+                                    type="button"
+                                    onClick={() => applyCustomAccent(color)}
+                                    className={`relative flex h-[52px] w-[52px] items-center justify-center rounded-full transition hover:-translate-y-0.5 hover:scale-105 ${
+                                      isSelected ? 'shadow-[0_14px_28px_rgba(15,23,42,0.22)]' : 'shadow-[0_8px_18px_rgba(148,163,184,0.14)]'
+                                    }`}
+                                    style={{ backgroundColor: color }}
+                                    aria-label={`เลือกสี ${color}`}
+                                  >
+                                    {isSelected ? (
+                                      <>
+                                        <span className="pointer-events-none absolute -inset-3 rounded-full border border-slate-900/25 bg-white/25 shadow-[inset_0_1px_7px_rgba(255,255,255,0.85),0_0_0_5px_rgba(15,23,42,0.08),0_8px_18px_rgba(15,23,42,0.16)] backdrop-blur-[2px]" />
+                                        <span className="pointer-events-none absolute -inset-1.5 rounded-full border-[2.5px] border-slate-950/80" />
+                                        <span className="pointer-events-none absolute inset-1.5 rounded-full border border-slate-950/35" />
+                                        <svg viewBox="0 0 24 24" className="relative z-10 h-7 w-7 text-slate-950" fill="none" aria-hidden="true">
+                                          <path d="m5.5 12.5 4 4 9-9" stroke="currentColor" strokeWidth="2.7" strokeLinecap="round" strokeLinejoin="round" />
+                                        </svg>
+                                      </>
+                                    ) : null}
+                                  </button>
+                                );
+                              })}
                             </div>
                           </div>
                         </div>
                       </div>
                     )}
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setNotifyOpen(false);
-                      setDesktopThemeOpen(false);
-                      setCalendarOpen(true);
-                    }}
-                    className={`relative flex h-11 w-11 items-center justify-center rounded-full border transition ${
-                      theme === 'dark'
-                        ? 'border-white/15 bg-slate-950/40 text-white'
-                        : 'border-slate-200 bg-white text-slate-600 shadow-sm hover:text-slate-900'
-                    }`}
-                    title="ปฏิทิน"
-                    aria-label="ปฏิทิน"
-                  >
-                    <MobileIcon name="calendar" accent={activeAccentTheme.accent} className="h-6 w-6" active={false} />
-                  </button>
                   <div className="relative" ref={dropdownRef}>
                 <button
                   onClick={() => setNotifyOpen(v => !v)}
@@ -1708,7 +1721,7 @@ export const DashboardLayout = () => {
                       }`}
                     >
                     <div className="mb-2 flex items-center justify-between">
-                      <div className="flex items-center gap-2 font-semibold text-[color:var(--text)]">
+                      <div className={`flex items-center gap-2 font-semibold ${theme === 'dark' ? 'text-[color:var(--text)]' : 'text-slate-950'}`}>
                         <MobileIcon name="notifications" accent={activeAccentTheme.accent} className="h-5 w-5" active />
                         แจ้งเตือนเรียน
                       </div>
@@ -1733,7 +1746,7 @@ export const DashboardLayout = () => {
                           </div>
                         </div>
                     {notifications.length === 0 ? (
-                      <p className="rounded-xl surface-2 px-3 py-3 text-muted">ยังไม่มีการแจ้งเตือน</p>
+                      <p className={`rounded-xl surface-2 px-3 py-3 ${theme === 'dark' ? 'text-muted' : 'text-slate-900'}`}>ยังไม่มีการแจ้งเตือน</p>
                     ) : (
                       <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
                         {latestNotifications.map(n => (
@@ -1744,14 +1757,10 @@ export const DashboardLayout = () => {
                             <div className="flex items-start justify-between gap-2">
                               <div>
                                 <p className="text-[13px] font-semibold text-[color:var(--text)]">{n.title}</p>
-                                <p className="text-[11px] text-muted">
-                                  แจ้งเมื่อ {(parseNotificationDate(n.notify_at) ?? new Date()).toLocaleString('th-TH')}
+                                <p className={`text-[11px] ${theme === 'dark' ? 'text-muted' : 'text-slate-800'}`}>
+                                  {n.delivered_at ? 'แจ้งเมื่อ ' : 'กำหนดแจ้ง '}
+                                  {formatNotificationTimestamp(n.delivered_at ?? n.notify_at)}
                                 </p>
-                                {n.delivered_at ? (
-                                  <p className="text-[11px] text-emerald-200">
-                                    ส่งไปที่ Gmail แล้ว: {new Date(n.delivered_at).toLocaleString('th-TH')}
-                                  </p>
-                                ) : null}
                               </div>
                               <div className="flex gap-1">
                                 {!n.is_read && (
@@ -1764,14 +1773,14 @@ export const DashboardLayout = () => {
                                 )}
                                 <button
                                   onClick={() => deleteNotification(n.id)}
-                                  className="rounded-full border border-muted px-2 py-[2px] text-[11px] font-semibold text-muted hover:opacity-90"
+                                  className={`rounded-full border border-muted px-2 py-[2px] text-[11px] font-semibold hover:opacity-90 ${theme === 'dark' ? 'text-muted' : 'text-slate-900'}`}
                                 >
                                   ลบ
                                 </button>
                               </div>
                             </div>
-                            <p className="mt-1 text-[13px] text-muted">{n.message}</p>
-                            <p className="mt-1 text-[10px] uppercase tracking-wider text-muted">ประเภท: {n.type}</p>
+                            <p className={`mt-1 text-[13px] ${theme === 'dark' ? 'text-muted' : 'text-slate-900'}`}>{n.message}</p>
+                            <p className={`mt-1 text-[10px] uppercase tracking-wider ${theme === 'dark' ? 'text-muted' : 'text-slate-800'}`}>ประเภท: {n.type}</p>
                           </div>
                         ))}
                       </div>
@@ -1796,11 +1805,14 @@ export const DashboardLayout = () => {
           </header>
 
           <div
-            className="mobile-topbar mobile-topbar--minimal sticky top-0 z-40 mb-10 px-0 text-white lg:hidden"
+            className="mobile-topbar mobile-topbar--minimal sticky top-0 z-40 mb-6 px-0 text-white md:hidden"
+            style={{ background: 'var(--accent)' }}
           >
               <div className="relative mx-auto max-w-4xl px-5 pb-2 pt-[max(0.75rem,env(safe-area-inset-top))]" ref={mobileMenuRef}>
                 <div className="flex items-center justify-between gap-3">
-                  <div
+                  <Link
+                    to="/profile"
+                    aria-label="เปิดหน้าโปรไฟล์"
                     className="flex min-w-0 items-center gap-2.5 rounded-full py-1.5 pl-1.5 pr-3 shadow-sm"
                     style={{ background: '#ffffff' }}
                   >
@@ -1826,32 +1838,9 @@ export const DashboardLayout = () => {
                       </p>
                       <p className="truncate text-sm font-bold" style={{ color: '#0f172a' }}>Smart Room</p>
                     </div>
-                  </div>
+                  </Link>
 
                   <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setNotifyOpen(false);
-                        setMobileThemeOpen(false);
-                        setMobileMenuOpen(false);
-                        setCalendarOpen(true);
-                      }}
-                      className="relative flex h-10 w-10 items-center justify-center rounded-full border shadow-sm transition hover:opacity-90"
-                      style={{
-                        borderColor: 'rgba(255,255,255,0.72)',
-                        background: '#ffffff',
-                        color: 'var(--accent)'
-                      }}
-                      aria-label="ปฏิทิน"
-                    >
-                      <MobileIcon
-                        name="calendar"
-                        accent={activeAccentTheme.accent}
-                        className="h-[18px] w-[18px]"
-                        active={false}
-                      />
-                    </button>
                     <div className="relative" ref={mobileDropdownRef}>
                       <button
                         type="button"
@@ -1877,7 +1866,13 @@ export const DashboardLayout = () => {
                           active
                         />
                         {unreadCount > 0 && (
-                          <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-rose-500 ring-2" style={{ boxShadow: '0 0 0 2px var(--surface)' }} />
+                          <span
+                            className="absolute -right-1.5 -top-1.5 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold leading-none text-white"
+                            style={{ boxShadow: '0 0 0 2px var(--surface)' }}
+                            aria-label={`มีการแจ้งเตือนที่ยังไม่ได้อ่าน ${unreadCount} ข้อความ`}
+                          >
+                            {unreadCount > 99 ? '99+' : unreadCount}
+                          </span>
                         )}
                       </button>
                       {notifyOpen && typeof document !== 'undefined'
@@ -1897,7 +1892,7 @@ export const DashboardLayout = () => {
                                 aria-label="แจ้งเตือนเรียน"
                               >
                           <div className="mb-2 flex items-center justify-between">
-                            <div className="flex items-center gap-2 font-semibold text-[color:var(--text)]">
+                            <div className={`flex items-center gap-2 font-semibold ${theme === 'dark' ? 'text-[color:var(--text)]' : 'text-slate-950'}`}>
                               <MobileIcon
                                 name="notifications"
                                 accent={activeAccentTheme.accent}
@@ -1921,7 +1916,7 @@ export const DashboardLayout = () => {
                             </div>
                           </div>
                           {notifications.length === 0 ? (
-                            <p className="rounded-xl px-3 py-3 text-[color:var(--muted)]" style={{ background: 'var(--surface-2)' }}>ยังไม่มีการแจ้งเตือน</p>
+                            <p className={`rounded-xl px-3 py-3 ${theme === 'dark' ? 'text-[color:var(--muted)]' : 'text-slate-900'}`} style={{ background: 'var(--surface-2)' }}>ยังไม่มีการแจ้งเตือน</p>
                           ) : (
                             <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
                               {latestNotifications.map(n => (
@@ -1933,8 +1928,9 @@ export const DashboardLayout = () => {
                                   <div className="flex items-start justify-between gap-2">
                                     <div>
                                       <p className="text-[13px] font-semibold text-[color:var(--text)]">{n.title}</p>
-                                      <p className="text-[11px] text-[color:var(--muted)]">
-                                        แจ้งเมื่อ {(parseNotificationDate(n.notify_at) ?? new Date()).toLocaleString('th-TH')}
+                                      <p className={`text-[11px] ${theme === 'dark' ? 'text-[color:var(--muted)]' : 'text-slate-800'}`}>
+                                        {n.delivered_at ? 'แจ้งจริงเมื่อ ' : 'กำหนดแจ้ง '}
+                                        {formatNotificationTimestamp(n.delivered_at ?? n.notify_at)}
                                       </p>
                                     </div>
                                     <div className="flex gap-1">
@@ -1958,7 +1954,7 @@ export const DashboardLayout = () => {
                                       </button>
                                     </div>
                                   </div>
-                                  <p className="mt-1 text-[13px] text-[color:var(--muted)]">{n.message}</p>
+                                  <p className={`mt-1 text-[13px] ${theme === 'dark' ? 'text-[color:var(--muted)]' : 'text-slate-900'}`}>{n.message}</p>
                                 </div>
                               ))}
                             </div>
@@ -2021,7 +2017,7 @@ export const DashboardLayout = () => {
                 {mobileMenuOpen && typeof document !== 'undefined'
                   ? createPortal(
                 <div
-                  className="fixed inset-0 z-[9998] lg:hidden"
+                  className="fixed inset-0 z-[9998]"
                 >
                   <button
                     type="button"
@@ -2031,7 +2027,7 @@ export const DashboardLayout = () => {
                   />
                   <div
                     ref={mobileMenuDialogRef}
-                    className={`absolute left-1/2 top-[max(1rem,env(safe-area-inset-top))] max-h-[calc(100dvh-2rem)] w-[min(400px,calc(100vw-1.5rem))] -translate-x-1/2 overflow-y-auto rounded-[2rem] border p-5 shadow-[0_30px_80px_rgba(2,6,23,0.24)] ${
+                    className={`absolute left-1/2 top-[max(1rem,env(safe-area-inset-top))] max-h-[calc(100dvh-2rem)] w-[min(560px,calc(100vw-2rem))] -translate-x-1/2 overflow-y-auto rounded-[2rem] border p-6 shadow-[0_30px_80px_rgba(2,6,23,0.24)] ${
                       theme === 'dark'
                         ? 'border-white/10 bg-[#0b1220] text-white'
                         : 'border-slate-200 bg-white text-slate-900'
@@ -2040,7 +2036,7 @@ export const DashboardLayout = () => {
                     <div className="mb-5 flex items-start justify-between gap-4">
                       <div>
                         <p className={`text-2xl font-extrabold tracking-tight ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>เมนูเพิ่มเติม</p>
-                        <p className={`mt-1 text-sm ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>ตั้งค่าธีมและเมนูเสริม</p>
+                       
                       </div>
                       <button
                         type="button"
@@ -2070,128 +2066,69 @@ export const DashboardLayout = () => {
                       <div className="flex items-center justify-between gap-3">
                         <div>
                           <p className={`text-base font-semibold ${theme === 'dark' ? 'text-white' : 'text-slate-800'}`}>โหมดการแสดงผล</p>
-                          <p className={`mt-1 text-xs ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>สลับโหมดสว่างและโหมดมืด</p>
+                       
                         </div>
                         <ThemeModeSwitch theme={theme} onChange={nextTheme => setTheme(nextTheme)} size="sm" />
                       </div>
                     </div>
 
                     <div
-                      className={`rounded-[1.6rem] border p-5 ${
-                        theme === 'dark'
-                          ? 'border-white/10 bg-white/[0.04]'
-                          : 'border-slate-200 bg-slate-50'
-                      }`}
+                      className="rounded-[1.35rem] border border-white/80 bg-white/95 px-5 py-6 text-slate-950 shadow-[0_16px_40px_rgba(15,23,42,0.13)]"
                       ref={mobileThemeRef}
                     >
-                      <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-start justify-between gap-4">
                         <div>
-                          <p className={`text-base font-semibold ${theme === 'dark' ? 'text-white' : 'text-slate-800'}`}>เลือกสีธีม</p>
-                          <p className={`mt-1 text-xs ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>แตะหรือลากบนวงล้อเพื่อเลือกสี</p>
+                          <p className="text-[1.45rem] font-extrabold leading-none text-slate-950">สีทั้งหมด</p>
+            
                         </div>
-                        <span
-                          className="h-5 w-5 shrink-0 rounded-full border border-white/50 shadow-sm"
-                          style={{ background: activeAccentTheme.accent }}
-                        />
+                        <button
+                          type="button"
+                          onClick={() => setMobileMenuOpen(false)}
+                          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-100 hover:text-slate-800"
+                          aria-label="ปิด"
+                        >
+                          <X size={18} weight="regular" />
+                        </button>
                       </div>
 
-                      <div className="mt-5 flex flex-col items-center">
-                        <div
-                          role="slider"
-                          aria-label="เลือกสีธีม"
-                          aria-valuetext={activeAccentTheme.accent.toUpperCase()}
-                          tabIndex={0}
-                          onPointerDown={event => {
-                            event.currentTarget.setPointerCapture(event.pointerId);
-                            updateCustomAccentFromPointer(event);
-                          }}
-                          onPointerMove={event => {
-                            if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-                              updateCustomAccentFromPointer(event);
-                            }
-                          }}
-                          className="relative h-52 w-52 touch-none rounded-full border-4 shadow-sm sm:h-56 sm:w-56"
-                          style={{
-                            borderColor: theme === 'dark' ? 'rgba(255,255,255,0.16)' : '#ffffff',
-                            background: 'conic-gradient(from 0deg,#ff2a16,#ff9700,#ffe600,#9cff19,#20c936,#12c5c8,#258ff3,#5930d8,#9729dc,#d12183,#ff2a16)',
-                          }}
-                          >
-                          <span
-                            className="pointer-events-none absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-sm"
-                            style={{ ...customAccentMarker, background: customAccent }}
-                          />
-                        </div>
-
-                        <label className="mt-5 block w-full cursor-pointer">
-                          <input
-                            type="color"
-                            value={activeAccentTheme.accent}
-                            onChange={event => applyCustomAccent(event.target.value)}
-                            className="sr-only"
-                            aria-label="เลือกสีแบบละเอียด"
-                          />
-                          <div
-                            className="relative h-28 overflow-hidden rounded-[1.5rem] border border-white/80 shadow-[0_12px_24px_rgba(148,163,184,0.12)]"
-                            style={{
-                              background: `linear-gradient(135deg, ${activeAccentTheme.accent} 0%, ${activeAccentTheme.accentStrong} 56%, ${activeAccentTheme.accentSoft} 100%)`
-                            }}
-                          >
-                            <div className="absolute inset-0 bg-[radial-gradient(circle_at_25%_30%,rgba(255,255,255,0.22),transparent_28%)]" />
-                            <div className="absolute inset-x-4 bottom-3 rounded-[1rem] bg-white/85 px-3 py-2 text-center shadow-[0_10px_18px_rgba(148,163,184,0.12)] backdrop-blur-sm">
-                              <p className="text-[10px] font-medium text-slate-500">แตะเพื่อเลือกสีตรงนี้ได้</p>
-                              <p className="font-mono text-xs font-semibold text-slate-700">
-                                {activeAccentTheme.accent.toUpperCase()}
-                              </p>
-                            </div>
-                          </div>
-                        </label>
-
-                        <div className="mt-4 w-full rounded-[1.2rem] border border-white/80 bg-white/85 px-4 py-3 shadow-[0_10px_24px_rgba(148,163,184,0.12)]">
-                          <div className="mb-2 flex items-center justify-between gap-3">
-                            <p className="text-xs font-medium text-slate-500">โทนสีอ่อน</p>
-                            <p className="font-mono text-xs font-semibold text-slate-600">{customAccentHsl.lightness}%</p>
-                          </div>
-                          <input
-                            type="range"
-                            min={18}
-                            max={86}
-                            value={customAccentHsl.lightness}
-                            onChange={event => updateCustomAccentLightness(Number(event.target.value))}
-                            className="h-3 w-full cursor-pointer appearance-none rounded-full"
-                            style={{
-                              background: `linear-gradient(90deg, ${shadeColor(customAccent, -38)}, ${customAccent}, ${shadeColor(customAccent, 28)})`
-                            }}
-                            aria-label="ปรับโทนสีอ่อน"
-                          />
-                        </div>
-
-                        <div className="mt-4 flex w-full items-center gap-3 rounded-[1.2rem] border border-white/80 bg-white/85 px-3 py-2 shadow-[0_10px_24px_rgba(148,163,184,0.12)]">
-                          <input
-                            type="color"
-                            value={activeAccentTheme.accent}
-                            onChange={event => applyCustomAccent(event.target.value)}
-                            className="h-10 w-10 cursor-pointer rounded-full border-0 bg-transparent p-0"
-                            aria-label="เลือกสีแบบละเอียด"
-                          />
-                          <div className="min-w-0 flex-1">
-                            <p className="text-xs font-medium text-slate-500">เลือกสีได้ทุกเฉด</p>
-                            <p className="truncate font-mono text-sm font-semibold text-slate-700">
-                              {activeAccentTheme.accent.toUpperCase()}
-                            </p>
-                          </div>
-                        </div>
-
+                      <div className="mt-5 grid grid-cols-4 gap-x-5 gap-y-6">
+                        {themeSwatches.map(color => {
+                          const isSelected = activeAccentTheme.accent.toLowerCase() === color;
+                          return (
+                            <button
+                              key={`mobile-theme-${color}`}
+                              type="button"
+                              onClick={() => applyCustomAccent(color)}
+                              className={`relative flex h-[52px] w-[52px] items-center justify-center rounded-full transition active:scale-95 ${
+                                isSelected ? 'shadow-[0_14px_26px_rgba(15,23,42,0.2)]' : 'shadow-[0_8px_18px_rgba(148,163,184,0.14)]'
+                              }`}
+                              style={{ backgroundColor: color }}
+                              aria-label={`เลือกสี ${color}`}
+                            >
+                              {isSelected ? (
+                                <>
+                                  <span className="pointer-events-none absolute -inset-3 rounded-full border border-slate-900/25 bg-white/25 shadow-[inset_0_1px_7px_rgba(255,255,255,0.85),0_0_0_5px_rgba(15,23,42,0.08),0_8px_18px_rgba(15,23,42,0.16)] backdrop-blur-[2px]" />
+                                  <span className="pointer-events-none absolute -inset-1.5 rounded-full border-[2.5px] border-slate-950/80" />
+                                  <span className="pointer-events-none absolute inset-1.5 rounded-full border border-slate-950/35" />
+                                  <svg viewBox="0 0 24 24" className="relative z-10 h-7 w-7 text-slate-950" fill="none" aria-hidden="true">
+                                    <path d="m5.5 12.5 4 4 9-9" stroke="currentColor" strokeWidth="2.7" strokeLinecap="round" strokeLinejoin="round" />
+                                  </svg>
+                                </>
+                              ) : null}
+                            </button>
+                          );
+                        })}
                       </div>
                     </div>
 
-                    <nav className="space-y-3">
+                    <nav className="space-y-3" aria-label="เมนูฟังก์ชันเพิ่มเติม">
                       {topNavItems.map(item => (
                         <NavLink
                           key={item.to}
                           to={item.to}
                           onClick={() => setMobileMenuOpen(false)}
                           className={({ isActive }) =>
-                            `flex items-center gap-3 rounded-[1.25rem] px-4 py-3.5 text-sm font-semibold transition ${
+                            `flex items-center gap-3 rounded-[1.25rem] border px-4 py-3.5 text-sm font-semibold transition ${
                               isActive
                                 ? 'border border-[color:rgba(var(--accent-rgb),0.18)] bg-[color:rgba(var(--accent-rgb),0.10)] text-[color:var(--accent)]'
                                 : theme === 'dark'
@@ -2238,7 +2175,7 @@ export const DashboardLayout = () => {
                   : null}
               </div>
               <div
-                className="mobile-topbar-wave pointer-events-none absolute inset-x-0 top-[calc(100%-2px)] text-[color:var(--accent)]"
+                className="mobile-topbar-wave pointer-events-none absolute inset-x-0 top-[calc(100%-2px)] h-10 text-[color:var(--accent)]"
                 aria-hidden="true"
               >
                 <svg viewBox="0 0 500 58" preserveAspectRatio="none" className="block h-full w-full">
@@ -2250,17 +2187,9 @@ export const DashboardLayout = () => {
               </div>
             </div>
 
-          <main className={`relative z-10 ${isAiPage ? 'mt-0 sm:mt-2 lg:h-[calc(100vh-5rem)] lg:overflow-hidden' : 'mt-0 sm:mt-6 lg:mt-0'}`}>
-            <div className={`mx-auto w-full max-w-7xl px-0 pb-[calc(76px+env(safe-area-inset-bottom,0px))] ${isAiPage ? 'sm:px-0' : 'sm:px-6'} lg:px-8 ${
-              isAiPage ? 'lg:h-full lg:pb-0' : 'lg:pb-10'
-            }`}>
-              <div className={`lg:rounded-[32px] lg:border lg:p-8 ${
-                isAiPage ? 'lg:h-full lg:overflow-hidden' : 'lg:min-h-[calc(100vh-7rem)]'
-              } ${
-                theme === 'dark'
-                  ? 'lg:border-white/10 lg:bg-slate-900/75'
-                  : 'lg:border-slate-200/70 lg:bg-white/80 lg:shadow-sm'
-              }`}>
+          <main className={`relative z-10 ${isAiPage ? 'mt-0 sm:mt-2' : 'mt-0 sm:mt-6'}`}>
+            <div className={`mx-auto w-full max-w-7xl px-0 ${isAiPage ? 'pb-[calc(122px+env(safe-area-inset-bottom,0px))] sm:px-0' : 'pb-[calc(122px+env(safe-area-inset-bottom,0px))] sm:px-6'}`}>
+              <div>
                 <Outlet />
               </div>
             </div>
@@ -2269,156 +2198,11 @@ export const DashboardLayout = () => {
       </div>
 
       <div
-        className="pointer-events-none fixed inset-x-0 bottom-0 z-50 px-4 lg:hidden"
+        className="pointer-events-none fixed inset-x-0 bottom-0 z-50 px-4"
         style={{ paddingBottom: `calc(env(safe-area-inset-bottom, 0px) + 14px)` }}
       >
-          {(() => {
-            const itemCount = bottomNavItems.length;
-            const slotPct = 100 / itemCount;
-            const activeIndex = Math.max(
-              bottomNavItems.findIndex(
-                item => location.pathname === item.to || location.pathname.startsWith(`${item.to}/`)
-              ),
-              0
-            );
-            const activeColor = activeAccentTheme.accent;
-            const activeStrongColor = activeAccentTheme.accentStrong;
-            const navItemColor = '#ffffff';
-            const notchColor = theme === 'dark' ? '#020617' : '#f8fafc';
-            const pillHeight = 68;
-            const wrapperHeight = 108;
-            const pillTop = wrapperHeight - pillHeight; // 36px headroom for the raised icon
-            const activeIconSize = 54;
-            const inactiveIconSize = 26;
-            const activeIconTop = pillTop - 30;
-            const inactiveIconTop = pillTop + 7;
-
-            return (
-              <nav className="mobile-bottom-nav pointer-events-auto mx-auto w-full max-w-[460px]">
-                <div className="relative overflow-visible" style={{ height: `${wrapperHeight}px` }}>
-                  {/* floating pill body */}
-                  <div
-                    className="absolute inset-x-0 bottom-0"
-                    style={{
-                      height: `${pillHeight}px`,
-                      borderRadius: '30px',
-                      background: `linear-gradient(145deg, color-mix(in srgb, ${activeStrongColor} 58%, #06111f), color-mix(in srgb, ${activeColor} 38%, #071426))`,
-                      boxShadow: `0 14px 34px rgba(${activeAccentTheme.accentRgb},0.28), inset 0 1px 0 rgba(255,255,255,0.10)`
-                    }}
-                  />
-
-                  {/* sliding notch carved out of the pill top */}
-                  <div
-                    className="pointer-events-none absolute left-0 top-0 h-full transition-transform duration-[450ms] ease-[cubic-bezier(0.34,1.56,0.64,1)]"
-                    style={{ width: `${slotPct}%`, transform: `translateX(${activeIndex * 100}%)` }}
-                  >
-                    <div
-                      className="absolute left-1/2 h-[34px] w-[108px] -translate-x-1/2"
-                      style={{ top: `${pillTop}px`, color: notchColor }}
-                    >
-                      <svg width="100%" height="100%" viewBox="0 0 108 34" fill="currentColor" preserveAspectRatio="none">
-                        <path d="M0 0 C 28 0, 27 34, 54 34 C 81 34, 80 0, 108 0 Z" />
-                      </svg>
-                    </div>
-                  </div>
-
-                  {/* nav items */}
-                  <div className="relative z-10 flex h-full w-full">
-                    {bottomNavItems.map(item => (
-                      <NavLink
-                        key={item.to}
-                        to={item.to}
-                        aria-label={item.label}
-                        className="relative h-full outline-none"
-                        style={{ width: `${slotPct}%` }}
-                        onClick={() => {
-                          if (item.to === '/ai-assistant' && typeof window !== 'undefined') {
-                            window.dispatchEvent(new Event('smartroom:home-menu-pressed'));
-                          }
-                        }}
-                      >
-                        {({ isActive }) => (
-                          <span className="relative flex h-full w-full items-end justify-center">
-                            <span
-                              className="absolute left-1/2 flex items-center justify-center rounded-full transition-all duration-[450ms] ease-[cubic-bezier(0.34,1.56,0.64,1)]"
-                              style={{
-                                transform: 'translateX(-50%)',
-                                top: isActive ? `${activeIconTop}px` : `${inactiveIconTop}px`,
-                                height: isActive ? `${activeIconSize}px` : `${inactiveIconSize}px`,
-                                width: isActive ? `${activeIconSize}px` : `${inactiveIconSize}px`,
-                                backgroundColor: isActive ? activeColor : 'transparent',
-                                zIndex: 1,
-                                boxShadow: isActive
-                                  ? `0 7px 20px rgba(${activeAccentTheme.accentRgb},0.36)`
-                                  : 'none'
-                              }}
-                            >
-                              <MobileIcon
-                                name={item.icon}
-                                active={false}
-                                accent={navItemColor}
-                                className={isActive ? 'h-6 w-6' : 'h-6 w-6'}
-                              />
-                            </span>
-
-                            <span
-                              className="mobile-bottom-nav__label pointer-events-none absolute inset-x-0 truncate px-1 text-center text-[11px] font-bold leading-none transition-colors duration-300"
-                              style={{
-                                bottom: '10px',
-                                color: navItemColor
-                              }}
-                            >
-                              {item.label}
-                            </span>
-                          </span>
-                        )}
-                      </NavLink>
-                    ))}
-                  </div>
-                </div>
-              </nav>
-            );
-          })()}
-        </div>
-
-      {calendarOpen && (
-        <div
-          className="fixed inset-0 z-[90] flex items-stretch justify-center bg-slate-950/55 backdrop-blur-sm sm:items-center sm:p-4"
-          onClick={() => setCalendarOpen(false)}
-          role="dialog"
-          aria-modal="true"
-        >
-          <div
-            className="relative flex h-[100dvh] w-full max-w-6xl flex-col overflow-hidden border shadow-[0_30px_80px_rgba(2,6,23,0.5)] sm:h-auto sm:max-h-[92dvh] sm:rounded-3xl"
-            style={{ background: 'var(--surface)', borderColor: 'var(--border)' }}
-            onClick={event => event.stopPropagation()}
-          >
-            <div
-              className="flex shrink-0 items-center justify-between border-b px-5 pb-3.5 pt-[max(0.875rem,env(safe-area-inset-top))] sm:py-3.5"
-              style={{ borderColor: 'var(--border)' }}
-            >
-              <div className="flex items-center gap-2.5">
-                <MobileIcon name="calendar" accent={activeAccentTheme.accent} className="h-5 w-5" active={false} />
-                <span className="text-base font-bold text-[color:var(--text)]">ปฏิทิน</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setCalendarOpen(false)}
-                className="flex h-9 w-9 items-center justify-center rounded-full border text-[color:var(--muted)] transition hover:opacity-80"
-                style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
-                aria-label="ปิด"
-              >
-                <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  <path d="M18 6 6 18" /><path d="m6 6 12 12" />
-                </svg>
-              </button>
-            </div>
-            <div className="min-h-0 flex-1 overflow-y-auto">
-              <CalendarPage embedded />
-            </div>
-          </div>
-        </div>
-      )}
+        {renderBottomNavigation(mobileBottomNavItems, 'mobile-bottom-nav--compact md:hidden')}
+      </div>
 
       {logoPreviewOpen && (
         <div
@@ -2453,7 +2237,7 @@ export const DashboardLayout = () => {
               <div className="flex items-start justify-between gap-2">
                 <div>
                   <p className="text-sm font-semibold text-[color:var(--text)]">{toast.title}</p>
-                  <p className="mt-1 text-xs text-muted">{toast.message}</p>
+                  <p className="mt-1 whitespace-pre-line text-xs text-muted">{toast.message}</p>
                 </div>
                 <button
                   type="button"

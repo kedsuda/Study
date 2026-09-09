@@ -2,6 +2,7 @@ const USER_STORAGE_KEY = 'user';
 
 type StoredUser = {
   id?: number;
+  role?: string | null;
 };
 
 const readStoredUserId = (): number | null => {
@@ -17,6 +18,18 @@ const readStoredUserId = (): number | null => {
 };
 
 export const getStoredUserId = (): number | null => readStoredUserId();
+
+export const getStoredUserRole = (): string | null => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(USER_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as StoredUser;
+    return typeof parsed?.role === 'string' ? parsed.role.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+};
 
 const buildUserScopedKey = (baseKey: string, userId?: number | null) => {
   const resolvedId = userId ?? readStoredUserId();

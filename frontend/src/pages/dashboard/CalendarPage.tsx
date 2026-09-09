@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 import { format, parseISO } from 'date-fns';
 import { th } from 'date-fns/locale';
 import { api, apiFallbackClients } from '../../services/api';
-import { useSemesterOptions } from '../../hooks/useSemesterOptions';
+import { useDefaultSemesterSelection, useSemesterOptions } from '../../hooks/useSemesterOptions';
 import { filterBySemester, toNumberOrNull } from '../../utils/semester';
 import { subscribeSubjectsUpdated } from '../../utils/subjectSync';
 
@@ -41,17 +41,25 @@ type NormalizedEventType = Exclude<CalendarEvent['type'], null | undefined>;
 
 const eventTypeConfig: Record<EventTypeKey, { label: string; className: string }> = {
   class: { label: 'เรียน', className: 'border border-emerald-500/30 bg-emerald-500/10 text-emerald-600' },
-  exam: { label: 'สอบ', className: 'border border-primary/30 bg-primary/10 text-primary' },
+  exam: { label: 'สอบ', className: 'border border-rose-500/30 bg-rose-500/10 text-rose-600' },
   other: { label: 'กิจกรรม', className: 'border border-muted surface-2 text-muted' },
   log: { label: 'บันทึกการเรียน', className: 'border border-sky-500/30 bg-sky-500/15 text-sky-200' }
 };
 
 const calendarChipClassByType = {
   class: 'bg-emerald-500 text-white',
-  exam: 'bg-primary',
+  exam: 'bg-rose-500 text-white',
   other: 'bg-amber-400 text-white',
   log: 'bg-sky-500 text-white',
 };
+
+const timeOptions = Array.from({ length: 48 }, (_, index) => {
+  const hour = Math.floor(index / 2);
+  const minute = index % 2 === 0 ? 0 : 30;
+  const value = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
+  const label = `${String(hour).padStart(2, '0')}.${String(minute).padStart(2, '0')}`;
+  return { value, label };
+});
 
 const Icon = ({
   children,
@@ -112,21 +120,6 @@ const ClockIcon = ({ size = 24, className }: { size?: number; className?: string
   </Icon>
 );
 
-const buildTimeOptions = (stepMinutes = 5) => {
-  const options: string[] = [];
-  for (let hour = 0; hour < 24; hour += 1) {
-    for (let minute = 0; minute < 60; minute += stepMinutes) {
-      options.push(`${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`);
-    }
-  }
-  return options;
-};
-const timeOptions = buildTimeOptions(5);
-const formatTimeOptionLabel = (value: string) => {
-  const [hour = '00', minute = '00'] = value.split(':');
-  return `${hour}.${minute}`;
-};
-
 const unwrapCollection = (payload: any) => {
   if (Array.isArray(payload)) return payload;
   if (Array.isArray(payload?.data)) return payload.data;
@@ -148,6 +141,32 @@ const fetchCollectionWithFallback = async (path: string) => {
     }
   }
   return { ok: false, data: [], error: lastError };
+};
+
+// Calendar is served through both the Laravel API and the compatibility API
+// in existing installs.  Some web servers do not forward PATCH requests to
+// the compatibility endpoint, so a time edit used to fail without trying the
+// other available route.  Keep the same fallback behaviour used for reads.
+const updateCalendarEventWithFallback = async (eventId: number, payload: Record<string, unknown>) => {
+  let lastError: any = null;
+
+  for (const client of apiFallbackClients) {
+    try {
+      return await client.patch(`/calendar-events/${eventId}`, payload);
+    } catch (err: any) {
+      lastError = err;
+      if (!isFallbackStatus(err?.response?.status)) throw err;
+    }
+
+    try {
+      return await client.put(`/calendar-events/${eventId}`, payload);
+    } catch (err: any) {
+      lastError = err;
+      if (!isFallbackStatus(err?.response?.status)) throw err;
+    }
+  }
+
+  throw lastError ?? new Error('บันทึกการแก้ไขตารางไม่สำเร็จ');
 };
 
 const normalizeDateValue = (value: string) => {
@@ -192,17 +211,31 @@ const buildDateTime = (date: string, time: string) => {
   const normalizedTime = normalizeTimeValue(time) ?? '00:00:00';
   return `${normalizedDate} ${normalizedTime}`;
 };
-const addHoursToTime = (time: string, hours: number) => {
-  const normalized = normalizeTimeValue(time);
-  if (!normalized || !Number.isFinite(hours) || hours <= 0) return normalized ?? time;
-  const [h, m, s] = normalized.split(':').map(part => Number(part));
-  const startSeconds = (h * 3600) + (m * 60) + s;
-  const endSeconds = startSeconds + Math.round(hours * 3600);
-  const daySeconds = ((endSeconds % 86400) + 86400) % 86400;
-  const endHour = Math.floor(daySeconds / 3600);
-  const endMinute = Math.floor((daySeconds % 3600) / 60);
-  const endSecond = daySeconds % 60;
-  return `${String(endHour).padStart(2, '0')}:${String(endMinute).padStart(2, '0')}:${String(endSecond).padStart(2, '0')}`;
+
+// Timetable values are wall-clock times, not instants.  Some API routes
+// serialize the same MySQL DATETIME with a UTC offset, which makes parseISO
+// add seven hours in Thailand (10:00 becomes 17:00).  Read the date/time
+// fields directly so every route displays the time the user entered.
+const parseCalendarDateTime = (value: string) => {
+  const match = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (match) {
+    const [, year, month, day, hour, minute, second = '00'] = match;
+    return new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second));
+  }
+
+  return parseISO(value);
+};
+const getDurationHours = (startTime: string, endTime: string) => {
+  const start = normalizeTimeValue(startTime);
+  const end = normalizeTimeValue(endTime);
+  if (!start || !end) return null;
+
+  const toMinutes = (time: string) => {
+    const [hour, minute] = time.split(':').map(Number);
+    return (hour * 60) + minute;
+  };
+  const durationMinutes = toMinutes(end) - toMinutes(start);
+  return durationMinutes > 0 ? durationMinutes / 60 : null;
 };
 const buildSubjectDateTime = (date?: string | null, time?: string | null) => {
   if (!date) return null;
@@ -299,23 +332,21 @@ const resolveEventType = (event: CalendarEvent) =>
   ?? null;
 const mergeSubjectSchedule = (events: CalendarEvent[], subjects: SubjectOption[]) => {
   if (!subjects.length) return events;
-  const subjectBackedEvents = events.filter(event => {
+  // The subject timetable is the source of truth for a class. Older/manual
+  // calendar records for the same subject can otherwise render a second chip.
+  const scheduledSubjectIds = new Set(
+    subjects.filter(subject => subject.start_date).map(subject => subject.id)
+  );
+  const eventsWithoutDuplicateClasses = events.filter(event => {
     const subjectId = event.subject?.id ?? event.subject_id;
-    return event.source === 'subject' && Boolean(subjectId);
+    if (!subjectId || !scheduledSubjectIds.has(subjectId)) return true;
+    if (event.source === 'study_log' || event.study_log_id) return true;
+    return resolveEventType(event) !== 'class';
   });
-  const subjectBackedBySubjectId = new Map<number, CalendarEvent>();
-  subjectBackedEvents.forEach(event => {
-    const subjectId = event.subject?.id ?? event.subject_id;
-    if (!subjectId || subjectBackedBySubjectId.has(subjectId)) return;
-    subjectBackedBySubjectId.set(subjectId, event);
-  });
-  const nonSubjectBackedEvents = events.filter(event => !subjectBackedEvents.includes(event));
 
   const derived = subjects
     .filter(subject => subject.start_date)
     .map(subject => {
-      const existingSubjectEvent = subjectBackedBySubjectId.get(subject.id);
-      const resolvedType = existingSubjectEvent ? (resolveEventType(existingSubjectEvent) ?? 'class') : 'class';
       const startTime = buildSubjectDateTime(subject.start_date, subject.start_time);
       if (!startTime) return null;
       const endTime = subject.end_time ? buildSubjectDateTime(subject.start_date, subject.end_time) : null;
@@ -327,16 +358,106 @@ const mergeSubjectSchedule = (events: CalendarEvent[], subjects: SubjectOption[]
         start_time: startTime,
         end_time: isAllDay ? null : endTime,
         status: 'planned',
-        type: resolvedType,
-        event_type: resolvedType,
+        type: 'class',
+        event_type: 'class',
         all_day: isAllDay,
         source: 'subject',
         subject: { id: subject.id, name: subject.name },
-        metadata: { source: 'subject', type: resolvedType, all_day: isAllDay }
+        metadata: { source: 'subject', type: 'class', all_day: isAllDay }
       } as CalendarEvent;
     })
     .filter((event): event is CalendarEvent => Boolean(event));
-  return [...nonSubjectBackedEvents, ...derived];
+  return [...eventsWithoutDuplicateClasses, ...derived];
+};
+
+const getStartOfWeek = (date: Date) => {
+  const start = new Date(date);
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - start.getDay());
+  return start;
+};
+
+const expandRecurringSubjectSchedules = (
+  events: CalendarEvent[],
+  subjects: SubjectOption[],
+  rangeStart: Date,
+  rangeEnd: Date,
+) => {
+  if (!subjects.length) return events;
+
+  const scheduledSubjectIds = new Set(
+    subjects.filter(subject => subject.start_date).map(subject => subject.id)
+  );
+  const nonRecurringEvents = events.filter(event => {
+    const subjectId = event.subject?.id ?? event.subject_id;
+    if (!subjectId || !scheduledSubjectIds.has(subjectId)) return true;
+    if (event.source === 'study_log' || event.study_log_id) return true;
+    return resolveEventType(event) !== 'class';
+  });
+
+  // A one-off event (especially an exam) is the explicit activity chosen for
+  // that subject on that date.  Do not also render the generated weekly class
+  // occurrence underneath it.
+  const overriddenClassDates = new Set(
+    nonRecurringEvents
+      .filter(event => {
+        const subjectId = event.subject?.id ?? event.subject_id;
+        const type = resolveEventType(event);
+        return Boolean(subjectId && (type === 'class' || type === 'exam'));
+      })
+      .map(event => {
+        const subjectId = event.subject?.id ?? event.subject_id;
+        return `${subjectId}:${format(parseCalendarDateTime(event.start_time), 'yyyy-MM-dd')}`;
+      })
+  );
+
+  const start = new Date(rangeStart);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(rangeEnd);
+  end.setHours(23, 59, 59, 999);
+
+  const recurringEvents = subjects.flatMap(subject => {
+    if (!subject.start_date) return [];
+    const baseDatePart = subject.start_date.split(/[T ]/)[0];
+    const firstClassDate = parseISO(baseDatePart);
+    if (Number.isNaN(firstClassDate.getTime())) return [];
+
+    firstClassDate.setHours(0, 0, 0, 0);
+    const occurrence = new Date(firstClassDate);
+    while (occurrence < start) occurrence.setDate(occurrence.getDate() + 7);
+
+    const result: CalendarEvent[] = [];
+    while (occurrence <= end) {
+      const date = format(occurrence, 'yyyy-MM-dd');
+      if (overriddenClassDates.has(`${subject.id}:${date}`)) {
+        occurrence.setDate(occurrence.getDate() + 7);
+        continue;
+      }
+      const startTime = buildSubjectDateTime(date, subject.start_time);
+      if (startTime) {
+        const allDay = !subject.start_time;
+        result.push({
+          id: -(subject.id * 100000000 + Number(date.replaceAll('-', ''))),
+          title: subject.name,
+          description: null,
+          subject_id: subject.id,
+          start_time: startTime,
+          end_time: allDay ? null : buildSubjectDateTime(date, subject.end_time),
+          status: 'planned',
+          type: 'class',
+          event_type: 'class',
+          all_day: allDay,
+          source: 'subject',
+          subject: { id: subject.id, name: subject.name },
+          metadata: { source: 'subject', type: 'class', all_day: allDay },
+        });
+      }
+      occurrence.setDate(occurrence.getDate() + 7);
+    }
+    return result;
+  });
+
+  return [...nonRecurringEvents, ...recurringEvents];
 };
 
 const filterEventsBySubjects = (events: CalendarEvent[], subjects: SubjectOption[]) => {
@@ -374,6 +495,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
   const [selectedSemesterKey, setSelectedSemesterKey] = useState('all');
   const [selectedDate, setSelectedDate] = useState<string>(() => format(new Date(), 'yyyy-MM-dd'));
   const [currentMonthDate, setCurrentMonthDate] = useState<Date>(() => new Date());
+  const [calendarView, setCalendarView] = useState<'day' | 'week' | 'month'>('week');
   const [isAddingEvent, setIsAddingEvent] = useState(false);
   const [subjectSearch] = useState('');
   const [form, setForm] = useState({
@@ -399,6 +521,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [editingEventId, setEditingEventId] = useState<number | null>(null);
   const semesterOptions = useSemesterOptions();
+  useDefaultSemesterSelection(semesterOptions, selectedSemesterKey, setSelectedSemesterKey);
 
   const openAddForm = () => {
     setEditingEventId(null);
@@ -447,7 +570,9 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
       const filteredEvents = subjectsLoaded
         ? filterEventsBySubjects(nextEvents, nextSubjects)
         : nextEvents;
-      setEvents(mergeSubjectSchedule(filteredEvents, nextSubjects));
+      // Keep API events intact here. Recurring class occurrences are derived
+      // for the displayed dates below, using the subject timetable as truth.
+      setEvents(filteredEvents);
     } finally {
       setLoading(false);
     }
@@ -483,14 +608,6 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
     });
   }, [selectedDate]);
 
-  useEffect(() => {
-    if (form.type !== 'exam' || form.allDay || !form.startTime) return;
-    const examHours = Number(form.examHours);
-    if (!Number.isFinite(examHours) || examHours <= 0) return;
-    const nextEndTime = addHoursToTime(form.startTime, examHours);
-    setForm(prev => (prev.endTime === nextEndTime ? prev : { ...prev, endTime: nextEndTime }));
-  }, [form.type, form.allDay, form.startTime, form.examHours]);
-
   const filteredSubjects = useMemo(() => filterBySemester(subjects, selectedSemesterKey), [subjects, selectedSemesterKey]);
   const filteredSubjectIdSet = useMemo(() => new Set(filteredSubjects.map(subject => subject.id)), [filteredSubjects]);
   const filteredEvents = useMemo(
@@ -504,13 +621,25 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
           }),
     [events, filteredSubjectIdSet, selectedSemesterKey]
   );
+  const calendarEvents = useMemo(() => {
+    const monthStart = new Date(currentMonthDate.getFullYear(), currentMonthDate.getMonth(), 1);
+    const monthEnd = new Date(currentMonthDate.getFullYear(), currentMonthDate.getMonth() + 1, 0);
+    const selected = parseISO(selectedDate);
+    const selectedWeekStart = Number.isNaN(selected.getTime()) ? monthStart : getStartOfWeek(selected);
+    const selectedWeekEnd = new Date(selectedWeekStart);
+    selectedWeekEnd.setDate(selectedWeekEnd.getDate() + 6);
+    const rangeStart = monthStart < selectedWeekStart ? monthStart : selectedWeekStart;
+    const rangeEnd = monthEnd > selectedWeekEnd ? monthEnd : selectedWeekEnd;
+
+    return expandRecurringSubjectSchedules(filteredEvents, filteredSubjects, rangeStart, rangeEnd);
+  }, [currentMonthDate, filteredEvents, filteredSubjects, selectedDate]);
   const visibleEvents = useMemo(
     () =>
-      filteredEvents.filter(event => {
+      calendarEvents.filter(event => {
         if (event.source === 'study_log' || event.study_log_id) return true;
         return resolveEventType(event) !== 'other';
       }),
-    [filteredEvents]
+    [calendarEvents]
   );
 
   useEffect(() => {
@@ -520,11 +649,25 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
   }, [filteredSubjects, form.subjectId]);
 
   const selectedEvents = useMemo(
-    () => visibleEvents.filter(event => format(parseISO(event.start_time), 'yyyy-MM-dd') === selectedDate),
+    () => visibleEvents.filter(event => format(parseCalendarDateTime(event.start_time), 'yyyy-MM-dd') === selectedDate),
     [selectedDate, visibleEvents]
   );
   const currentYear = currentMonthDate.getFullYear();
   const currentMonth = currentMonthDate.getMonth();
+  const weekDays = useMemo(() => {
+    const weekStart = getStartOfWeek(parseISO(selectedDate));
+    return Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(weekStart);
+      date.setDate(weekStart.getDate() + index);
+      return date;
+    });
+  }, [selectedDate]);
+  const weekLabel = `${format(weekDays[0], 'd MMM', { locale: th })} – ${format(weekDays[6], 'd MMM yyyy', { locale: th })}`;
+  const calendarDays = useMemo(
+    () => (calendarView === 'day' ? [parseISO(selectedDate)] : weekDays),
+    [calendarView, selectedDate, weekDays]
+  );
+  const weekTimeRows = Array.from({ length: 17 }, (_, index) => index + 6);
   const yearOptions = useMemo(() => {
     const selectedYear = parseISO(selectedDate).getFullYear();
     const startYear = Math.min(currentYear, selectedYear) - 3;
@@ -540,7 +683,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
     if (!filteredSubjects.length) return [];
     const bySubject = new Map<number, CalendarEvent[]>();
     visibleEvents.forEach(event => {
-      const eventDate = format(parseISO(event.start_time), 'yyyy-MM-dd');
+      const eventDate = format(parseCalendarDateTime(event.start_time), 'yyyy-MM-dd');
       if (eventDate !== selectedDate) return;
       const subjectId = event.subject?.id ?? event.subject_id;
       if (!subjectId) return;
@@ -593,7 +736,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
       const day = new Date(start);
       day.setDate(start.getDate() + index);
       const key = format(day, 'yyyy-MM-dd');
-      return visibleEvents.filter(event => format(parseISO(event.start_time), 'yyyy-MM-dd') === key).length;
+      return visibleEvents.filter(event => format(parseCalendarDateTime(event.start_time), 'yyyy-MM-dd') === key).length;
     });
 
     const max = Math.max(1, ...values);
@@ -611,9 +754,9 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
 
   const formatEventTime = (event: CalendarEvent) => {
     if (event.all_day) return 'ทั้งวัน';
-    const start = format(parseISO(event.start_time), 'HH:mm');
+    const start = format(parseCalendarDateTime(event.start_time), 'HH:mm');
     if (event.end_time) {
-      const end = format(parseISO(event.end_time), 'HH:mm');
+      const end = format(parseCalendarDateTime(event.end_time), 'HH:mm');
       return `${start} - ${end}`;
     }
     return start;
@@ -622,8 +765,8 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
   const startEditEvent = (event: CalendarEvent) => {
     if (event.id <= 0 || event.source === 'study_log') return;
     const resolvedType = resolveEventType(event) ?? 'other';
-    const startAt = parseISO(event.start_time);
-    const endAt = event.end_time ? parseISO(event.end_time) : null;
+    const startAt = parseCalendarDateTime(event.start_time);
+    const endAt = event.end_time ? parseCalendarDateTime(event.end_time) : null;
     const examTopicFromTitle = (event.title ?? '').replace(/^สอบ:\s*/u, '').trim();
     const descriptionRaw = (event.description ?? '').trim();
     const parsedExam = parseExamDescription(descriptionRaw);
@@ -668,13 +811,16 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
       return;
     }
 
-    const examHours = Number(form.examHours);
-    if (form.type === 'exam' && !form.allDay && (!Number.isFinite(examHours) || examHours <= 0)) {
-      setError('กรุณาระบุจำนวนชั่วโมงสอบ');
-      return;
-    }
     if (!form.allDay && (!form.startTime || !form.endTime)) {
       setError('กรุณาระบุเวลาเริ่มและเวลาเลิก');
+      return;
+    }
+
+    const examHours = form.type === 'exam' && !form.allDay
+      ? getDurationHours(form.startTime, form.endTime)
+      : Number(form.examHours);
+    if (form.type === 'exam' && !form.allDay && !examHours) {
+      setError('เวลาสิ้นสุดต้องอยู่หลังเวลาเริ่มสอบ');
       return;
     }
 
@@ -686,13 +832,10 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
     const examNotes = form.examNotes.trim();
     const room = form.room.trim();
     const title = form.type === 'exam' ? `สอบ: ${examTopic}` : form.title.trim();
-    const computedExamEndTime = form.type === 'exam' && !isAllDay
-      ? addHoursToTime(form.startTime || '00:00:00', examHours)
-      : form.endTime;
     const description = form.type === 'exam'
       ? buildExamDescription({
           examScope: examTopic,
-          examHours,
+          examHours: examHours ?? 0,
           isAllDay,
           examMethod,
           preparationNotes: examNotes,
@@ -708,7 +851,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
       ...(normalizedType ? { event_type: normalizedType } : {}),
       all_day: isAllDay,
       start_time: buildDateTime(form.date, isAllDay ? '00:00:00' : form.startTime || '00:00:00'),
-      end_time: isAllDay || !computedExamEndTime ? null : buildDateTime(form.date, computedExamEndTime),
+      end_time: isAllDay || !form.endTime ? null : buildDateTime(form.date, form.endTime),
       status: 'planned'
     };
 
@@ -716,7 +859,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
     setError(null);
     try {
       if (editingEventId) {
-        await api.patch(`/calendar-events/${editingEventId}`, payload);
+        await updateCalendarEventWithFallback(editingEventId, payload);
       } else {
         await api.post('/calendar-events', payload);
       }
@@ -731,7 +874,6 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
     }
   };
 
-  
   const upsertSubjectActivity = async (subjectId: number, nextType: 'class' | 'exam') => {
     const subject = subjects.find(item => item.id === subjectId);
     if (!subject) return;
@@ -767,6 +909,33 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
     } finally {
       setSavingSubjectId(null);
     }
+  };
+
+  const openExamFormForSubject = (subjectId: number) => {
+    const status = subjectStatuses.find(item => item.id === subjectId);
+    if (status?.activity === 'exam') return;
+
+    setEditingEventId(null);
+    setError(null);
+    setForm(prev => ({
+      ...prev,
+      title: '',
+      examTopic: '',
+      examMethod: '',
+      examNotes: '',
+      room: '',
+      type: 'exam',
+      date: selectedDate,
+      startTime: '',
+      endTime: '',
+      examHours: '1',
+      allDay: false,
+      subjectId: String(subjectId),
+      description: ''
+    }));
+    setFormDateDisplay(formatDateDisplayValue(selectedDate));
+    setIsAddingEvent(true);
+    document.getElementById('calendar-form')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
   const deleteEvent = async (event: CalendarEvent) => {
@@ -809,7 +978,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
 
   const getEventsForDay = (day: number) => {
     const dateKey = format(new Date(currentYear, currentMonth, day), 'yyyy-MM-dd');
-    return visibleEvents.filter(event => format(parseISO(event.start_time), 'yyyy-MM-dd') === dateKey);
+    return visibleEvents.filter(event => format(parseCalendarDateTime(event.start_time), 'yyyy-MM-dd') === dateKey);
   };
 
   const goToToday = () => {
@@ -819,7 +988,35 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
     setSelectedDate(todayKey);
     setIsAddingEvent(false);
   };
-  const todayExamCount = selectedEvents.filter(event => resolveEventType(event) === 'exam').length;
+  const changeCalendarPeriod = (direction: -1 | 1) => {
+    if (calendarView !== 'month') {
+      const nextDate = parseISO(selectedDate);
+      nextDate.setDate(nextDate.getDate() + direction);
+      setSelectedDate(format(nextDate, 'yyyy-MM-dd'));
+      return;
+    }
+    setCurrentMonthDate(new Date(currentYear, currentMonth + direction, 1));
+  };
+  const todayDate = new Date();
+  const todayDateKey = format(todayDate, 'yyyy-MM-dd');
+  const tomorrowDate = new Date(todayDate);
+  tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+  const yesterdayDate = new Date(todayDate);
+  yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+  const selectedDateLabel = selectedDate === todayDateKey
+    ? 'วันนี้'
+    : selectedDate === format(tomorrowDate, 'yyyy-MM-dd')
+      ? 'พรุ่งนี้'
+      : selectedDate === format(yesterdayDate, 'yyyy-MM-dd')
+        ? 'เมื่อวาน'
+        : format(parseISO(selectedDate), 'd MMM yyyy', { locale: th });
+  const navigationPeriodLabel = calendarView === 'month'
+    ? `${thaiMonthOptions[currentMonth]} ${currentYear}`
+    : selectedDateLabel;
+  const isViewingToday = calendarView === 'month'
+    ? currentMonth === todayDate.getMonth() && currentYear === todayDate.getFullYear()
+    : selectedDate === todayDateKey;
+  const selectedExamCount = selectedEvents.filter(event => resolveEventType(event) === 'exam').length;
 
   return (
     <div className={`bg-transparent text-[color:var(--text)] ${embedded ? 'px-3 py-4' : 'min-h-screen px-4 py-6 md:px-8 md:py-8'}`}>
@@ -840,7 +1037,6 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
               <h1 className="mt-3 text-3xl font-bold text-[color:var(--text)]">
                 จัดการปฏิทินและการสอบ
               </h1>
-              <p className="mt-1 text-sm text-[color:rgba(var(--text),0.72)]">จัดการเวลาเรียน สอบ และกิจกรรมรายวันในหน้าเดียว</p>
             </div>
             )}
             <button
@@ -854,11 +1050,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
             </button>
           </div>
 
-          <div className="mt-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
-            <div className="rounded-[18px] border border-muted bg-[color:var(--surface)] px-4 py-3">
-              <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted">รายการทั้งหมด</p>
-              <p className="mt-1.5 text-2xl font-bold text-[color:var(--text)]">{loading ? '...' : visibleEvents.length}</p>
-            </div>
+          <div className="mt-4 grid grid-cols-2 gap-3 xl:grid-cols-3">
             <div className="rounded-[18px] border border-muted bg-[color:var(--surface)] px-4 py-3">
               <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted">วิชาในเทอม</p>
               <p className="mt-1.5 text-2xl font-bold text-[color:var(--text)]">{filteredSubjects.length}</p>
@@ -868,14 +1060,14 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
               <p className="mt-1.5 text-lg font-bold text-[color:var(--text)]">{format(parseISO(selectedDate), 'd MMM yyyy', { locale: th })}</p>
             </div>
             <div className="rounded-[18px] border border-muted bg-[color:var(--surface)] px-4 py-3">
-              <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted">สอบวันนี้</p>
-              <p className="mt-1.5 text-2xl font-bold text-[color:var(--text)]">{todayExamCount}</p>
+              <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted">สอบในวันที่เลือก</p>
+              <p className="mt-1.5 text-2xl font-bold text-[color:var(--text)]">{selectedExamCount}</p>
             </div>
           </div>
         </section>
 
       <div className={`grid grid-cols-1 gap-6 ${embedded ? 'xl:grid-cols-12' : 'lg:grid-cols-12'}`}>
-        <section className={`min-w-0 ${embedded ? 'xl:col-span-8' : 'lg:col-span-8'}`}>
+        <section className={`min-w-0 ${embedded ? 'xl:col-span-9' : 'lg:col-span-9'}`}>
           <div className="bg-[color:var(--panel-bg)] backdrop-blur-xl border border-muted rounded-[32px] overflow-hidden shadow-soft">
           <div className="flex flex-col gap-4 border-b border-muted px-4 py-4 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:px-6 sm:py-5">
             <div className="flex w-full flex-wrap items-center gap-3 sm:w-auto">
@@ -907,28 +1099,45 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
             <div className="flex items-center gap-2 surface-2 p-1 rounded-2xl border border-muted">
               <button
                 type="button"
-                onClick={() => setCurrentMonthDate(new Date(currentYear, currentMonth - 1, 1))}
+                onClick={() => changeCalendarPeriod(-1)}
                 className="p-2 hover:bg-[color:rgba(var(--accent-rgb),0.08)] rounded-xl transition-colors text-[color:var(--text)]"
-                aria-label="เดือนก่อนหน้า"
+                aria-label={calendarView === 'month' ? 'เดือนก่อนหน้า' : 'วันก่อนหน้า'}
                   >
                     <ChevronLeftIcon size={18} />
                   </button>
+              <span className="min-w-[5.5rem] px-2 text-center text-sm font-medium text-[color:var(--text)]">
+                {navigationPeriodLabel}
+              </span>
               <button
                 type="button"
-                onClick={goToToday}
-                className="text-sm font-medium px-2 text-[color:var(--text)] hover:text-accent transition-colors"
-              >
-                วันนี้
-              </button>
-              <button
-                type="button"
-                onClick={() => setCurrentMonthDate(new Date(currentYear, currentMonth + 1, 1))}
+                onClick={() => changeCalendarPeriod(1)}
                 className="p-2 hover:bg-[color:rgba(var(--accent-rgb),0.08)] rounded-xl transition-colors text-[color:var(--text)]"
-                aria-label="เดือนถัดไป"
+                aria-label={calendarView === 'month' ? 'เดือนถัดไป' : 'วันถัดไป'}
                   >
                     <ChevronRightIcon size={18} />
                   </button>
+                {!isViewingToday ? (
+                  <button
+                    type="button"
+                    onClick={goToToday}
+                    className="rounded-xl px-2 py-1 text-xs font-bold text-accent transition-colors hover:bg-[color:rgba(var(--accent-rgb),0.08)]"
+                  >
+                    กลับวันนี้
+                  </button>
+                ) : null}
                 </div>
+              <div className="rounded-2xl border border-muted surface-2 px-1">
+                <select
+                  value={calendarView}
+                  onChange={event => setCalendarView(event.target.value as 'day' | 'week' | 'month')}
+                  className="cursor-pointer bg-transparent py-2 pl-3 pr-2 text-xs font-bold text-[color:var(--text)] outline-none"
+                  aria-label="เลือกรูปแบบปฏิทิน"
+                >
+                  <option value="day">วัน</option>
+                  <option value="week">สัปดาห์</option>
+                  <option value="month">เดือน</option>
+                </select>
+              </div>
               </div>
 
           <div className="px-3 py-4 sm:px-6 sm:py-6">
@@ -947,18 +1156,100 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                   ))}
                 </select>
               </div>
-              <div className="text-xs font-bold text-muted">
-                {format(parseISO(selectedDate), 'd MMMM yyyy', { locale: th })}
+              <div className="flex flex-wrap items-center justify-between gap-3 sm:justify-end">
+                <div className="flex items-center gap-3 text-xs font-semibold text-muted" aria-label="คำอธิบายสีของกิจกรรม">
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" aria-hidden="true" />
+                    เรียน
+                  </span>
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="h-2.5 w-2.5 rounded-full bg-rose-500" aria-hidden="true" />
+                    สอบ
+                  </span>
+                </div>
+                <div className="text-xs font-bold text-muted">
+                  {calendarView === 'week'
+                    ? weekLabel
+                    : format(parseISO(selectedDate), 'd MMMM yyyy', { locale: th })}
+                </div>
               </div>
             </div>
 
+            {calendarView !== 'month' ? (
+              <div className="overflow-x-auto pb-2">
+                <div className={`${calendarView === 'week' ? 'min-w-[760px]' : 'min-w-[300px]'} overflow-hidden rounded-2xl border border-muted bg-[color:var(--surface)]`}>
+                  <div
+                    className="grid border-b border-muted"
+                    style={{ gridTemplateColumns: `64px repeat(${calendarDays.length}, minmax(100px, 1fr))` }}
+                  >
+                    <div className="border-r border-muted px-2 py-3 text-center text-[10px] font-bold text-muted">เวลา</div>
+                    {calendarDays.map(date => {
+                      const dateKey = format(date, 'yyyy-MM-dd');
+                      const isSelected = dateKey === selectedDate;
+                      const isToday = dateKey === format(new Date(), 'yyyy-MM-dd');
+                      const dayIndex = date.getDay();
+                      return (
+                        <button
+                          key={dateKey}
+                          type="button"
+                          onClick={() => { setSelectedDate(dateKey); setIsAddingEvent(false); }}
+                          className={`border-r border-muted py-2 text-center last:border-r-0 transition hover:bg-primary/5 ${isSelected ? 'bg-primary/10' : ''}`}
+                        >
+                          <span className={`block text-[10px] font-bold uppercase ${dayIndex === 0 ? 'text-rose-500' : dayIndex === 6 ? 'text-accent' : 'text-muted'}`}>{dayHeaders[dayIndex]}</span>
+                          <span className={`mx-auto mt-1 flex h-8 w-8 items-center justify-center rounded-full text-lg font-bold ${isToday ? 'bg-primary text-[color:var(--on-accent)]' : isSelected ? 'text-primary' : 'text-[color:var(--text)]'}`}>{format(date, 'd')}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div
+                    className="grid"
+                    style={{ gridTemplateColumns: `64px repeat(${calendarDays.length}, minmax(100px, 1fr))` }}
+                  >
+                    <div className="border-r border-muted bg-[color:var(--surface-2)]">
+                      {weekTimeRows.map(hour => <div key={hour} className="h-16 border-b border-muted pr-2 pt-1 text-right text-[10px] font-medium text-muted">{String(hour).padStart(2, '0')}:00</div>)}
+                    </div>
+                    {calendarDays.map(date => {
+                      const dateKey = format(date, 'yyyy-MM-dd');
+                      const timedEvents = visibleEvents.filter(event => format(parseCalendarDateTime(event.start_time), 'yyyy-MM-dd') === dateKey && !event.all_day);
+                      return (
+                        <div key={dateKey} className="relative min-h-[1088px] border-r border-muted last:border-r-0">
+                          {weekTimeRows.map(hour => <div key={hour} className="h-16 border-b border-muted" />)}
+                          {timedEvents.map(event => {
+                            const start = parseCalendarDateTime(event.start_time);
+                            const end = event.end_time ? parseCalendarDateTime(event.end_time) : null;
+                            const startMinutes = (start.getHours() * 60) + start.getMinutes();
+                            const endMinutes = end && !Number.isNaN(end.getTime()) ? (end.getHours() * 60) + end.getMinutes() : startMinutes + 60;
+                            const top = Math.max(0, ((startMinutes - (6 * 60)) / 60) * 64);
+                            const height = Math.max(28, ((Math.max(endMinutes, startMinutes + 30) - startMinutes) / 60) * 64);
+                            const type = event.source === 'study_log' ? 'log' : (resolveEventType(event) ?? 'other');
+                            return (
+                              <button
+                                key={event.id}
+                                type="button"
+                                onClick={() => { setSelectedDate(dateKey); setIsAddingEvent(false); }}
+                                title={`${event.title} · ${formatEventTime(event)}`}
+                                style={{ top: `${top}px`, height: `${height}px` }}
+                                className={`absolute left-1 right-1 z-10 overflow-hidden rounded-lg px-2 py-1 text-left text-xs font-bold leading-tight shadow-sm ${calendarChipClassByType[type]}`}
+                              >
+                                <span className="block truncate">{formatEventTime(event)}</span>
+                                <span className="block truncate">{event.title}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            ) : (
             <div className="w-full pb-2">
               <div className="grid w-full min-w-0 grid-cols-7 gap-2">
                 {dayHeaders.map((dayLabel, index) => (
                   <div
                     key={dayLabel}
                     className={`text-center text-xs font-bold uppercase tracking-wider mb-3 ${
-                      index === 0 ? 'text-rose-500' : index === 6 ? 'text-accent' : 'text-muted'
+                      index === 0 ? 'text-rose-600' : index === 6 ? 'text-accent' : 'text-[color:rgba(var(--text),0.72)]'
                     }`}
                   >
                     {dayLabel}
@@ -966,7 +1257,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                 ))}
 
                 {blankDays.map(blankKey => (
-                  <div key={blankKey} className="h-24 opacity-0" />
+                  <div key={blankKey} className="h-32 opacity-0" />
                 ))}
 
                 {monthDays.map(day => {
@@ -986,20 +1277,20 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                         setSelectedDate(dayKey);
                         setIsAddingEvent(false);
                       }}
-                      className={`h-24 rounded-2xl p-2 border transition-all cursor-pointer relative group ${
+                      className={`h-32 rounded-2xl p-2.5 border transition-all cursor-pointer relative group ${
                         isSelected
                           ? 'bg-primary/10 border-primary/40 shadow-glow'
                           : 'bg-[color:rgba(var(--on-accent-rgb),0.04)] border-muted hover:border-[color:rgba(var(--accent-rgb),0.45)]'
                       }`}
                     >
                       <div
-                        className={`text-sm font-bold ${
+                        className={`text-base font-extrabold leading-none ${
                           isToday ? 'text-accent' : isWeekend ? (weekDay === 0 ? 'text-rose-400' : 'text-accent') : 'text-[color:var(--text)]'
                         }`}
                       >
                         {day}
                       </div>
-                      <div className="mt-1.5 space-y-1 sm:mt-3">
+                      <div className="mt-2 space-y-1.5">
                         {dayEvents.slice(0, 2).map(event => {
                           const badge = resolveEventBadge(event);
                           const resolvedType = event.source === 'study_log' ? 'log' : (resolveEventType(event) ?? 'other');
@@ -1014,7 +1305,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                           return (
                             <div
                               key={event.id}
-                              className={`text-[10px] p-1 rounded-lg truncate ${calendarChipClassByType[resolvedType]}`}
+                              className={`line-clamp-2 rounded-lg px-2 py-1.5 text-xs font-bold leading-snug shadow-sm ${calendarChipClassByType[resolvedType]}`}
                               title={
                                 resolvedType === 'exam'
                                   ? `${badge.label}: ${subjectName || '-'} | ${examTopic || '-'} | ${eventTimeText}`
@@ -1026,7 +1317,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                           );
                         })}
                         {dayEvents.length > 2 ? (
-                          <div className="text-[10px] surface-2 text-muted p-1 rounded-lg border border-muted">
+                          <div className="rounded-lg border border-muted surface-2 px-2 py-1.5 text-xs font-semibold leading-tight text-[color:rgba(var(--text),0.78)]">
                             +{dayEvents.length - 2} รายการ
                           </div>
                         ) : null}
@@ -1036,6 +1327,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                 })}
               </div>
             </div>
+            )}
           </div>
           </div>
 
@@ -1101,7 +1393,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                           </div>
                         </div>
                         <p className="mt-1 text-xs leading-5 text-muted">
-                          สถานะ: {subject.studied ? 'กำลังเรียน' : 'ยังไม่เริ่ม'} •{' '}
+                          สถานะ: {subject.studied ? 'กำลังเรียน' : ''} •{' '}
                           {subject.activity === 'exam' ? 'มีสอบ' : subject.activity === 'class' ? 'มีเรียน' : 'ยังไม่กำหนด'}
                         </p>
                         <div className="mt-2 flex flex-wrap gap-2">
@@ -1120,7 +1412,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                           </button>
                           <button
                             type="button"
-                            onClick={() => upsertSubjectActivity(subject.id, 'exam')}
+                            onClick={() => openExamFormForSubject(subject.id)}
                             disabled={savingSubjectId === subject.id}
                             aria-pressed={subject.activity === 'exam'}
                             className={`text-[10px] font-bold px-3 py-1 rounded-full border transition disabled:opacity-60 ${
@@ -1141,7 +1433,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
           </div>
         </section>
 
-        <aside className={`flex flex-col gap-6 ${embedded ? 'xl:col-span-4 xl:sticky xl:top-6' : 'lg:col-span-4 lg:sticky lg:top-6'}`}>
+        <aside className={`flex flex-col gap-6 ${embedded ? 'xl:col-span-3 xl:sticky xl:top-6' : 'lg:col-span-3 lg:sticky lg:top-6'}`}>
           {!isAddingEvent ? (
             <section className="overflow-hidden rounded-[32px] border border-muted bg-[color:var(--panel-bg)] backdrop-blur-xl shadow-soft">
               <div className="flex items-start justify-between gap-4 px-6 py-6">
@@ -1245,20 +1537,20 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                   })
                 ) : (
                   <div className="p-6 rounded-[24px] surface-2 border border-muted text-center">
-                    <p className="text-sm font-semibold text-[color:var(--text)]">ยังไม่มีรายการในวันนี้</p>
+                    <p className="text-sm font-semibold text-[color:var(--text)]">ยังไม่มีรายการในวันที่เลือก</p>
                     <p className="text-xs text-muted mt-1">กดปุ่ม + เพื่อเพิ่มกิจกรรมใหม่</p>
                   </div>
                 )}
               </div>
             </section>
           ) : (
-            <section className="overflow-hidden rounded-[32px] border border-muted bg-[color:var(--panel-bg)] backdrop-blur-xl shadow-soft">
-              <div className="flex items-center justify-between gap-3 px-6 py-6">
+            <section className="mx-auto w-full max-w-[400px] overflow-hidden rounded-[32px] border border-muted bg-[color:var(--panel-bg)] shadow-soft">
+              <div className="flex items-start justify-between gap-3 px-6 pb-4 pt-6">
                 <div>
-                  <h3 className="text-xl font-bold text-[color:var(--text)]">
+                  <h3 className="text-lg font-black leading-none text-[color:var(--text)]">
                     {editingEventId ? 'แก้ไขตาราง' : 'เพิ่มตารางใหม่'}
                   </h3>
-                  <p className="mt-1 text-sm text-muted">
+                  <p className="mt-2 text-xs font-bold text-muted">
                     {format(parseISO(form.date), 'd MMMM yyyy', { locale: th })}
                   </p>
                 </div>
@@ -1269,7 +1561,8 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                     setEditingEventId(null);
                     setForm(prev => ({ ...prev, title: '', examTopic: '', examMethod: '', examNotes: '', room: '', description: '' }));
                   }}
-                  className="flex h-9 w-9 items-center justify-center rounded-full border border-muted surface-2 text-muted transition hover:text-accent"
+                  className="flex h-8 w-8 items-center justify-center rounded-full border border-muted surface-2 text-base font-bold text-muted transition hover:border-[color:var(--accent)] hover:text-accent"
+                  aria-label="ปิดฟอร์มเพิ่มตาราง"
                 >
                   ×
                 </button>
@@ -1284,7 +1577,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                 className="grid gap-4 px-6 pb-6"
               >
                 <div>
-                  <label className="mb-1 block text-sm font-semibold text-[color:var(--text)]">
+                  <label className="mb-1.5 block text-[11px] font-black text-[color:var(--text)]">
                     {form.type === 'exam' ? 'เรื่องที่สอบ' : 'ชื่อกิจกรรม'}
                   </label>
                   <input
@@ -1296,50 +1589,49 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                           : { ...prev, title: event.target.value }
                       ))
                     }
-                    className="w-full surface-2 border border-muted rounded-2xl px-4 py-3 text-sm text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
+                    className="h-9 w-full rounded-xl border border-muted surface-2 px-3 text-sm text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
                   />
                 </div>
 
                 {form.type === 'exam' ? (
                   <>
                     <div>
-                      <label className="mb-1 block text-sm font-semibold text-[color:var(--text)]">รูปแบบการสอบ</label>
+                      <label className="mb-1.5 block text-[11px] font-black text-[color:var(--text)]">รูปแบบการสอบ</label>
                       <input
                         value={form.examMethod}
                         onChange={event => setForm(prev => ({ ...prev, examMethod: event.target.value }))}
-                        className="w-full surface-2 border border-muted rounded-2xl px-4 py-3 text-sm text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
+                        className="h-9 w-full rounded-xl border border-muted surface-2 px-3 text-sm text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
                       />
                     </div>
                     <div>
-                      <label className="mb-1 block text-sm font-semibold text-[color:var(--text)]">แนวทางเตรียมตัว / รายละเอียดสอบ</label>
+                      <label className="mb-1.5 block text-[11px] font-black text-[color:var(--text)]">แนวทางเตรียมตัว / รายละเอียดสอบ</label>
                       <textarea
                         value={form.examNotes}
                         onChange={event => setForm(prev => ({ ...prev, examNotes: event.target.value }))}
-                        className="min-h-[110px] w-full surface-2 border border-muted rounded-2xl px-4 py-3 text-sm text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
+                        className="min-h-[96px] w-full resize-y rounded-xl border border-muted surface-2 px-3 py-2.5 text-sm text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
                       />
                     </div>
                   </>
                 ) : null}
 
-                <div className="grid gap-3 sm:grid-cols-2">
+                <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="mb-1 block text-sm font-semibold text-[color:var(--text)]">ประเภท</label>
+                    <label className="mb-1.5 block text-[11px] font-black text-[color:var(--text)]">ประเภท</label>
                     <select
                       value={form.type}
                       onChange={event => setForm(prev => ({ ...prev, type: event.target.value }))}
-                      className="w-full surface-2 border border-muted rounded-2xl px-4 py-3 text-sm text-[color:var(--text)] focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
+                      className="h-9 w-full rounded-xl border border-muted surface-2 px-3 text-sm font-medium text-[color:var(--text)] focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
                     >
                       <option value="class" className="bg-[color:var(--surface-3)] text-[color:var(--text)]">เรียน</option>
                       <option value="exam" className="bg-[color:var(--surface-3)] text-[color:var(--text)]">สอบ</option>
-                  
                     </select>
                   </div>
                   <div>
-                    <label className="mb-1 block text-sm font-semibold text-[color:var(--text)]">รายวิชา</label>
+                    <label className="mb-1.5 block text-[11px] font-black text-[color:var(--text)]">รายวิชา</label>
                     <select
                       value={form.subjectId}
                       onChange={event => setForm(prev => ({ ...prev, subjectId: event.target.value }))}
-                      className="w-full surface-2 border border-muted rounded-2xl px-4 py-3 text-sm text-[color:var(--text)] focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
+                      className="h-9 w-full rounded-xl border border-muted surface-2 px-3 text-sm font-medium text-[color:var(--text)] focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
                     >
                       <option value="" className="bg-[color:var(--surface-3)] text-[color:var(--text)]">เลือกวิชา</option>
                       {filteredSubjects.map(subject => (
@@ -1352,17 +1644,17 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                 </div>
 
                 <div>
-                  <label className="mb-1 block text-sm font-semibold text-[color:var(--text)]">ห้องเรียน</label>
+                  <label className="mb-1.5 block text-[11px] font-black text-[color:var(--text)]">ห้องเรียน</label>
                   <input
                     value={form.room}
                     onChange={event => setForm(prev => ({ ...prev, room: event.target.value }))}
                     placeholder="เช่น อาคาร 3 ห้อง 305"
-                    className="w-full surface-2 border border-muted rounded-2xl px-4 py-3 text-sm text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
+                    className="h-9 w-full rounded-xl border border-muted surface-2 px-3 text-sm text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
                   />
                 </div>
 
                 <div>
-                  <label className="mb-1 block text-sm font-semibold text-[color:var(--text)]">วันที่</label>
+                  <label className="mb-1.5 block text-[11px] font-black text-[color:var(--text)]">วันที่</label>
                   <div className="relative">
                     <input
                       type="text"
@@ -1377,7 +1669,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                           setForm(prev => ({ ...prev, date: normalized }));
                         }
                       }}
-                      className="w-full surface-2 border border-muted rounded-2xl px-4 py-3 pr-12 text-sm text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
+                      className="h-9 w-full rounded-xl border border-muted surface-2 px-3 pr-10 text-sm font-medium text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
                     />
                     <button
                       type="button"
@@ -1391,7 +1683,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                       title="เลือกวันที่"
                       className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-accent"
                     >
-                      <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none">
+                      <svg viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none">
                         <rect x="3" y="5" width="18" height="16" rx="2" stroke="currentColor" strokeWidth="1.6" />
                         <path d="M8 3v4M16 3v4M3 9h18" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
                       </svg>
@@ -1413,72 +1705,64 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                   </div>
                 </div>
 
-                <div className="flex items-center gap-3 rounded-2xl border border-muted surface-2 px-4 py-3 text-sm text-[color:var(--text)]">
+                <div className="flex h-9 items-center gap-2 rounded-xl border border-muted surface-2 px-3 text-sm font-medium text-[color:var(--text)]">
                   <input
                     id="all-day"
                     type="checkbox"
                     checked={form.allDay}
                     onChange={event => setForm(prev => ({ ...prev, allDay: event.target.checked }))}
+                    className="h-4 w-4 rounded border-muted text-[color:var(--accent)] focus:ring-[color:var(--accent)]"
                   />
                   <label htmlFor="all-day">ทั้งวัน</label>
                 </div>
 
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div>
-                    <label className="mb-1 block text-sm font-semibold text-[color:var(--text)]">เวลาเริ่ม</label>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="min-w-0">
+                    <label className="mb-1.5 block whitespace-nowrap text-[11px] font-black text-[color:var(--text)]">เวลาเริ่ม</label>
                     <select
                       value={form.startTime}
                       onChange={event => setForm(prev => ({ ...prev, startTime: event.target.value }))}
                       disabled={form.allDay}
-                      className="w-full surface-2 border border-muted rounded-2xl px-4 py-3 text-sm text-[color:var(--text)] focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20 disabled:opacity-60"
+                      className="h-9 w-full cursor-pointer rounded-xl border border-muted surface-2 px-3 text-center text-sm font-semibold text-[color:var(--text)] outline-none transition focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20 disabled:cursor-not-allowed disabled:opacity-50"
+                      aria-label="เวลาเริ่ม"
                     >
                       <option value="">--.--</option>
                       {timeOptions.map(option => (
-                        <option key={option} value={option} className="bg-[color:var(--surface-3)] text-[color:var(--text)]">
-                          {formatTimeOptionLabel(option)}
+                        <option key={`start-${option.value}`} value={option.value}>
+                          {option.label}
                         </option>
                       ))}
                     </select>
                   </div>
-                  <div>
-                    <label className="mb-1 block text-sm font-semibold text-[color:var(--text)]">
-                      {form.type === 'exam' ? 'ชั่วโมงสอบ' : 'เวลาเลิก'}
+
+                  <div className="min-w-0">
+                    <label className="mb-1.5 block whitespace-nowrap text-[11px] font-black text-[color:var(--text)]">
+                      {form.type === 'exam' ? 'เวลาสิ้นสุด' : 'เวลาเลิก'}
                     </label>
-                    {form.type === 'exam' ? (
-                      <input
-                        type="number"
-                        min="0.5"
-                        step="0.5"
-                        value={form.examHours}
-                        onChange={event => setForm(prev => ({ ...prev, examHours: event.target.value }))}
-                        disabled={form.allDay}
-                        className="w-full surface-2 border border-muted rounded-2xl px-4 py-3 text-sm text-[color:var(--text)] focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20 disabled:opacity-60"
-                      />
-                    ) : (
-                      <select
-                        value={form.endTime}
-                        onChange={event => setForm(prev => ({ ...prev, endTime: event.target.value }))}
-                        disabled={form.allDay}
-                        className="w-full surface-2 border border-muted rounded-2xl px-4 py-3 text-sm text-[color:var(--text)] focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20 disabled:opacity-60"
-                      >
-                        <option value="">--.--</option>
-                        {timeOptions.map(option => (
-                          <option key={option} value={option} className="bg-[color:var(--surface-3)] text-[color:var(--text)]">
-                            {formatTimeOptionLabel(option)}
-                          </option>
-                        ))}
-                      </select>
-                    )}
+                    <select
+                      value={form.endTime}
+                      onChange={event => setForm(prev => ({ ...prev, endTime: event.target.value }))}
+                      disabled={form.allDay}
+                      className="h-9 w-full cursor-pointer rounded-xl border border-muted surface-2 px-3 text-center text-sm font-semibold text-[color:var(--text)] outline-none transition focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20 disabled:cursor-not-allowed disabled:opacity-50"
+                      aria-label={form.type === 'exam' ? 'เวลาสิ้นสุด' : 'เวลาเลิก'}
+                    >
+                      <option value="">--.--</option>
+                      {timeOptions.map(option => (
+                        <option key={`end-${option.value}`} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
                   </div>
                 </div>
 
                 {form.type !== 'exam' ? (
                   <div>
-                    <label className="mb-1 block text-sm font-semibold text-[color:var(--text)]">รายละเอียดเพิ่มเติม</label>
+                    <label className="mb-1.5 block text-[11px] font-black text-[color:var(--text)]">รายละเอียดเพิ่มเติม</label>
                     <textarea
                       value={form.description}
                       onChange={event => setForm(prev => ({ ...prev, description: event.target.value }))}
-                      className="min-h-[110px] w-full surface-2 border border-muted rounded-2xl px-4 py-3 text-sm text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
+                      className="min-h-[96px] w-full resize-y rounded-xl border border-muted surface-2 px-3 py-2.5 text-sm text-[color:var(--text)] placeholder:text-muted focus:outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
                     />
                   </div>
                 ) : null}
@@ -1486,7 +1770,7 @@ export const CalendarPage = ({ embedded = false }: { embedded?: boolean } = {}) 
                 <button
                   type="submit"
                   disabled={saving}
-                  className="w-full py-3 rounded-[24px] bg-primary text-[color:var(--on-accent)] font-bold text-sm shadow-glow hover:opacity-90 transition-all disabled:opacity-60"
+                  className="h-10 w-full rounded-full bg-primary text-sm font-black text-[color:var(--on-accent)] shadow-glow transition-all hover:opacity-90 disabled:opacity-60"
                 >
                   {saving ? 'กำลังบันทึก...' : editingEventId ? 'บันทึกการแก้ไข' : 'บันทึกตาราง'}
                 </button>

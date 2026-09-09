@@ -42,9 +42,13 @@ class SubjectController extends Controller
         $includeAll = request()->boolean('include_all') || request()->boolean('all');
         $canViewAll = $includeAll && $user && $user->role === 'admin';
 
-        $query = $canViewAll
-            ? Subject::withoutGlobalScope('user')->withCount('studyLogs')
-            : $user->subjects()->withCount('studyLogs');
+        $query = Subject::withoutGlobalScope('user')->withCount('studyLogs');
+
+        if ($canViewAll) {
+            $query->orderBy('user_id')->orderByDesc('updated_at');
+        } else {
+            $query->where('user_id', $user->id)->orderByDesc('updated_at');
+        }
 
         if ($this->canUseSemesterColumn()) {
             $query->with('semester');
@@ -52,12 +56,6 @@ class SubjectController extends Controller
 
         if (request()->boolean('include_study_logs')) {
             $query->with(['studyLogs' => fn ($q) => $q->latest('log_date')]);
-        }
-
-        if ($canViewAll) {
-            $query->orderBy('user_id')->orderByDesc('updated_at');
-        } else {
-            $query->orderByDesc('updated_at');
         }
 
         $subjects = $query->get();
@@ -75,9 +73,23 @@ class SubjectController extends Controller
             $data['semester_id'] = $this->resolveCurrentSemesterId();
         }
 
+        if ($this->findDuplicateSubject($user->id, $data)) {
+            return response()->json(['message' => 'วิชาซ้ำในภาคเรียนนี้ กรุณาใช้ชื่อวิชาอื่นหรือแก้ไขวิชาเดิม'], 422);
+        }
+
         $timing = $this->resolveScheduleTiming($data);
         if (isset($timing['error'])) {
             return response()->json(['message' => $timing['error']], 422);
+        }
+
+        $conflict = $this->findScheduleConflict($user->id, $data, $timing);
+        if ($conflict) {
+            return response()->json(['message' => $this->scheduleConflictMessage($conflict)], 422);
+        }
+
+        $eventConflict = $this->findCalendarScheduleConflict($user->id, $data, $timing);
+        if ($eventConflict) {
+            return response()->json(['message' => $this->calendarScheduleConflictMessage($eventConflict)], 422);
         }
 
         $subjectPayload = $this->filterSchedulePayload($data);
@@ -106,9 +118,27 @@ class SubjectController extends Controller
         $this->authorizeSubject($subject);
         $user = $request->user();
         $data = $request->validated();
+        if ($this->canUseSemesterColumn() && ! array_key_exists('semester_id', $data)) {
+            $data['semester_id'] = $subject->semester_id;
+        }
+
+        if ($this->findDuplicateSubject($user->id, $data, $subject->id)) {
+            return response()->json(['message' => 'วิชาซ้ำในภาคเรียนนี้ กรุณาใช้ชื่อวิชาอื่นหรือแก้ไขวิชาเดิม'], 422);
+        }
+
         $timing = $this->resolveScheduleTiming($data);
         if (isset($timing['error'])) {
             return response()->json(['message' => $timing['error']], 422);
+        }
+
+        $conflict = $this->findScheduleConflict($user->id, $data, $timing, $subject->id);
+        if ($conflict) {
+            return response()->json(['message' => $this->scheduleConflictMessage($conflict)], 422);
+        }
+
+        $eventConflict = $this->findCalendarScheduleConflict($user->id, $data, $timing, $subject->id);
+        if ($eventConflict) {
+            return response()->json(['message' => $this->calendarScheduleConflictMessage($eventConflict)], 422);
         }
 
         $subjectPayload = $this->filterSchedulePayload($data);
@@ -125,13 +155,9 @@ class SubjectController extends Controller
 
     public function destroy(Request $request, Subject $subject): JsonResponse
     {
-        if ((int) $subject->user_id !== (int) $request->user()->id) {
-            return response()->json(['message' => 'Not found'], 404);
-        }
+        $this->authorizeSubject($subject);
 
-        $this->deleteSubject($subject);
-
-        return response()->json(['message' => 'Deleted'], 200);
+        return $this->destroySubjectIfUnused($subject);
     }
 
     public function destroyById(Request $request): JsonResponse
@@ -152,14 +178,90 @@ class SubjectController extends Controller
             return response()->json(['message' => 'Not found'], 404);
         }
 
-        $this->deleteSubject($subject);
+        return $this->destroySubjectIfUnused($subject);
+    }
 
-        return response()->json(['message' => 'Deleted'], 200);
+    /**
+     * A subject may only be deleted when no other saved data refers to it.
+     * This guard deliberately runs on the server so a client cannot bypass it.
+     */
+    private function destroySubjectIfUnused(Subject $subject): JsonResponse
+    {
+        $linkedRecords = $this->linkedSubjectRecords($subject->id);
+
+        if ($linkedRecords !== []) {
+            return response()->json([
+                'message' => 'ไม่สามารถลบวิชา "'.$subject->name.'" ได้ เนื่องจากยังเชื่อมโยงกับ: '.implode(', ', $linkedRecords),
+                'linked_records' => $linkedRecords,
+            ], 422);
+        }
+
+        $subject->delete();
+
+        return response()->json(['message' => 'ลบรายวิชาเรียบร้อยแล้ว']);
+    }
+
+    /** @return array<int, string> */
+    private function linkedSubjectRecords(int $subjectId): array
+    {
+        $relations = [
+            ['table' => 'study_logs', 'column' => 'subject_id', 'label' => 'บันทึกการเรียน'],
+            ['table' => 'study_calendar_events', 'column' => 'subject_id', 'label' => 'ตารางเรียน'],
+            ['table' => 'learning_notifications', 'column' => 'subject_id', 'label' => 'การแจ้งเตือนการเรียน'],
+            ['table' => 'study_notifications', 'column' => 'subject_id', 'label' => 'การแจ้งเตือน'],
+            ['table' => 'mood_logs', 'column' => 'subject_id', 'label' => 'บันทึกอารมณ์'],
+            ['table' => 'career_recommendations', 'column' => 'subject_id', 'label' => 'คำแนะนำอาชีพ'],
+            ['table' => 'quizzes', 'column' => 'subject_id', 'label' => 'แบบฝึกหัด'],
+            ['table' => 'lessons', 'column' => 'subject_id', 'label' => 'บทเรียน'],
+            ['table' => 'schedules', 'column' => 'subject_id', 'label' => 'ตารางเรียน'],
+            ['table' => 'learning_goal_targets', 'column' => 'subject_id', 'label' => 'เป้าหมายการเรียน'],
+            ['table' => 'subjects_archives', 'column' => 'original_subject_id', 'label' => 'ประวัติรายวิชา'],
+        ];
+
+        $linked = [];
+        foreach ($relations as $relation) {
+            if (! $this->hasTableSafe($relation['table']) || ! $this->hasColumnSafe($relation['table'], $relation['column'])) {
+                continue;
+            }
+
+            if (DB::table($relation['table'])->where($relation['column'], $subjectId)->exists()) {
+                $linked[] = $relation['label'];
+            }
+        }
+
+        return array_values(array_unique($linked));
     }
 
     private function authorizeSubject(Subject $subject): void
     {
         abort_unless($subject->user_id === request()->user()->id, 403, 'Unauthorized');
+    }
+
+    private function findDuplicateSubject(int $userId, array $data, ?int $ignoreSubjectId = null): ?Subject
+    {
+        $name = trim((string) ($data['name'] ?? ''));
+        if ($name === '') {
+            return null;
+        }
+
+        $query = Subject::withoutGlobalScopes()
+            ->where('user_id', $userId)
+            ->whereRaw('LOWER(TRIM(name)) = ?', [mb_strtolower($name, 'UTF-8')]);
+
+        if ($ignoreSubjectId) {
+            $query->where('id', '<>', $ignoreSubjectId);
+        }
+
+        if ($this->hasColumnSafe((new Subject())->getTable(), 'semester_id')) {
+            $semesterId = $data['semester_id'] ?? null;
+            if ($semesterId !== null && $semesterId !== '') {
+                $query->where('semester_id', (int) $semesterId);
+            } else {
+                $query->whereNull('semester_id');
+            }
+        }
+
+        return $query->first();
     }
 
     private function deleteSubject(Subject $subject): void
@@ -246,8 +348,8 @@ class SubjectController extends Controller
                 }
 
                 $endAt = Carbon::parse($startDate . ' ' . $endTime, $timezone);
-                if ($endAt->lessThan($startAt)) {
-                    return ['error' => 'เวลาเลิกต้องไม่ก่อนเวลาเริ่ม'];
+                if ($endAt->lessThanOrEqualTo($startAt)) {
+                    return ['error' => 'เวลาเลิกต้องมากกว่าเวลาเริ่ม'];
                 }
             }
         }
@@ -258,6 +360,208 @@ class SubjectController extends Controller
             'end_at' => $endAt,
             'all_day' => $allDay,
         ];
+    }
+
+    private function findScheduleConflict(int $userId, array $data, array $timing, ?int $ignoreSubjectId = null): ?Subject
+    {
+        $startAt = $timing['start_at'] ?? null;
+        $endAt = $timing['end_at'] ?? null;
+
+        if (! $startAt || ! $endAt || ($timing['all_day'] ?? true)) {
+            return null;
+        }
+
+        $subjectTable = (new Subject())->getTable();
+        if (
+            ! $this->hasColumnSafe($subjectTable, 'start_date') ||
+            ! $this->hasColumnSafe($subjectTable, 'start_time') ||
+            ! $this->hasColumnSafe($subjectTable, 'end_time')
+        ) {
+            return null;
+        }
+
+        $query = Subject::withoutGlobalScopes()
+            ->where('user_id', $userId)
+            ->whereNotNull('start_date')
+            ->whereNotNull('start_time')
+            ->whereNotNull('end_time');
+
+        if ($ignoreSubjectId) {
+            $query->where('id', '<>', $ignoreSubjectId);
+        }
+
+        if ($this->hasColumnSafe($subjectTable, 'semester_id')) {
+            $semesterId = $data['semester_id'] ?? null;
+            if ($semesterId !== null && $semesterId !== '') {
+                $query->where('semester_id', (int) $semesterId);
+            }
+        }
+
+        $timezone = config('app.timezone', 'Asia/Bangkok');
+        $newDate = $startAt->copy()->timezone($timezone)->startOfDay();
+        $newStart = $startAt->format('H:i:s');
+        $newEnd = $endAt->format('H:i:s');
+
+        foreach ($query->get() as $subject) {
+            try {
+                $existingDate = Carbon::parse((string) $subject->start_date, $timezone)->startOfDay();
+            } catch (Throwable $error) {
+                continue;
+            }
+
+            if (! $existingDate->isSameDay($newDate)) {
+                continue;
+            }
+
+            $existingStart = $this->timeOnlyString($subject->start_time);
+            $existingEnd = $this->timeOnlyString($subject->end_time);
+            if (! $existingStart || ! $existingEnd) {
+                continue;
+            }
+
+            if ($newStart < $existingEnd && $existingStart < $newEnd) {
+                return $subject;
+            }
+        }
+
+        return null;
+    }
+
+    private function scheduleConflictMessage(Subject $conflict): string
+    {
+        $timeRange = trim(($this->formatTimeForMessage($conflict->start_time) ?? '') . '-' . ($this->formatTimeForMessage($conflict->end_time) ?? ''), '-');
+        $detail = $timeRange !== '' ? " เวลา {$timeRange}" : '';
+
+        return "เวลานี้ซ้อนกับวิชา {$conflict->name}{$detail} กรุณาเลือกเวลาอื่น เพราะซ้อนกับวิชาอื่น";
+    }
+
+    private function findCalendarScheduleConflict(int $userId, array $data, array $timing, ?int $ignoreSubjectId = null): ?StudyCalendarEvent
+    {
+        $startAt = $timing['start_at'] ?? null;
+        $endAt = $timing['end_at'] ?? null;
+
+        if (! $startAt || ! $endAt || ($timing['all_day'] ?? true)) {
+            return null;
+        }
+
+        if (! $this->hasTableSafe((new StudyCalendarEvent())->getTable())) {
+            return null;
+        }
+
+        $query = StudyCalendarEvent::with('subject')
+            ->where('user_id', $userId)
+            ->whereNotNull('end_time')
+            ->where('start_time', '<', $endAt)
+            ->where('end_time', '>', $startAt);
+
+        $semesterId = $this->calendarConflictSemesterId($data);
+
+        foreach ($query->get() as $event) {
+            if ($ignoreSubjectId && (int) $event->subject_id === (int) $ignoreSubjectId) {
+                continue;
+            }
+
+            $eventSemesterId = $event->subject?->semester_id;
+            if ($semesterId !== null && $eventSemesterId !== null && (int) $eventSemesterId !== $semesterId) {
+                continue;
+            }
+
+            $metadata = is_array($event->metadata) ? $event->metadata : [];
+            if ((bool) ($metadata['all_day'] ?? false)) {
+                continue;
+            }
+
+            $eventType = $this->calendarEventType($event);
+            if ($eventType !== 'class') {
+                continue;
+            }
+
+            return $event;
+        }
+
+        return null;
+    }
+
+    private function calendarConflictSemesterId(array $data): ?int
+    {
+        if (! $this->hasColumnSafe((new Subject())->getTable(), 'semester_id')) {
+            return null;
+        }
+
+        $semesterId = $data['semester_id'] ?? null;
+        if ($semesterId === null || $semesterId === '') {
+            return null;
+        }
+
+        return (int) $semesterId;
+    }
+
+    private function calendarScheduleConflictMessage(StudyCalendarEvent $conflict): string
+    {
+        $timezone = config('app.timezone', 'Asia/Bangkok');
+        $title = trim((string) ($conflict->subject?->name ?: $conflict->title));
+        $timeRange = trim(
+            ($conflict->start_time ? $conflict->start_time->copy()->timezone($timezone)->format('H:i') : '')
+            . '-'
+            . ($conflict->end_time ? $conflict->end_time->copy()->timezone($timezone)->format('H:i') : ''),
+            '-'
+        );
+        $detail = $timeRange !== '' ? " เวลา {$timeRange}" : '';
+
+        return "เวลานี้ซ้อนกับวิชา {$title}{$detail} กรุณาเลือกเวลาอื่น เพราะซ้อนกับวิชาอื่น";
+    }
+
+    private function calendarEventType(StudyCalendarEvent $event): string
+    {
+        $metadata = is_array($event->metadata) ? $event->metadata : [];
+        $metadataType = is_string($metadata['type'] ?? null) ? strtolower((string) $metadata['type']) : null;
+        if (in_array($metadataType, ['class', 'exam', 'other'], true)) {
+            return $metadataType;
+        }
+
+        $columnType = is_string($event->event_type ?? null) ? strtolower((string) $event->event_type) : null;
+        if (in_array($columnType, ['class', 'exam', 'other'], true)) {
+            return $columnType;
+        }
+
+        return 'class';
+    }
+
+    private function timeOnlyString(mixed $value): ?string
+    {
+        if ($value instanceof Carbon) {
+            return $value->format('H:i:s');
+        }
+
+        $raw = is_string($value) ? trim($value) : (string) $value;
+        if ($raw === '') {
+            return null;
+        }
+
+        if (str_contains($raw, ' ')) {
+            $raw = explode(' ', $raw)[1] ?? $raw;
+        }
+
+        if (str_contains($raw, 'T')) {
+            $raw = explode('T', $raw)[1] ?? $raw;
+        }
+
+        $raw = str_replace('.', ':', preg_replace('/Z$|[+-]\d{2}:?\d{2}$/', '', $raw) ?? $raw);
+        if (! preg_match('/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/', $raw, $matches)) {
+            return null;
+        }
+
+        return sprintf('%02d:%02d:%02d', (int) $matches[1], (int) $matches[2], (int) ($matches[3] ?? 0));
+    }
+
+    private function formatTimeForMessage(mixed $value): ?string
+    {
+        $time = $this->timeOnlyString($value);
+        if (! $time) {
+            return null;
+        }
+
+        return substr($time, 0, 5);
     }
 
     private function syncSubjectCalendarEvent(Subject $subject, $user, array $data, array $timing): void

@@ -29,7 +29,6 @@ return new class extends Migration
             'lessons',
             'lesson_summaries',
             'mood_logs',
-            'notification_email_logs',
             'quiz_answers',
             'quiz_attempts',
             'quiz_questions',

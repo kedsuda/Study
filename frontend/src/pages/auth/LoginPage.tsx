@@ -464,7 +464,7 @@ export const LoginPage = () => {
     <div className="relative mx-auto w-full max-w-[380px] text-slate-700">
       <div className="text-center">
         <h2 className="text-4xl font-bold text-[#00A1F1] sm:text-5xl">เข้าสู่ระบบ</h2>
-        <p className="mt-2 text-sm text-slate-500">เริ่มต้นการเรียนรู้ไปกับเรา</p>
+
       </div>
 
       <div className="mt-8 space-y-5">

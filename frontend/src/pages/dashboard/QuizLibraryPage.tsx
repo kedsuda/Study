@@ -1,13 +1,15 @@
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { SlidersHorizontal } from 'lucide-react';
-import { Link, useNavigate } from 'react-router-dom';
-import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import { api, apiFallbackClients } from '../../services/api';
+import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker';
+import { ConfirmDialog } from '../../components/ConfirmDialog';
+import { QuizAttemptPage } from './QuizAttemptPage';
+import { api, apiFallbackClients, assetBaseURL } from '../../services/api';
 import { useAppAlert } from '../../context/AppAlertContext';
 import { useAuth } from '../../context/AuthContext';
-import { useSemesterOptions } from '../../hooks/useSemesterOptions';
+import { useDefaultSemesterSelection, useSemesterOptions } from '../../hooks/useSemesterOptions';
 import { filterBySemester, toNumberOrNull } from '../../utils/semester';
 import { subscribeSubjectsUpdated } from '../../utils/subjectSync';
+import { downloadStudyFileBlob, resolveStudyFileUrl } from '../../utils/studyFiles';
 
 interface SubjectOption {
   id: number;
@@ -45,6 +47,43 @@ interface Quiz {
     answered_at: string;
   } | null;
 }
+
+interface QuizSummary {
+  attempt_count: number;
+  attempted_quiz_count: number;
+  average_score: number | null;
+  latest_score: number | null;
+  best_score: number | null;
+  passed_count: number;
+  pass_rate: number | null;
+}
+
+type Difficulty = 'easy' | 'medium' | 'hard';
+type QuestionType = 'multiple_choice' | 'true_false' | 'short_answer';
+
+type StudyFile = {
+  id: number;
+  original_name: string;
+  file_path: string;
+  file_url?: string | null;
+  file_type: string;
+  mime_type?: string | null;
+  file_size?: number | null;
+  created_at?: string | null;
+};
+
+type StudyLogEntry = {
+  id: number;
+  title?: string | null;
+  files?: StudyFile[];
+};
+
+type ConfirmState = {
+  title: string;
+  description: string;
+  confirmLabel: string;
+  onConfirm: () => Promise<void> | void;
+};
 
 const allowedTypes = [
   'application/pdf',
@@ -92,7 +131,9 @@ const normalizeQuizDescription = (value?: string | null) => {
 
 const extractPdfTextInBrowser = async (file: File) => {
   const pdfjs = await import('pdfjs-dist');
-  pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
+  if (!pdfjs.GlobalWorkerOptions.workerPort) {
+    pdfjs.GlobalWorkerOptions.workerPort = new PdfWorker();
+  }
 
   const buffer = await file.arrayBuffer();
   const loadingTask = pdfjs.getDocument({ data: new Uint8Array(buffer) });
@@ -144,6 +185,20 @@ const unwrapCollection = (payload: any) => {
   return [];
 };
 
+const unwrapNestedArray = (value: any) => {
+  if (Array.isArray(value)) return value;
+  if (Array.isArray(value?.data)) return value.data;
+  return [];
+};
+
+const normalizeQuizPayload = (payload: any): Quiz | null => {
+  if (!payload || typeof payload !== 'object') return null;
+  return {
+    ...payload,
+    questions: unwrapNestedArray(payload.questions),
+  };
+};
+
 const toSubjectOption = (item: any): SubjectOption | null => {
   const id = Number(item?.id ?? item?.subject_id);
   const nameCandidate = item?.name ?? item?.subject_name ?? item?.title;
@@ -180,18 +235,42 @@ const stripTrailingEllipsis = (value?: string | null) => {
   return value.replace(/\s*\.\.\.\s*$/, '').trimEnd();
 };
 
+const formatPercent = (value?: number | null) => {
+  if (!Number.isFinite(value)) return '-';
+  return `${Math.round(Number(value))}%`;
+};
+
+const questionTypeOptions: { value: QuestionType; label: string }[] = [
+  { value: 'multiple_choice', label: 'ปรนัย' },
+  { value: 'true_false', label: 'ถูก/ผิด' },
+  { value: 'short_answer', label: 'อัตนัย' },
+];
+
+const difficultyOptions: { value: Difficulty; label: string }[] = [
+  { value: 'easy', label: 'ง่าย' },
+  { value: 'medium', label: 'ปานกลาง' },
+  { value: 'hard', label: 'ยาก' },
+];
+
+const storageBase = assetBaseURL || (api.defaults.baseURL ?? '').replace(/\/api\/?$/, '');
+
 export const QuizLibraryPage = () => {
   const { success, error: showError } = useAppAlert();
   const { user } = useAuth();
-  const navigate = useNavigate();
   const [subjects, setSubjects] = useState<SubjectOption[]>([]);
   const [selectedSemesterKey, setSelectedSemesterKey] = useState('all');
   const [quizzes, setQuizzes] = useState<Quiz[]>([]);
+  const [quizSummary, setQuizSummary] = useState<QuizSummary | null>(null);
   const [selectedSubject, setSelectedSubject] = useState<number | null>(null);
   const [fileTitle, setFileTitle] = useState('');
-  const [fileDifficulty, setFileDifficulty] = useState<'easy' | 'medium' | 'hard'>('medium');
+  const [fileDifficulty, setFileDifficulty] = useState<Difficulty>('medium');
   const [fileQuestionCount, setFileQuestionCount] = useState(5);
+  const [fileQuestionTypes, setFileQuestionTypes] = useState<QuestionType[]>(['multiple_choice']);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [subjectFiles, setSubjectFiles] = useState<StudyFile[]>([]);
+  const [selectedStoredFileId, setSelectedStoredFileId] = useState('');
+  const [isLoadingSubjectFiles, setIsLoadingSubjectFiles] = useState(false);
+  const [isLoadingStoredFile, setIsLoadingStoredFile] = useState(false);
   const [fileStatus, setFileStatus] = useState<string | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
   const [isFileSubmitting, setIsFileSubmitting] = useState(false);
@@ -199,9 +278,14 @@ export const QuizLibraryPage = () => {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewQuiz, setPreviewQuiz] = useState<Quiz | null>(null);
+  const [attemptQuizId, setAttemptQuizId] = useState<number | null>(null);
   const [deletingQuizId, setDeletingQuizId] = useState<number | null>(null);
+  const [confirmState, setConfirmState] = useState<ConfirmState | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   const semesterOptions = useSemesterOptions();
+  useDefaultSemesterSelection(semesterOptions, selectedSemesterKey, setSelectedSemesterKey);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const previewContentRef = useRef<HTMLDivElement | null>(null);
 
   const fileInfo = useMemo(() => {
     if (!selectedFile) return null;
@@ -212,22 +296,14 @@ export const QuizLibraryPage = () => {
     [subjects]
   );
   const filteredSubjects = useMemo(() => filterBySemester(subjects, selectedSemesterKey), [subjects, selectedSemesterKey]);
-  const attemptedQuizCount = useMemo(
-    () => quizzes.filter(quiz => Boolean(quiz.latest_attempt)).length,
-    [quizzes]
-  );
-  const averageScore = useMemo(() => {
-    const attempts = quizzes
-      .map(quiz => quiz.latest_attempt?.percentage)
-      .filter((value): value is number => Number.isFinite(value));
-    if (attempts.length === 0) return null;
-    return Math.round(attempts.reduce((sum, value) => sum + value, 0) / attempts.length);
-  }, [quizzes]);
+  const attemptedQuizCount = quizSummary?.attempt_count ?? 0;
+  const averageScore = quizSummary?.average_score ?? null;
   const selectedSubjectName = useMemo(
     () => (selectedSubject ? subjectNameMap.get(selectedSubject) ?? 'ยังไม่ได้เลือกวิชา' : 'ยังไม่ได้เลือกวิชา'),
     [selectedSubject, subjectNameMap]
   );
   const hasSubjects = filteredSubjects.length > 0;
+  const hasSubjectFiles = subjectFiles.length > 0;
 
   const fetchSubjects = async (cancelledRef?: { current: boolean }) => {
     const requestConfigs =
@@ -293,6 +369,89 @@ export const QuizLibraryPage = () => {
     });
   }, [selectedSubject]);
 
+  useEffect(() => {
+    if (!selectedSubject) {
+      setSubjectFiles([]);
+      setSelectedStoredFileId('');
+      return;
+    }
+
+    let cancelled = false;
+    setIsLoadingSubjectFiles(true);
+    setSelectedStoredFileId('');
+
+    api.get(`/subjects/${selectedSubject}/study-logs`)
+      .then(res => {
+        if (cancelled) return;
+        const logs = unwrapCollection(res.data) as StudyLogEntry[];
+        const files = logs
+          .flatMap(log => (Array.isArray(log.files) ? log.files : []))
+          .filter(file => {
+            const name = typeof file.original_name === 'string' ? file.original_name : '';
+            const ext = name.split('.').pop()?.toLowerCase();
+            return !!ext && allowedExtensions.includes(ext);
+          })
+          .sort((a, b) => new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime());
+
+        setSubjectFiles(files);
+      })
+      .catch(() => {
+        if (!cancelled) setSubjectFiles([]);
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoadingSubjectFiles(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSubject]);
+
+  const fetchQuizSummary = async () => {
+    try {
+      const res = await api.get<QuizSummary>('/quizzes/summary');
+      setQuizSummary(res.data);
+    } catch {
+      setQuizSummary(null);
+    }
+  };
+
+  useEffect(() => {
+    void fetchQuizSummary();
+  }, []);
+
+  useEffect(() => {
+    if (!previewOpen && attemptQuizId === null) return;
+
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (attemptQuizId !== null) {
+        setAttemptQuizId(null);
+        return;
+      }
+      setPreviewOpen(false);
+      setPreviewQuiz(null);
+    };
+
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [attemptQuizId, previewOpen]);
+
+  useEffect(() => {
+    if (!previewOpen) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      previewContentRef.current?.scrollTo({ top: 0, behavior: 'auto' });
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [previewOpen, previewQuiz?.id]);
+
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -303,13 +462,73 @@ export const QuizLibraryPage = () => {
       return;
     }
     setSelectedFile(file);
+    setSelectedStoredFileId('');
     setFileError(null);
     setFileStatus(`เลือกไฟล์แล้ว: ${file.name}`);
     event.target.value = '';
   };
 
-  const handleFileSubmit = async (event: FormEvent) => {
-    event.preventDefault();
+  const toggleQuestionType = (type: QuestionType) => {
+    setFileQuestionTypes(prev => {
+      if (prev.includes(type)) {
+        return prev.length > 1 ? prev.filter(item => item !== type) : prev;
+      }
+      return [...prev, type];
+    });
+  };
+
+  const handleStoredFileSelect = async (event: ChangeEvent<HTMLSelectElement>) => {
+    const fileId = event.target.value;
+    setSelectedStoredFileId(fileId);
+    if (!fileId) return;
+
+    const storedFile = subjectFiles.find(file => String(file.id) === fileId);
+    if (!storedFile) return;
+
+    setIsLoadingStoredFile(true);
+    setFileError(null);
+    setFileStatus(`กำลังดึงไฟล์จากกระเป๋า: ${storedFile.original_name}`);
+
+    try {
+      const downloadedBlob =
+        storedFile.file_path?.startsWith('supabase:')
+          ? await downloadStudyFileBlob(storedFile.file_path)
+          : null;
+
+      const blob = downloadedBlob ?? await fetch(storedFile.file_url || resolveStudyFileUrl(storedFile.file_path, storageBase)).then(response => {
+        if (!response.ok) {
+          throw new Error('ไม่สามารถดาวน์โหลดไฟล์จากกระเป๋าได้');
+        }
+        return response.blob();
+      });
+
+      if (!blob) {
+        throw new Error('ไม่สามารถดาวน์โหลดไฟล์จากกระเป๋าได้');
+      }
+
+      const file = new File([blob], storedFile.original_name, {
+        type: storedFile.mime_type || blob.type || 'application/octet-stream',
+      });
+
+      if (!isAllowedFile(file)) {
+        throw new Error('ไฟล์ในกระเป๋ารายการนี้ไม่ใช่ PDF, DOC, DOCX หรือ TXT');
+      }
+
+      setSelectedFile(file);
+      setFileStatus(`เลือกไฟล์จากกระเป๋าแล้ว: ${storedFile.original_name}`);
+    } catch (error) {
+      setSelectedFile(null);
+      setSelectedStoredFileId('');
+      setFileError(extractErrorMessage(error, 'ไม่สามารถดึงไฟล์จากกระเป๋าได้'));
+      setFileStatus(null);
+    } finally {
+      setIsLoadingStoredFile(false);
+    }
+  };
+
+  const handleFileSubmit = async (event?: FormEvent) => {
+    event?.preventDefault();
+
     if (!selectedSubject) {
       setFileError('กรุณาเลือกวิชาที่ต้องการสร้างแบบฝึกหัดจากเอกสาร');
       setFileStatus(null);
@@ -332,6 +551,9 @@ export const QuizLibraryPage = () => {
     }
     formData.append('difficulty', fileDifficulty);
     formData.append('question_count', String(fileQuestionCount));
+    fileQuestionTypes.forEach(type => {
+      formData.append('question_types[]', type);
+    });
 
     try {
       const fileExtension = selectedFile.name.split('.').pop()?.toLowerCase();
@@ -349,7 +571,8 @@ export const QuizLibraryPage = () => {
       const response = await api.post<Quiz & { message?: string }>(`/subjects/${selectedSubject}/quizzes/from-file`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
-      const fallbackMessage = response.data.metadata?.fallback_message;
+      const createdQuiz = normalizeQuizPayload(response.data) ?? response.data;
+      const fallbackMessage = createdQuiz.metadata?.fallback_message;
       setFileStatus(
         typeof response.data.message === 'string' && response.data.message.trim() !== ''
           ? response.data.message
@@ -357,10 +580,10 @@ export const QuizLibraryPage = () => {
       );
       setSelectedFile(null);
       setFileTitle('');
-      if (selectedSubject === response.data.subject_id) {
-        setQuizzes(prev => [response.data, ...prev]);
+      if (selectedSubject === createdQuiz.subject_id) {
+        setQuizzes(prev => [createdQuiz, ...prev]);
       }
-      navigate(`/quizzes/${response.data.id}`);
+      setAttemptQuizId(createdQuiz.id);
     } catch (error) {
       setFileError(extractErrorMessage(error, 'ไม่สามารถสร้างแบบฝึกหัดจากเอกสารได้'));
       setFileStatus(null);
@@ -376,7 +599,7 @@ export const QuizLibraryPage = () => {
     try {
       const res = await api.get(`/quizzes/${quizId}`);
       const payload = res.data?.data ?? res.data;
-      setPreviewQuiz(payload ?? null);
+      setPreviewQuiz(normalizeQuizPayload(payload));
     } catch (error) {
       setPreviewError(extractErrorMessage(error, 'ไม่สามารถโหลดแบบฝึกหัดจากเอกสารได้'));
       setPreviewQuiz(null);
@@ -385,25 +608,51 @@ export const QuizLibraryPage = () => {
     }
   };
 
-  const deleteQuiz = async (quiz: Quiz) => {
-    const confirmed = window.confirm(`ต้องการลบแบบฝึกหัด "${quiz.title}" ใช่หรือไม่?`);
-    if (!confirmed) return;
+  const openConfirmDialog = (config: { title: string; description: string; confirmLabel: string; onConfirm: () => Promise<void> | void }) => {
+    setConfirmState(config);
+    setConfirmBusy(false);
+  };
 
-    setDeletingQuizId(quiz.id);
-    setPreviewError(null);
+  const handleConfirmDialogCancel = () => {
+    setConfirmState(null);
+    setConfirmBusy(false);
+  };
+
+  const handleConfirmDialogConfirm = async () => {
+    if (!confirmState) return;
+    setConfirmBusy(true);
     try {
-      await api.delete(`/quizzes/${quiz.id}`);
-      setQuizzes(prev => prev.filter(item => item.id !== quiz.id));
-      if (previewQuiz?.id === quiz.id) {
-        setPreviewQuiz(null);
-        setPreviewOpen(false);
-      }
-      success('ลบแบบฝึกหัดเรียบร้อยแล้ว');
-    } catch (error) {
-      showError(extractErrorMessage(error, 'ลบแบบฝึกหัดไม่สำเร็จ'));
+      await confirmState.onConfirm();
     } finally {
-      setDeletingQuizId(null);
+      setConfirmBusy(false);
+      setConfirmState(null);
     }
+  };
+
+  const deleteQuiz = async (quiz: Quiz) => {
+    openConfirmDialog({
+      title: 'ลบแบบฝึกหัด',
+      description: `ต้องการลบแบบฝึกหัด "${quiz.title}" ใช่หรือไม่?`,
+      confirmLabel: 'ลบแบบฝึกหัด',
+      onConfirm: async () => {
+        setDeletingQuizId(quiz.id);
+        setPreviewError(null);
+        try {
+          await api.delete(`/quizzes/${quiz.id}`);
+          setQuizzes(prev => prev.filter(item => item.id !== quiz.id));
+          void fetchQuizSummary();
+          if (previewQuiz?.id === quiz.id) {
+            setPreviewQuiz(null);
+            setPreviewOpen(false);
+          }
+          success('ลบแบบฝึกหัดเรียบร้อยแล้ว');
+        } catch (error) {
+          showError(extractErrorMessage(error, 'ลบแบบฝึกหัดไม่สำเร็จ'));
+        } finally {
+          setDeletingQuizId(null);
+        }
+      },
+    });
   };
 
   const handlePrintQuiz = () => {
@@ -463,13 +712,13 @@ export const QuizLibraryPage = () => {
                 <span className="quiz-hero__label">Practice Studio</span>
                 <div className="space-y-2">
                   <h2 className="text-2xl font-bold leading-tight tracking-[-0.03em] md:text-4xl">
-                    แบบฝึกหัดจากเอกสารที่พร้อมทำทันที
+                    แบบฝึกหัดจากวิชาและเอกสารที่พร้อมทำทันที
                   </h2>
            
                 </div>
                 <div className="flex flex-wrap gap-2 text-xs text-muted md:text-sm">
                   <span className="quiz-hero__chip">วิชาที่เลือก: {selectedSubjectName}</span>
-                  <span className="quiz-hero__chip">แบบฝึกหัดจากเอกสารทั้งหมด {quizzes.length} ชุด</span>
+                  <span className="quiz-hero__chip">แบบฝึกหัดทั้งหมด {quizzes.length} ชุด</span>
                 </div>
               </div>
               <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-1 xl:grid-cols-3">
@@ -478,12 +727,12 @@ export const QuizLibraryPage = () => {
                   <p className="mt-1.5 text-2xl font-bold text-[color:var(--text)]">{filteredSubjects.length}</p>
                 </div>
                 <div className="quiz-stat p-3 md:p-4">
-                  <p className="text-xs uppercase tracking-[0.2em] text-muted">เคยทำแล้ว</p>
+                  <p className="text-xs uppercase tracking-[0.2em] text-muted">ทำแบบฝึกหัดแล้ว</p>
                   <p className="mt-1.5 text-2xl font-bold text-[color:var(--text)]">{attemptedQuizCount}</p>
                 </div>
                 <div className="quiz-stat p-3 md:p-4">
                   <p className="text-xs uppercase tracking-[0.2em] text-muted">คะแนนเฉลี่ย</p>
-                  <p className="mt-1.5 text-2xl font-bold text-[color:var(--text)]">{averageScore !== null ? `${averageScore}%` : '-'}</p>
+                  <p className="mt-1.5 text-2xl font-bold text-[color:var(--text)]">{formatPercent(averageScore)}</p>
                 </div>
               </div>
             </div>
@@ -553,20 +802,14 @@ export const QuizLibraryPage = () => {
                         <div>
                           <label className="mb-1.5 block text-sm font-semibold text-muted">ระดับความยาก</label>
                           <div className="grid w-full grid-cols-3 items-center gap-1 rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] p-1 shadow-sm">
-                            {(
-                              [
-                                { value: 'easy' as const, label: 'ง่าย' },
-                                { value: 'medium' as const, label: 'ปานกลาง' },
-                                { value: 'hard' as const, label: 'ยาก' }
-                              ] as const
-                            ).map(option => {
+                            {difficultyOptions.map(option => {
                               const isActive = fileDifficulty === option.value;
                               return (
                                 <button
                                   key={option.value}
                                   type="button"
                                   onClick={() => setFileDifficulty(option.value)}
-                                  className={`min-w-0 w-full rounded-xl px-2 py-2 text-center text-xs font-semibold leading-none transition sm:px-3 sm:py-2.5 sm:text-sm ${
+                                  className={`min-w-0 w-full whitespace-nowrap rounded-xl px-1.5 py-2 text-center text-[11px] font-semibold leading-none transition sm:px-3 sm:py-2.5 sm:text-sm ${
                                     isActive
                                       ? 'bg-[color:rgba(var(--accent-rgb),0.10)] text-accent shadow-sm'
                                       : 'text-muted hover:bg-[color:var(--surface)] hover:text-[color:var(--text)]'
@@ -590,6 +833,30 @@ export const QuizLibraryPage = () => {
                             value={fileQuestionCount}
                             onChange={event => setFileQuestionCount(Number(event.target.value))}
                           />
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="mb-1.5 block text-sm font-semibold text-muted">ชนิดคำถาม</label>
+                        <div className="grid w-full grid-cols-3 items-center gap-1 rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] p-1 shadow-sm">
+                          {questionTypeOptions.map(option => {
+                            const isActive = fileQuestionTypes.includes(option.value);
+                            return (
+                              <button
+                                key={option.value}
+                                type="button"
+                                onClick={() => toggleQuestionType(option.value)}
+                                className={`min-w-0 w-full rounded-xl px-2 py-2 text-center text-xs font-semibold leading-none transition sm:px-3 sm:py-2.5 sm:text-sm ${
+                                  isActive
+                                    ? 'bg-[color:rgba(var(--accent-rgb),0.10)] text-accent shadow-sm'
+                                    : 'text-muted hover:bg-[color:var(--surface)] hover:text-[color:var(--text)]'
+                                }`}
+                                aria-pressed={isActive}
+                              >
+                                {option.label}
+                              </button>
+                            );
+                          })}
                         </div>
                       </div>
                     </div>
@@ -623,6 +890,29 @@ export const QuizLibraryPage = () => {
                         </p>
 
                         <div className="mt-8 flex flex-col items-center gap-2">
+                          <div className="w-full max-w-sm text-left">
+                            <label className="mb-1.5 block text-xs font-semibold text-muted">ไฟล์ในกระเป๋าของวิชานี้</label>
+                            <select
+                              className="w-full rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] px-4 py-3 text-sm text-[color:var(--text)] shadow-sm outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20"
+                              value={selectedStoredFileId}
+                              onChange={handleStoredFileSelect}
+                              disabled={!selectedSubject || isLoadingSubjectFiles || isLoadingStoredFile || !hasSubjectFiles}
+                            >
+                              <option value="">
+                                {isLoadingSubjectFiles
+                                  ? 'กำลังโหลดไฟล์...'
+                                  : hasSubjectFiles
+                                    ? 'เลือกไฟล์จากกระเป๋า'
+                                    : 'ยังไม่มีไฟล์เอกสารในวิชานี้'}
+                              </option>
+                              {subjectFiles.map(file => (
+                                <option key={file.id} value={file.id}>
+                                  {file.original_name}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
                           <button
                             type="button"
                             onClick={() => fileInputRef.current?.click()}
@@ -667,20 +957,24 @@ export const QuizLibraryPage = () => {
 
                 <button
                   type="submit"
-                  disabled={isFileSubmitting}
+                  disabled={isFileSubmitting || isLoadingStoredFile}
                   className="mb-2 inline-flex w-full items-center justify-center gap-3 rounded-[1.5rem] bg-[color:var(--accent)] px-8 py-4 text-base font-semibold text-[color:var(--on-accent)] shadow-[0_18px_40px_rgba(var(--accent-rgb),0.22)] transition hover:-translate-y-0.5 hover:shadow-glow disabled:cursor-not-allowed disabled:opacity-70 sm:mb-0"
                 >
                   <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth={2}>
                     <path d="M12 2l1.6 6.2L20 10l-6.4 1.8L12 18l-1.6-6.2L4 10l6.4-1.8L12 2Z" strokeLinejoin="round" />
                     <path d="M19 15l.9 3.5L23 20l-3.1.9L19 24l-.9-3.1L15 20l3.1-1.5L19 15Z" strokeLinejoin="round" />
                   </svg>
-                  <span>{isFileSubmitting ? 'กำลังสร้าง...' : 'สร้างแบบฝึกหัดทันที'}</span>
+                  <span>
+                    {isFileSubmitting
+                      ? 'กำลังสร้าง...'
+                      : 'สร้างแบบฝึกหัดจากเอกสาร'}
+                  </span>
                 </button>
               </form>
             </section>
           </div>
 
-          <section className="space-y-4 quiz-fade-in-delayed-2" id="quiz-list">
+          <section className="space-y-4 quiz-fade-in-delayed-2" id="quiz-list" style={{ marginTop: '1rem' }}>
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h3 className="text-2xl font-bold text-[color:var(--text)]">แบบฝึกหัดล่าสุด</h3>
@@ -733,12 +1027,13 @@ export const QuizLibraryPage = () => {
                 >
                   <span>ดูแบบฝึกหัดจากเอกสาร</span>
                 </button>
-                <Link
-                  to={`/quizzes/${quiz.id}`}
+                <button
+                  type="button"
+                  onClick={() => setAttemptQuizId(quiz.id)}
                   className="inline-flex w-fit items-center space-x-2 rounded-full bg-[color:var(--accent)] px-4 py-2 text-sm font-medium text-[color:var(--on-accent)] shadow-soft transition hover:-translate-y-0.5 hover:shadow-glow"
                 >
                   <span>ทำแบบฝึกหัด</span>
-                </Link>
+                </button>
                 <button
                   type="button"
                   onClick={() => void deleteQuiz(quiz)}
@@ -769,23 +1064,23 @@ export const QuizLibraryPage = () => {
         </div>
       </div>
       {previewOpen && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/40 px-4 pb-8 pt-10 backdrop-blur sm:items-center">
-          <div className="w-full max-w-3xl rounded-3xl border border-muted surface p-6 shadow-glow">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-xs uppercase tracking-[0.35em] text-primary/70">Quiz Preview</p>
-                <h3 className="mt-2 text-2xl font-semibold text-[color:var(--text)]">
+        <div className="fixed inset-0 z-[120] flex items-end justify-center overflow-y-auto bg-slate-950/60 px-3 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] pt-6 backdrop-blur-md sm:items-center sm:px-4 sm:pb-8 sm:pt-10">
+          <div className="flex max-h-full w-full max-w-3xl flex-col overflow-hidden rounded-[1.75rem] border border-muted surface p-4 shadow-glow sm:rounded-3xl sm:p-6">
+            <div className="flex shrink-0 flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-primary/80 sm:text-xs sm:tracking-[0.35em]">Quiz Preview</p>
+                <h3 className="mt-2 break-words text-2xl font-bold leading-tight text-[color:var(--text)] sm:text-2xl sm:font-semibold">
                   {previewQuiz?.title ?? 'แบบฝึกหัด'}
                 </h3>
                 {normalizeQuizDescription(previewQuiz?.description) ? (
-                  <p className="mt-1 text-sm text-muted">{normalizeQuizDescription(previewQuiz?.description)}</p>
+                  <p className="mt-2 text-[15px] leading-6 text-muted sm:mt-1 sm:text-sm">{normalizeQuizDescription(previewQuiz?.description)}</p>
                 ) : null}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex shrink-0 items-center gap-2">
                 <button
                   type="button"
                   onClick={handlePrintQuiz}
-                  className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-[color:var(--text)] transition hover:bg-white/10"
+                  className="min-h-10 rounded-full border border-primary/20 bg-primary/10 px-4 py-2 text-xs font-bold leading-tight text-[color:var(--text)] transition hover:bg-primary/15 sm:min-h-0 sm:border-white/10 sm:bg-white/5 sm:px-3 sm:py-1 sm:font-semibold sm:hover:bg-white/10"
                 >
                   พิมพ์แบบฝึกหัด
                 </button>
@@ -795,34 +1090,37 @@ export const QuizLibraryPage = () => {
                     setPreviewOpen(false);
                     setPreviewQuiz(null);
                   }}
-                  className="rounded-full border border-muted surface-2 px-3 py-1 text-xs font-semibold text-muted hover:text-[color:var(--text)]"
+                  className="min-h-10 rounded-full border border-muted surface-2 px-4 py-2 text-xs font-bold text-muted hover:text-[color:var(--text)] sm:min-h-0 sm:px-3 sm:py-1 sm:font-semibold"
                 >
                   ปิด
                 </button>
               </div>
             </div>
 
-            <div className="mt-5 max-h-[60vh] space-y-3 overflow-y-auto pr-2 text-sm text-muted">
+            <div
+              ref={previewContentRef}
+              className="mt-4 min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain pb-1 pr-1 text-[15px] leading-6 text-muted sm:mt-5 sm:pr-2 sm:text-sm sm:leading-normal"
+            >
               {previewLoading ? (
-                <div className="rounded-2xl border border-muted surface-2 px-4 py-6 text-center text-sm text-muted">
+                <div className="rounded-2xl border border-muted surface-2 px-4 py-6 text-center text-[15px] text-muted sm:text-sm">
                   กำลังโหลดแบบฝึกหัดจากเอกสาร...
                 </div>
               ) : previewError ? (
-                <div className="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-500">
+                <div className="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-[15px] text-rose-500 sm:text-sm">
                   {previewError}
                 </div>
               ) : previewQuiz?.questions?.length ? (
                 previewQuiz.questions.map((question, index) => (
-                  <div key={question.id} className="rounded-2xl border border-muted surface-2 px-4 py-4">
-                    <p className="text-xs font-medium uppercase tracking-widest text-muted">ข้อที่ {index + 1}</p>
-                    <p className="mt-2 whitespace-pre-wrap break-words font-medium text-[color:var(--text)]">
+                  <div key={question.id} className="rounded-2xl border border-muted surface-2 px-4 py-4 sm:px-4 sm:py-4">
+                    <p className="text-xs font-bold uppercase tracking-widest text-muted">ข้อที่ {index + 1}</p>
+                    <p className="mt-2 whitespace-pre-wrap break-words text-[15px] font-bold leading-7 text-[color:var(--text)] sm:text-sm sm:font-medium sm:leading-normal">
                       {stripTrailingEllipsis(question.question_text)}
                     </p>
                     {question.question_type === 'multiple_choice' && (
-                      <div className="mt-3 space-y-2 text-sm text-muted">
+                      <div className="mt-3 space-y-2.5 text-[15px] leading-6 text-muted sm:space-y-2 sm:text-sm sm:leading-normal">
                         {(question.options ?? []).map(option => (
                           <div key={option} className="flex items-start gap-2">
-                            <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-primary/60"></span>
+                            <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-primary/70 sm:mt-1"></span>
                             <span className="min-w-0 whitespace-pre-wrap break-words">
                               {stripTrailingEllipsis(option)}
                             </span>
@@ -831,33 +1129,33 @@ export const QuizLibraryPage = () => {
                       </div>
                     )}
                     {question.question_type === 'true_false' && (
-                      <div className="mt-3 flex items-center gap-4 text-sm text-muted">
+                      <div className="mt-3 flex items-center gap-4 text-[15px] text-muted sm:text-sm">
                         <span>ถูก</span>
                         <span>ผิด</span>
                       </div>
                     )}
                     {question.question_type === 'short_answer' && (
-                      <div className="mt-3 rounded-xl border border-dashed border-muted surface px-3 py-3 text-xs text-muted">
+                      <div className="mt-3 rounded-xl border border-dashed border-muted surface px-3 py-3 text-sm text-muted sm:text-xs">
                         คำตอบแบบเขียน
                       </div>
                     )}
                     {question.correct_answer ? (
-                      <div className="mt-3 rounded-xl border border-primary/20 bg-primary/5 px-3 py-2 text-sm text-primary">
-                        <p className="text-xs uppercase tracking-widest text-primary/70">คำตอบ</p>
-                        <p className="mt-1 whitespace-pre-wrap text-[color:var(--text)]">
+                      <div className="mt-3 rounded-xl border border-primary/25 bg-primary/10 px-3 py-3 text-sm text-primary sm:bg-primary/5 sm:py-2">
+                        <p className="text-xs font-bold uppercase tracking-widest text-primary/75 sm:font-normal">คำตอบ</p>
+                        <p className="mt-1 whitespace-pre-wrap break-words text-[15px] font-semibold leading-6 text-[color:var(--text)] sm:text-sm sm:font-normal sm:leading-normal">
                           {stripTrailingEllipsis(question.correct_answer)}
                         </p>
                       </div>
                     ) : null}
                     {question.explanation ? (
-                      <div className="mt-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-muted">
+                      <div className="mt-2 rounded-xl border border-muted bg-white/5 px-3 py-2 text-sm text-muted sm:border-white/10 sm:text-xs">
                         {stripTrailingEllipsis(question.explanation)}
                       </div>
                     ) : null}
                   </div>
                 ))
               ) : (
-                <div className="rounded-2xl border border-dashed border-muted surface-2 px-4 py-6 text-center text-sm text-muted">
+                <div className="rounded-2xl border border-dashed border-muted surface-2 px-4 py-6 text-center text-[15px] text-muted sm:text-sm">
                   ไม่มีคำถามในแบบฝึกหัดนี้
                 </div>
               )}
@@ -865,6 +1163,50 @@ export const QuizLibraryPage = () => {
           </div>
         </div>
       )}
+      {attemptQuizId !== null && (
+        <div
+          className="fixed inset-0 z-[130] flex items-end justify-center bg-slate-950/60 px-3 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] pt-6 backdrop-blur-md sm:items-center sm:px-4 sm:pb-8 sm:pt-10"
+          role="dialog"
+          aria-modal="true"
+          aria-label="ทำแบบฝึกหัด"
+          onMouseDown={event => {
+            if (event.currentTarget === event.target) setAttemptQuizId(null);
+          }}
+        >
+          <div className="relative max-h-full w-full max-w-6xl overflow-y-auto rounded-[1.75rem] border border-muted surface p-3 shadow-glow sm:rounded-3xl sm:p-5">
+            <button
+              type="button"
+              onClick={() => setAttemptQuizId(null)}
+              className="absolute right-4 top-4 z-30 flex h-9 w-9 items-center justify-center rounded-full border border-muted surface-2 text-lg font-semibold text-muted transition hover:text-[color:var(--text)]"
+              aria-label="ปิดแบบฝึกหัด"
+            >
+              ×
+            </button>
+            <QuizAttemptPage
+              quizId={attemptQuizId}
+              embedded
+              onClose={() => setAttemptQuizId(null)}
+              onAttemptComplete={() => {
+                void fetchQuizSummary();
+                if (!selectedSubject) return;
+                api.get(`/subjects/${selectedSubject}/quizzes`).then(res => {
+                  const payload = Array.isArray(res.data) ? res.data : res.data?.data;
+                  setQuizzes(Array.isArray(payload) ? payload : []);
+                });
+              }}
+            />
+          </div>
+        </div>
+      )}
+      <ConfirmDialog
+        isOpen={Boolean(confirmState)}
+        title={confirmState?.title ?? ''}
+        description={confirmState?.description ?? ''}
+        confirmLabel={confirmState?.confirmLabel ?? 'ยืนยัน'}
+        onConfirm={handleConfirmDialogConfirm}
+        onCancel={handleConfirmDialogCancel}
+        busy={confirmBusy}
+      />
     </div>
   );
 };

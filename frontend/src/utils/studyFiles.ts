@@ -10,6 +10,9 @@ type SubjectFolderInput = {
 const bucketName = import.meta.env.VITE_SUPABASE_STORAGE_BUCKET?.trim() || 'bag';
 const supabasePrefix = 'supabase:';
 
+export const isSupabaseStudyFilePath = (filePath?: string | null) =>
+  (filePath || '').trim().startsWith(supabasePrefix);
+
 const formatSupabaseStorageError = (error: {
   message?: string;
   statusCode?: string;
@@ -106,6 +109,26 @@ export const resolveStudyFileUrl = (filePath?: string | null, assetBase?: string
   const path = cleanPath.slice(supabasePrefix.length);
   const { data } = supabase.storage.from(bucketName).getPublicUrl(path);
   return data.publicUrl;
+};
+
+export const downloadStudyFileBlob = async (filePath?: string | null) => {
+  const cleanPath = (filePath || '').trim();
+  if (!cleanPath) {
+    throw new Error('ไม่พบตำแหน่งไฟล์แนบ');
+  }
+
+  if (!cleanPath.startsWith(supabasePrefix)) {
+    return null;
+  }
+
+  const path = cleanPath.slice(supabasePrefix.length);
+  const { data, error } = await supabase.storage.from(bucketName).download(path);
+
+  if (error || !data) {
+    throw new Error(error?.message || 'ดาวน์โหลดไฟล์จาก Supabase ไม่สำเร็จ');
+  }
+
+  return data;
 };
 
 export const uploadStudyFileToSupabase = async ({

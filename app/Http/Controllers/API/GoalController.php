@@ -55,16 +55,12 @@ class GoalController extends Controller
 
         $data = request()->validate([
             'period_type' => ['required', 'in:daily,weekly,monthly'],
-            'target_quiz_sets' => ['nullable', 'integer', 'min:1', 'max:999', 'required_without:target_sessions'],
-            'target_sessions' => ['nullable', 'integer', 'min:1', 'max:999'],
+            'target_quiz_sets' => ['nullable', 'integer', 'min:1', 'max:999', 'required_without_all:target_sessions,target_minutes'],
+            'target_sessions' => ['nullable', 'integer', 'min:1', 'max:999', 'required_without_all:target_quiz_sets,target_minutes'],
+            'target_minutes' => ['nullable', 'integer', 'min:1', 'max:99999', 'required_without_all:target_quiz_sets,target_sessions'],
             'subject_id' => ['nullable', 'integer', 'min:1'],
             'semester_id' => ['nullable', 'integer', 'min:1'],
         ]);
-
-        // Normalize legacy/alternate field name so the rest of the method can use `target_quiz_sets`.
-        if (! isset($data['target_quiz_sets']) && isset($data['target_sessions'])) {
-            $data['target_quiz_sets'] = $data['target_sessions'];
-        }
 
         // extra logging to help debug persistence issues
         try {
@@ -72,6 +68,8 @@ class GoalController extends Controller
                 'user_id' => $user?->id ?? null,
                 'period_type' => $data['period_type'] ?? null,
                 'target_quiz_sets' => $data['target_quiz_sets'] ?? null,
+                'target_sessions' => $data['target_sessions'] ?? null,
+                'target_minutes' => $data['target_minutes'] ?? null,
                 'subject_id' => $data['subject_id'] ?? null,
             ]);
         } catch (\Throwable $e) {
@@ -107,17 +105,60 @@ class GoalController extends Controller
         }
 
         $goalData = $this->extractQuizGoalData($goal, $data['period_type'], $context);
-        $goalData['quest_type'] = 'quiz_mastery';
-        $goalData['target_quiz_sets'] = (int) ($data['target_quiz_sets'] ?? 0);
-        $goalData['target_questions'] = 0;
-        $goalData['target_value'] = (int) $goalData['target_quiz_sets'];
-        $goalData['title'] = $this->buildQuizCountTitle($data['period_type'], $context);
-        $goalData['description'] = $this->buildQuizCountDescription($data['period_type'], $goalData['target_quiz_sets'], $context);
+        $targetSessions = (int) ($data['target_sessions'] ?? 0);
+        $targetMinutes = (int) ($data['target_minutes'] ?? 0);
+        $targetQuizSets = (int) ($data['target_quiz_sets'] ?? 0);
+
+        if ($targetMinutes > 0) {
+            $goalData['quest_type'] = 'study_minutes';
+            $goalData['target_sessions'] = 0;
+            $goalData['target_minutes'] = $targetMinutes;
+            $goalData['target_quiz_sets'] = 0;
+            $goalData['target_questions'] = 0;
+            $goalData['target_value'] = $targetMinutes;
+            $goalData['title'] = $this->buildStudyMinutesGoalTitle($data['period_type'], $context);
+            $goalData['description'] = $this->buildStudyMinutesDescription($data['period_type'], $targetMinutes, $context);
+        } elseif ($targetSessions > 0) {
+            $goalData['quest_type'] = 'study_sessions';
+            $goalData['target_sessions'] = $targetSessions;
+            $goalData['target_minutes'] = 0;
+            $goalData['target_quiz_sets'] = 0;
+            $goalData['target_questions'] = 0;
+            $goalData['target_value'] = $targetSessions;
+            $goalData['title'] = $this->buildActivityGoalTitle($data['period_type'], $context);
+            $goalData['description'] = $this->buildStudySessionsDescription($data['period_type'], $targetSessions, $context);
+        } else {
+            $goalData['quest_type'] = 'quiz_mastery';
+            $goalData['target_sessions'] = 0;
+            $goalData['target_minutes'] = 0;
+            $goalData['target_quiz_sets'] = $targetQuizSets;
+            $goalData['target_questions'] = 0;
+            $goalData['target_value'] = $targetQuizSets;
+            $goalData['title'] = $this->buildQuizCountTitle($data['period_type'], $context);
+            $goalData['description'] = $this->buildQuizCountDescription($data['period_type'], $targetQuizSets, $context);
+        }
+
         $goalData['filter_subject_id'] = isset($data['subject_id']) ? (int) $data['subject_id'] : null;
         $goalData['filter_semester_id'] = isset($data['semester_id']) ? (int) $data['semester_id'] : null;
 
-        $goalStatus = ['status' => 'not_achieved', 'achieved' => false, 'current_value' => 0, 'progress_percent' => 0];
-        $questProgress = ['current_value' => 0, 'progress_percent' => 0];
+        $studyTotals = $this->studyTotals($user, $start, $end, $context);
+        $quizTotals = $this->quizTotals($user, $start, $end, $context);
+        $currentActivities = (int) $studyTotals['study_sessions'] + (int) $quizTotals['quiz_sets'];
+        $goalStatus = $this->resolveGoalStatus(
+            $goalData,
+            $currentActivities,
+            (int) $studyTotals['study_minutes'],
+            (int) $quizTotals['question_count'],
+            (int) $quizTotals['quiz_sets']
+        );
+        $questProgress = $this->resolveQuestProgress(
+            $goalData['quest_type'],
+            $currentActivities,
+            (int) $studyTotals['study_minutes'],
+            (int) $quizTotals['question_count'],
+            (int) $quizTotals['quiz_sets'],
+            $goalData['target_value']
+        );
 
         $saved = $this->persistQuestState(
             $user,
@@ -130,9 +171,11 @@ class GoalController extends Controller
             $questProgress
         );
 
+        $summary = $this->buildSummary($user, $start, $end, $data['period_type'], $context);
+
         return response()->json([
-            'message' => 'อัปเดตเป้าหมายแบบทดสอบเรียบร้อยแล้ว',
-            'goal' => $saved,
+            'message' => 'อัปเดตเป้าหมายเรียบร้อยแล้ว',
+            'goal' => $summary['goal'] ?? $saved,
         ]);
     }
 
@@ -198,37 +241,17 @@ class GoalController extends Controller
 
         $goalData = $this->extractQuizGoalData($goal, $periodType, $context);
 
-        if (! Schema::hasTable('quiz_attempts') || ! Schema::hasTable('quizzes') || ! Schema::hasTable('subjects')) {
-            return $this->emptySummary($start, $end, $periodType, $goalData);
-        }
+        $studyTotals = $this->studyTotals($user, $start, $end, $context);
+        $quizTotals = $this->quizTotals($user, $start, $end, $context);
+        $subjects = $this->subjectProgress($user, $start, $end, $context);
 
-        $baseQuery = DB::table('quiz_attempts')
-            ->join('quizzes', 'quiz_attempts.quiz_id', '=', 'quizzes.id')
-            ->join('subjects', 'quizzes.subject_id', '=', 'subjects.id')
-            ->where('quiz_attempts.user_id', $user->id)
-            ->where('subjects.user_id', $user->id)
-            ->whereBetween('quiz_attempts.created_at', [$start->toDateTimeString(), $end->toDateTimeString()]);
-
-        if (!empty($context['filter_subject_id'])) {
-            $baseQuery->where('subjects.id', (int) $context['filter_subject_id']);
-        } elseif (!empty($context['filter_semester_id'])) {
-            $baseQuery->where('subjects.semester_id', (int) $context['filter_semester_id']);
-        }
-
-        $totals = (clone $baseQuery)
-            ->selectRaw('COUNT(*) as quiz_sets, COALESCE(SUM(JSON_LENGTH(quiz_attempts.answers)), 0) as question_count')
-            ->first();
-
-        $subjects = (clone $baseQuery)
-            ->selectRaw('subjects.id as subject_id, subjects.name as subject_name, COUNT(*) as quiz_sets, COALESCE(SUM(JSON_LENGTH(quiz_attempts.answers)), 0) as question_count')
-            ->groupBy('subjects.id', 'subjects.name')
-            ->orderByDesc('question_count')
-            ->get();
-
-        $currentQuestions = (int) ($totals->question_count ?? 0);
-        $currentQuizSets = (int) ($totals->quiz_sets ?? 0);
-        $goalStatus = $this->resolveQuizGoalStatus($currentQuestions, $goalData['target_questions'], $currentQuizSets, $goalData['target_quiz_sets']);
-        $questProgress = $this->resolveQuestProgress($goalData['quest_type'], $currentQuestions, $currentQuizSets, $goalData['target_value']);
+        $currentSessions = (int) $studyTotals['study_sessions'];
+        $currentMinutes = (int) $studyTotals['study_minutes'];
+        $currentQuestions = (int) $quizTotals['question_count'];
+        $currentQuizSets = (int) $quizTotals['quiz_sets'];
+        $currentActivities = $currentSessions + $currentQuizSets;
+        $goalStatus = $this->resolveGoalStatus($goalData, $currentActivities, $currentMinutes, $currentQuestions, $currentQuizSets);
+        $questProgress = $this->resolveQuestProgress($goalData['quest_type'], $currentActivities, $currentMinutes, $currentQuestions, $currentQuizSets, $goalData['target_value']);
 
         $goal = $this->persistQuestState(
             $user,
@@ -245,19 +268,24 @@ class GoalController extends Controller
             'period_type' => $periodType,
             'period_start' => $start->toIso8601String(),
             'period_end' => $end->toIso8601String(),
-            'total_sessions' => $currentQuizSets,
-            'total_minutes' => 0,
+            'total_activities' => $currentActivities,
+            'total_sessions' => $currentSessions,
+            'total_minutes' => $currentMinutes,
             'total_quiz_sets' => $currentQuizSets,
             'total_questions' => $currentQuestions,
             'subjects' => $subjects,
             'goal' => [
-                'goal_type' => 'quiz_practice',
+                'goal_type' => $goalData['quest_type'],
                 'target_value' => $goalData['target_value'],
                 'current_value' => $questProgress['current_value'],
-                'target_sessions' => $goalData['target_quiz_sets'],
-                'target_minutes' => null,
-                'target_questions' => 0,
+                'mission_count' => $questProgress['current_value'],
+                'target_sessions' => $goalData['target_sessions'],
+                'target_minutes' => $goalData['target_minutes'],
+                'target_questions' => $goalData['target_questions'],
                 'target_quiz_sets' => $goalData['target_quiz_sets'],
+                'current_activities' => $currentActivities,
+                'current_sessions' => $currentSessions,
+                'current_minutes' => $currentMinutes,
                 'current_questions' => $currentQuestions,
                 'current_quiz_sets' => $currentQuizSets,
                 'progress_percent' => $goalStatus['progress_percent'],
@@ -273,6 +301,7 @@ class GoalController extends Controller
                 'status' => $goalStatus['achieved'] ? 'completed' : 'pending',
                 'target_value' => $goalData['target_value'],
                 'current_value' => $questProgress['current_value'],
+                'mission_count' => $questProgress['current_value'],
                 'progress_percent' => $questProgress['progress_percent'],
                 'focus_subject_id' => $goalData['focus_subject_id'],
                 'focus_subject_name' => $goalData['focus_subject_name'],
@@ -281,7 +310,7 @@ class GoalController extends Controller
                 'celebration_message' => $goalStatus['achieved']
                     ? sprintf('ภารกิจสำเร็จแล้ว +%d แต้ม', $goalData['reward_points'])
                     : 'ลุยต่ออีกนิด ภารกิจนี้ใกล้สำเร็จแล้ว',
-                'cta_path' => '/quizzes',
+                'cta_path' => $goalData['quest_type'] === 'quiz_mastery' ? '/quizzes' : '/subjects',
             ],
         ];
     }
@@ -314,25 +343,70 @@ class GoalController extends Controller
         ];
     }
 
+    private function resolveGoalStatus(
+        array $goalData,
+        int $currentActivities,
+        int $currentMinutes,
+        int $currentQuestions,
+        int $currentQuizSets
+    ): array {
+        return match ($goalData['quest_type']) {
+            'study_sessions' => $this->resolveSingleMetricGoalStatus($currentActivities, (int) $goalData['target_sessions']),
+            'study_minutes' => $this->resolveSingleMetricGoalStatus($currentMinutes, (int) $goalData['target_minutes']),
+            default => $this->resolveQuizGoalStatus(
+                $currentQuestions,
+                (int) $goalData['target_questions'],
+                $currentQuizSets,
+                (int) $goalData['target_quiz_sets']
+            ),
+        };
+    }
+
+    private function resolveSingleMetricGoalStatus(int $currentValue, int $targetValue): array
+    {
+        if ($targetValue <= 0) {
+            return [
+                'status' => 'not_set',
+                'achieved' => false,
+                'current_value' => $currentValue,
+                'progress_percent' => 0,
+            ];
+        }
+
+        $progress = max(0, min(100, (int) round(($currentValue / $targetValue) * 100)));
+
+        return [
+            'status' => $currentValue >= $targetValue ? 'achieved' : 'not_achieved',
+            'achieved' => $currentValue >= $targetValue,
+            'current_value' => $currentValue,
+            'progress_percent' => $progress,
+        ];
+    }
+
     private function emptySummary(Carbon $start, Carbon $end, string $periodType, array $goalData): array
     {
         return [
             'period_type' => $periodType,
             'period_start' => $start->toIso8601String(),
             'period_end' => $end->toIso8601String(),
+            'total_activities' => 0,
             'total_sessions' => 0,
             'total_minutes' => 0,
             'total_quiz_sets' => 0,
             'total_questions' => 0,
             'subjects' => [],
             'goal' => [
-                'goal_type' => 'quiz_practice',
+                'goal_type' => $goalData['quest_type'],
                 'target_value' => $goalData['target_value'],
                 'current_value' => 0,
-                'target_sessions' => $goalData['target_quiz_sets'],
-                'target_minutes' => null,
-                'target_questions' => 0,
+                'mission_count' => 0,
+                'target_sessions' => $goalData['target_sessions'],
+                'target_minutes' => $goalData['target_minutes'],
+                'target_questions' => $goalData['target_questions'],
                 'target_quiz_sets' => $goalData['target_quiz_sets'],
+                'current_activities' => 0,
+                'current_sessions' => 0,
+                'current_minutes' => 0,
                 'current_questions' => 0,
                 'current_quiz_sets' => 0,
                 'progress_percent' => 0,
@@ -348,13 +422,14 @@ class GoalController extends Controller
                 'status' => 'pending',
                 'target_value' => $goalData['target_value'],
                 'current_value' => 0,
+                'mission_count' => 0,
                 'progress_percent' => 0,
                 'focus_subject_id' => $goalData['focus_subject_id'],
                 'focus_subject_name' => $goalData['focus_subject_name'],
                 'focus_lesson_title' => $goalData['focus_lesson_title'],
                 'focus_quiz_title' => $goalData['focus_quiz_title'],
                 'celebration_message' => sprintf('ภารกิจสำเร็จแล้ว +%d แต้ม', $goalData['reward_points']),
-                'cta_path' => '/quizzes',
+                'cta_path' => $goalData['quest_type'] === 'quiz_mastery' ? '/quizzes' : '/subjects',
             ],
         ];
     }
@@ -439,25 +514,56 @@ class GoalController extends Controller
         $sameFilter = $sameSubjectFilter && $sameSemesterFilter;
         $titleAndDescription = $this->buildQuestTitleAndDescription($periodType, $context);
 
-        $targetQuestions = $sameFilter ? $this->readGoalInt($goal, ['target_minutes', 'target_questions'], 0) : 0;
-        $targetQuizSets = $sameFilter ? $this->readGoalInt($goal, ['target_sessions', 'target_quiz_sets'], 0) : 0;
+        $questType = $sameFilter ? ($this->readGoalString($goal, ['quest_type']) ?: 'quiz_mastery') : 'quiz_mastery';
+        $targetSessions = $sameFilter ? $this->readGoalInt($goal, ['target_sessions'], 0) : 0;
+        $targetMinutes = $sameFilter ? $this->readGoalInt($goal, ['target_minutes'], 0) : 0;
+        $targetQuestions = $sameFilter ? $this->readGoalInt($goal, ['target_questions'], 0) : 0;
+        $targetQuizSets = $sameFilter ? $this->readGoalInt($goal, ['target_quiz_sets'], 0) : 0;
         $targetValue = $sameFilter ? $this->readGoalInt($goal, ['target_value'], 0) : 0;
         $rewardPoints = $sameFilter ? $this->readGoalInt($goal, ['reward_points'], 0) : 0;
 
-        $questType = $sameFilter ? ($this->readGoalString($goal, ['quest_type']) ?: 'quiz_mastery') : 'quiz_mastery';
+        if ($questType === 'quiz_mastery' && $targetQuizSets <= 0) {
+            $targetQuizSets = $targetValue > 0 ? $targetValue : $targetSessions;
+            $targetSessions = 0;
+            $targetMinutes = 0;
+        } elseif ($questType === 'study_minutes' && $targetMinutes <= 0) {
+            $targetMinutes = $targetValue;
+            $targetSessions = 0;
+            $targetQuizSets = 0;
+        } elseif ($questType === 'study_sessions' && $targetSessions <= 0) {
+            $targetSessions = $targetValue;
+            $targetMinutes = 0;
+            $targetQuizSets = 0;
+        }
+
         if ($targetValue <= 0) {
-            $targetValue = $questType === 'quiz_mastery' ? $targetQuizSets : $targetQuestions;
+            $targetValue = match ($questType) {
+                'study_sessions' => $targetSessions,
+                'study_minutes' => $targetMinutes,
+                default => $targetQuizSets,
+            };
         }
 
         if ($rewardPoints <= 0) {
             $rewardPoints = $defaults['reward_points'];
         }
 
+        $title = $this->readGoalString($goal, ['title']) ?: $titleAndDescription['title'];
+        if ($questType === 'study_sessions') {
+            // The metric is the number of completed learning activities, not study time.
+            // Rebuild the title so legacy rows also receive the accurate name on load.
+            $title = $this->buildActivityGoalTitle($periodType, $context);
+        } elseif ($questType === 'study_minutes') {
+            $title = $this->buildStudyMinutesGoalTitle($periodType, $context);
+        }
+
         return [
             'quest_type' => $questType,
-            'title' => $this->readGoalString($goal, ['title']) ?: $titleAndDescription['title'],
+            'title' => $title,
             'description' => $titleAndDescription['description'],
             'target_value' => $targetValue,
+            'target_sessions' => $targetSessions,
+            'target_minutes' => $targetMinutes,
             'target_questions' => $targetQuestions,
             'target_quiz_sets' => $targetQuizSets,
             'reward_points' => $rewardPoints,
@@ -502,9 +608,20 @@ class GoalController extends Controller
         };
     }
 
-    private function resolveQuestProgress(string $questType, int $currentQuestions, int $currentQuizSets, int $targetValue): array
+    private function resolveQuestProgress(
+        string $questType,
+        int $currentActivities,
+        int $currentMinutes,
+        int $currentQuestions,
+        int $currentQuizSets,
+        int $targetValue
+    ): array
     {
-        $currentValue = $questType === 'quiz_mastery' ? $currentQuizSets : $currentQuestions;
+        $currentValue = match ($questType) {
+            'study_sessions' => $currentActivities,
+            'study_minutes' => $currentMinutes,
+            default => $currentQuizSets,
+        };
         $progressPercent = $targetValue > 0
             ? max(0, min(100, (int) round(($currentValue / $targetValue) * 100)))
             : 0;
@@ -513,6 +630,137 @@ class GoalController extends Controller
             'current_value' => $currentValue,
             'progress_percent' => $progressPercent,
         ];
+    }
+
+    private function studyTotals(User $user, Carbon $start, Carbon $end, array $context): array
+    {
+        if (! Schema::hasTable('study_logs') || ! Schema::hasTable('subjects')) {
+            return ['study_sessions' => 0, 'study_minutes' => 0];
+        }
+
+        $query = DB::table('study_logs')
+            ->join('subjects', 'study_logs.subject_id', '=', 'subjects.id')
+            ->where('subjects.user_id', $user->id)
+            ->whereBetween('study_logs.log_date', [$start->toDateTimeString(), $end->toDateTimeString()]);
+
+        $this->applySubjectContext($query, $context);
+
+        $row = $query
+            ->selectRaw('COUNT(DISTINCT study_logs.id) as study_sessions, COALESCE(SUM(study_logs.duration_minutes), 0) as study_minutes')
+            ->first();
+
+        return [
+            'study_sessions' => (int) ($row->study_sessions ?? 0),
+            'study_minutes' => (int) ($row->study_minutes ?? 0),
+        ];
+    }
+
+    private function quizTotals(User $user, Carbon $start, Carbon $end, array $context): array
+    {
+        if (! Schema::hasTable('quiz_attempts') || ! Schema::hasTable('quizzes') || ! Schema::hasTable('subjects')) {
+            return ['quiz_sets' => 0, 'question_count' => 0];
+        }
+
+        $query = $this->baseQuizQuery($user, $start, $end, $context);
+        $questionCountSql = $this->questionCountSql($query);
+        $row = $query
+            ->selectRaw("COUNT(DISTINCT quiz_attempts.id) as quiz_sets, {$questionCountSql} as question_count")
+            ->first();
+
+        return [
+            'quiz_sets' => (int) ($row->quiz_sets ?? 0),
+            'question_count' => (int) ($row->question_count ?? 0),
+        ];
+    }
+
+    private function subjectProgress(User $user, Carbon $start, Carbon $end, array $context): array
+    {
+        if (! Schema::hasTable('subjects')) {
+            return [];
+        }
+
+        $studyRows = collect();
+        if (Schema::hasTable('study_logs')) {
+            $studyQuery = DB::table('study_logs')
+                ->join('subjects', 'study_logs.subject_id', '=', 'subjects.id')
+                ->where('subjects.user_id', $user->id)
+                ->whereBetween('study_logs.log_date', [$start->toDateTimeString(), $end->toDateTimeString()]);
+
+            $this->applySubjectContext($studyQuery, $context);
+
+            $studyRows = $studyQuery
+                ->selectRaw('subjects.id as subject_id, subjects.name as subject_name, COUNT(DISTINCT study_logs.id) as study_sessions, COALESCE(SUM(study_logs.duration_minutes), 0) as study_minutes')
+                ->groupBy('subjects.id', 'subjects.name')
+                ->get()
+                ->keyBy('subject_id');
+        }
+
+        $quizRows = collect();
+        if (Schema::hasTable('quiz_attempts') && Schema::hasTable('quizzes')) {
+            $quizQuery = $this->baseQuizQuery($user, $start, $end, $context);
+            $questionCountSql = $this->questionCountSql($quizQuery);
+            $quizRows = $quizQuery
+                ->selectRaw("subjects.id as subject_id, subjects.name as subject_name, COUNT(DISTINCT quiz_attempts.id) as quiz_sets, {$questionCountSql} as question_count")
+                ->groupBy('subjects.id', 'subjects.name')
+                ->get()
+                ->keyBy('subject_id');
+        }
+
+        return $studyRows
+            ->keys()
+            ->merge($quizRows->keys())
+            ->unique()
+            ->map(function ($subjectId) use ($studyRows, $quizRows) {
+                $study = $studyRows->get($subjectId);
+                $quiz = $quizRows->get($subjectId);
+
+                return [
+                    'subject_id' => (int) $subjectId,
+                    'subject_name' => (string) ($study->subject_name ?? $quiz->subject_name ?? 'ไม่ระบุวิชา'),
+                    'activity_count' => (int) ($study->study_sessions ?? 0) + (int) ($quiz->quiz_sets ?? 0),
+                    'study_sessions' => (int) ($study->study_sessions ?? 0),
+                    'study_minutes' => (int) ($study->study_minutes ?? 0),
+                    'quiz_sets' => (int) ($quiz->quiz_sets ?? 0),
+                    'question_count' => (int) ($quiz->question_count ?? 0),
+                ];
+            })
+            ->sortByDesc(fn ($item) => $item['activity_count'])
+            ->values()
+            ->all();
+    }
+
+    private function baseQuizQuery(User $user, Carbon $start, Carbon $end, array $context)
+    {
+        $query = DB::table('quiz_attempts')
+            ->join('quizzes', 'quiz_attempts.quiz_id', '=', 'quizzes.id')
+            ->join('subjects', 'quizzes.subject_id', '=', 'subjects.id')
+            ->where('quiz_attempts.user_id', $user->id)
+            ->where('subjects.user_id', $user->id)
+            ->whereBetween('quiz_attempts.created_at', [$start->toDateTimeString(), $end->toDateTimeString()]);
+
+        $this->applySubjectContext($query, $context);
+
+        return $query;
+    }
+
+    private function questionCountSql($query): string
+    {
+        if (Schema::hasTable('quiz_questions')) {
+            $query->leftJoin('quiz_questions', 'quiz_questions.quiz_id', '=', 'quizzes.id');
+
+            return 'COUNT(quiz_questions.id)';
+        }
+
+        return 'COALESCE(SUM(JSON_LENGTH(quiz_attempts.answers)), 0)';
+    }
+
+    private function applySubjectContext($query, array $context): void
+    {
+        if (!empty($context['filter_subject_id'])) {
+            $query->where('subjects.id', (int) $context['filter_subject_id']);
+        } elseif (!empty($context['filter_semester_id'])) {
+            $query->where('subjects.semester_id', (int) $context['filter_semester_id']);
+        }
     }
 
     private function persistQuestState(
@@ -527,6 +775,17 @@ class GoalController extends Controller
     ): ?LearningGoalTarget {
         if (! Schema::hasTable((new LearningGoalTarget())->getTable())) {
             return $goal;
+        }
+
+        if (
+            ! $goal
+            && $goalData['target_value'] <= 0
+            && $goalData['target_sessions'] <= 0
+            && $goalData['target_minutes'] <= 0
+            && $goalData['target_quiz_sets'] <= 0
+            && $goalData['target_questions'] <= 0
+        ) {
+            return null;
         }
 
         $attributes = [
@@ -576,6 +835,10 @@ class GoalController extends Controller
             $payload['current_value'] = $questProgress['current_value'];
         }
 
+        if ($this->goalTableHasColumn('mission_count')) {
+            $payload['mission_count'] = $questProgress['current_value'];
+        }
+
         if ($this->goalTableHasColumn('reward_points')) {
             $payload['reward_points'] = $goalData['reward_points'];
         }
@@ -585,11 +848,11 @@ class GoalController extends Controller
         }
 
         if ($this->goalTableHasColumn('target_sessions')) {
-            $payload['target_sessions'] = $goalData['target_quiz_sets'];
+            $payload['target_sessions'] = $goalData['target_sessions'];
         }
 
         if ($this->goalTableHasColumn('target_minutes')) {
-            $payload['target_minutes'] = $goalData['target_questions'];
+            $payload['target_minutes'] = $goalData['target_minutes'];
         }
 
         if ($this->goalTableHasColumn('target_questions')) {
@@ -609,6 +872,8 @@ class GoalController extends Controller
                 'focus_quiz_title' => $goalData['focus_quiz_title'],
                 'filter_subject_id' => $goalData['filter_subject_id'] ?? null,
                 'filter_semester_id' => $goalData['filter_semester_id'] ?? null,
+                'target_questions' => $goalData['target_questions'],
+                'target_quiz_sets' => $goalData['target_quiz_sets'],
                 'progress_percent' => $questProgress['progress_percent'],
             ];
         }
@@ -707,6 +972,55 @@ class GoalController extends Controller
             'weekly' => "ทำแบบทดสอบของ {$subjectName} ให้ครบ {$targetQuizSets} ชุดภายในสัปดาห์นี้",
             'monthly' => "ทำแบบทดสอบของ {$subjectName} ให้ครบ {$targetQuizSets} ชุดภายในเดือนนี้",
             default => "ทำแบบทดสอบของ {$subjectName} ให้ครบ {$targetQuizSets} ชุด",
+        };
+    }
+
+    private function buildActivityGoalTitle(string $periodType, array $context): string
+    {
+        $subjectName = $context['focus_subject_name'] ?: 'วิชาที่กำลังเรียน';
+
+        return match ($periodType) {
+            'daily' => "เป้าหมายกิจกรรมการเรียนวันนี้ของ {$subjectName}",
+            'weekly' => "เป้าหมายกิจกรรมการเรียนสัปดาห์นี้ของ {$subjectName}",
+            'monthly' => "เป้าหมายกิจกรรมการเรียนเดือนนี้ของ {$subjectName}",
+            default => "เป้าหมายกิจกรรมการเรียนของ {$subjectName}",
+        };
+    }
+
+    private function buildStudyMinutesGoalTitle(string $periodType, array $context): string
+    {
+        $subjectName = $context['focus_subject_name'] ?: 'วิชาที่กำลังเรียน';
+
+        return match ($periodType) {
+            'daily' => "เป้าหมายเวลาเรียนวันนี้ของ {$subjectName}",
+            'weekly' => "เป้าหมายเวลาเรียนสัปดาห์นี้ของ {$subjectName}",
+            'monthly' => "เป้าหมายเวลาเรียนเดือนนี้ของ {$subjectName}",
+            default => "เป้าหมายเวลาเรียนของ {$subjectName}",
+        };
+    }
+
+    private function buildStudySessionsDescription(string $periodType, int $targetSessions, array $context): string
+    {
+        $subjectName = $context['focus_subject_name'] ?: 'วิชาที่กำลังเรียน';
+
+        return match ($periodType) {
+            'daily' => "ทำกิจกรรมการเรียนของ {$subjectName} ให้ครบ {$targetSessions} กิจกรรมภายในวันนี้",
+            'weekly' => "ทำกิจกรรมการเรียนของ {$subjectName} ให้ครบ {$targetSessions} กิจกรรมภายในสัปดาห์นี้",
+            'monthly' => "ทำกิจกรรมการเรียนของ {$subjectName} ให้ครบ {$targetSessions} กิจกรรมภายในเดือนนี้",
+            default => "ทำกิจกรรมการเรียนของ {$subjectName} ให้ครบ {$targetSessions} กิจกรรม",
+        };
+    }
+
+    private function buildStudyMinutesDescription(string $periodType, int $targetMinutes, array $context): string
+    {
+        $subjectName = $context['focus_subject_name'] ?: 'วิชาที่กำลังเรียน';
+        $hours = round($targetMinutes / 60, 1);
+
+        return match ($periodType) {
+            'daily' => "เรียน {$subjectName} ให้ครบ {$hours} ชั่วโมงภายในวันนี้",
+            'weekly' => "เรียน {$subjectName} ให้ครบ {$hours} ชั่วโมงภายในสัปดาห์นี้",
+            'monthly' => "เรียน {$subjectName} ให้ครบ {$hours} ชั่วโมงภายในเดือนนี้",
+            default => "เรียน {$subjectName} ให้ครบ {$hours} ชั่วโมง",
         };
     }
 }

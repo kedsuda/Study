@@ -74,11 +74,16 @@ class CareerAdvisorController extends Controller
     public function analyze(Request $request): JsonResponse
     {
         $user = $request->user();
+        $analysisGeneratedAt = now()->toDateTimeString();
+        $analysisRunId = (string) Str::uuid();
+        $analysisProvider = $this->careerProviderLabel();
         $topSubjects = $this->topSubjects($user->id);
         $weakSubjects = $this->weakSubjects($user->id, collect($topSubjects)->pluck('id')->all());
         $latestQuiz = $this->latestQuizAttempt($user->id);
         $latestQuizAnalysis = $this->latestQuizAnalysis($user->id);
-        $subjectProfiles = $this->buildSubjectProfiles($topSubjects);
+        // Include every completed exercise across all subjects, rather than only
+        // the latest attempt, so the analysis represents sustained performance.
+        $subjectProfiles = $this->buildAllQuizSubjectProfiles($user->id);
 
         if ($subjectProfiles === []) {
             $this->clearRecommendations($user->id);
@@ -89,7 +94,10 @@ class CareerAdvisorController extends Controller
                 'latest_quiz' => $latestQuiz,
                 'latest_quiz_analysis' => $latestQuizAnalysis,
                 'recommendations' => [],
-                'message' => 'ยังไม่มีคะแนนแบบฝึกหัดเพียงพอ กรุณาทำแบบฝึกหัดก่อนเพื่อให้ระบบวิเคราะห์อาชีพได้',
+                'analysis_provider' => $analysisProvider,
+                'analysis_generated_at' => $analysisGeneratedAt,
+                'analysis_run_id' => $analysisRunId,
+                'message' => 'ยังไม่มีผลแบบฝึกหัดเพียงพอ กรุณาทำแบบฝึกหัดก่อนเพื่อให้ระบบวิเคราะห์อาชีพได้',
             ]);
         }
 
@@ -112,9 +120,15 @@ class CareerAdvisorController extends Controller
 
         if ($recommendations === []) {
             $this->clearRecommendations($user->id);
-            $message = $message ?: 'AI ยังไม่สามารถวิเคราะห์อาชีพจากคะแนนแบบฝึกหัดจริงได้ หรือข้อมูลคะแนนยังไม่เพียงพอ';
+            $message = $message ?: 'AI ยังไม่สามารถวิเคราะห์อาชีพจากผลแบบฝึกหัดทั้งหมดได้ หรือข้อมูลคะแนนยังไม่เพียงพอ';
         } else {
-            $this->storeRecommendations($user, $topSubjects, $recommendations);
+            $recommendations = $this->attachAnalysisMetadata($recommendations, [
+                'analysis_provider' => $analysisProvider,
+                'analysis_generated_at' => $analysisGeneratedAt,
+                'analysis_run_id' => $analysisRunId,
+                'latest_quiz_created_at' => $latestQuiz['created_at'] ?? null,
+            ]);
+            $this->storeRecommendations($user, collect($subjectProfiles), $recommendations);
         }
 
         return response()->json([
@@ -123,8 +137,24 @@ class CareerAdvisorController extends Controller
             'latest_quiz' => $latestQuiz,
             'latest_quiz_analysis' => $latestQuizAnalysis,
             'recommendations' => $recommendations,
+            'analysis_provider' => $analysisProvider,
+            'analysis_generated_at' => $analysisGeneratedAt,
+            'analysis_run_id' => $analysisRunId,
             'message' => $message,
         ]);
+    }
+
+    /**
+     * @param  array<int, array<string,mixed>>  $recommendations
+     * @param  array<string,mixed>  $metadata
+     * @return array<int, array<string,mixed>>
+     */
+    private function attachAnalysisMetadata(array $recommendations, array $metadata): array
+    {
+        return collect($recommendations)
+            ->map(fn (array $recommendation) => array_merge($recommendation, $metadata))
+            ->values()
+            ->all();
     }
 
     private function topSubjects(int $userId): Collection
@@ -330,6 +360,51 @@ class CareerAdvisorController extends Controller
             ->all();
     }
 
+    private function buildLatestQuizSubjectProfiles(int $userId, ?array $latestQuiz): array
+    {
+        $latestSubjectId = (int) ($latestQuiz['subject_id'] ?? 0);
+        $latestTotal = (int) ($latestQuiz['total'] ?? 0);
+        if ($latestSubjectId <= 0 || $latestTotal <= 0) {
+            return [];
+        }
+
+        $profiles = $this->buildSubjectProfiles(
+            $this->subjectStats($userId)
+                ->filter(fn (array $subject) => (int) ($subject['id'] ?? 0) === $latestSubjectId)
+                ->values()
+        );
+
+        if ($profiles !== []) {
+            return $profiles;
+        }
+
+        $latestScore = (float) ($latestQuiz['percentage'] ?? 0);
+
+        return [[
+            'id' => $latestSubjectId,
+            'name' => (string) ($latestQuiz['subject_name'] ?? ''),
+            'quiz_attempt_count' => 1,
+            'avg_quiz_score' => $latestScore,
+            'latest_quiz_score' => $latestScore,
+            'max_quiz_score' => $latestScore,
+            'passed_count' => ! empty($latestQuiz['passed']) ? 1 : 0,
+            'pass_rate' => ! empty($latestQuiz['passed']) ? 100.0 : 0.0,
+            'skill_level' => $latestScore >= 80
+                ? 'ถนัดมากจากคะแนนแบบฝึกหัดล่าสุด'
+                : ($latestScore >= 60 ? 'มีพื้นฐานจากคะแนนแบบฝึกหัดล่าสุด' : 'ควรพัฒนาจากคะแนนแบบฝึกหัดล่าสุด'),
+        ]];
+    }
+
+    private function buildAllQuizSubjectProfiles(int $userId): array
+    {
+        return $this->buildSubjectProfiles(
+            $this->subjectStats($userId)
+                ->filter(fn (array $subject) => (int) ($subject['quiz_attempt_count'] ?? 0) > 0)
+                ->sortByDesc(fn (array $subject) => (int) ($subject['quiz_attempt_count'] ?? 0))
+                ->values()
+        );
+    }
+
     private function latestQuizAttempt(int $userId): ?array
     {
         if (! Schema::hasTable('quiz_attempts') || ! Schema::hasTable('quizzes') || ! Schema::hasTable('subjects')) {
@@ -342,6 +417,7 @@ class CareerAdvisorController extends Controller
             ->where('quiz_attempts.user_id', $userId)
             ->orderByDesc('quiz_attempts.id')
             ->selectRaw('quiz_attempts.score, quiz_attempts.passed, quiz_attempts.answers, quiz_attempts.created_at')
+            ->selectRaw('subjects.id as subject_id')
             ->selectRaw('quizzes.title as quiz_title')
             ->selectRaw('subjects.name as subject_name')
             ->first();
@@ -356,6 +432,7 @@ class CareerAdvisorController extends Controller
         $percentage = $total > 0 ? (int) round(($score / $total) * 100) : 0;
 
         return [
+            'subject_id' => (int) ($row->subject_id ?? 0),
             'quiz_title' => (string) ($row->quiz_title ?? ''),
             'subject_name' => (string) ($row->subject_name ?? ''),
             'score' => $score,
@@ -376,7 +453,13 @@ class CareerAdvisorController extends Controller
             ->join('quizzes', 'quizzes.id', '=', 'quiz_attempts.quiz_id')
             ->where('quiz_attempts.user_id', $userId)
             ->orderByDesc('quiz_attempts.id')
-            ->select('quiz_attempts.answers', 'quiz_attempts.score', 'quizzes.title as quiz_title')
+            ->join('subjects', 'subjects.id', '=', 'quizzes.subject_id')
+            ->select(
+                'quiz_attempts.answers',
+                'quiz_attempts.score',
+                'quizzes.title as quiz_title',
+                'subjects.name as subject_name'
+            )
             ->first();
 
         if (! $attempt) {
@@ -395,12 +478,15 @@ class CareerAdvisorController extends Controller
 
         $questions = DB::table('quiz_questions')
             ->whereIn('id', $questionIds)
-            ->select('id', 'question_text', 'correct_answer')
+            ->select('id', 'question_text', 'question_type', 'correct_answer', 'explanation')
             ->get()
             ->keyBy('id');
 
-        $weakPoints = [];
+        $strongBuckets = [];
+        $weakBuckets = [];
+        $questionResults = [];
         $wrongCount = 0;
+        $correctCount = 0;
         foreach ($answerRows as $row) {
             $qid = (int) ($row['question_id'] ?? 0);
             $selected = trim((string) ($row['selected_answer'] ?? ''));
@@ -409,10 +495,31 @@ class CareerAdvisorController extends Controller
                 continue;
             }
             $correct = trim((string) ($q->correct_answer ?? ''));
-            if ($selected === '' || mb_strtolower($selected, 'UTF-8') !== mb_strtolower($correct, 'UTF-8')) {
+            $skillArea = $this->inferQuizSkillArea(
+                (string) ($q->question_text ?? ''),
+                (string) ($q->explanation ?? ''),
+                (string) ($q->question_type ?? '')
+            );
+            $isCorrect = array_key_exists('is_correct', $row)
+                ? (bool) $row['is_correct']
+                : ($selected !== '' && mb_strtolower($selected, 'UTF-8') === mb_strtolower($correct, 'UTF-8'));
+
+            if (! $isCorrect) {
                 $wrongCount++;
-                $weakPoints[] = Str::limit(trim((string) ($q->question_text ?? '')), 120, '...');
+                $weakBuckets[$skillArea] = ($weakBuckets[$skillArea] ?? 0) + 1;
+            } else {
+                $correctCount++;
+                $strongBuckets[$skillArea] = ($strongBuckets[$skillArea] ?? 0) + 1;
             }
+
+            $questionResults[] = [
+                'question' => Str::limit((string) ($q->question_text ?? ''), 220),
+                'selected_answer' => Str::limit($selected !== '' ? $selected : '-', 120),
+                'correct_answer' => Str::limit($correct !== '' ? $correct : '-', 120),
+                'is_correct' => $isCorrect,
+                'skill_area' => $skillArea,
+                'explanation' => Str::limit((string) ($q->explanation ?? ''), 180),
+            ];
         }
 
         $total = count($answerRows);
@@ -425,12 +532,62 @@ class CareerAdvisorController extends Controller
 
         return [
             'quiz_title' => (string) ($attempt->quiz_title ?? ''),
+            'subject_name' => (string) ($attempt->subject_name ?? ''),
             'performance' => $performance,
             'score_percent' => $percentage,
+            'correct_count' => $correctCount,
             'wrong_count' => $wrongCount,
             'total' => $total,
-            'weak_points' => array_values(array_slice(array_unique($weakPoints), 0, 6)),
+            'strong_points' => $this->summarizeQuizSkillBuckets($strongBuckets, true, (string) ($attempt->subject_name ?? '')),
+            'weak_points' => $this->summarizeQuizSkillBuckets($weakBuckets, false, (string) ($attempt->subject_name ?? '')),
+            'question_results' => array_slice($questionResults, 0, 12),
         ];
+    }
+
+    private function inferQuizSkillArea(string $questionText, string $explanation, string $questionType): string
+    {
+        $text = Str::lower($questionText.' '.$explanation);
+
+        $rules = [
+            'การพัฒนา Frontend และส่วนติดต่อผู้ใช้' => ['frontend', 'front-end', 'html', 'css', 'react', 'vue', 'ui', 'ux', 'หน้าเว็บ', 'ส่วนติดต่อ', 'ผู้ใช้'],
+            'การพัฒนา Backend และ API' => ['backend', 'back-end', 'api', 'server', 'database', 'ฐานข้อมูล', 'sql', 'php', 'laravel', 'node', 'controller'],
+            'ตรรกะโปรแกรมและการแก้ปัญหา' => ['algorithm', 'logic', 'loop', 'array', 'function', 'เงื่อนไข', 'ลูป', 'อัลกอริทึม', 'ตรรกะ', 'แก้ปัญหา'],
+            'การวิเคราะห์ข้อมูลและการคำนวณ' => ['data', 'analysis', 'calculate', 'คำนวณ', 'ข้อมูล', 'สถิติ', 'กราฟ', 'ตาราง'],
+            'ความเข้าใจแนวคิดและคำศัพท์หลัก' => ['definition', 'concept', 'หมายถึง', 'คืออะไร', 'แนวคิด', 'หลักการ', 'คำศัพท์'],
+            'การประยุกต์ใช้ความรู้กับสถานการณ์จริง' => ['scenario', 'case', 'example', 'ประยุกต์', 'สถานการณ์', 'ตัวอย่าง', 'เลือกใช้', 'ออกแบบ'],
+        ];
+
+        foreach ($rules as $area => $keywords) {
+            foreach ($keywords as $keyword) {
+                if (Str::contains($text, Str::lower($keyword))) {
+                    return $area;
+                }
+            }
+        }
+
+        return match ($questionType) {
+            'short_answer' => 'การอธิบายคำตอบและเรียบเรียงความเข้าใจ',
+            'true_false' => 'การแยกแยะข้อเท็จจริงและหลักการ',
+            default => 'ความเข้าใจเนื้อหาในวิชา',
+        };
+    }
+
+    /**
+     * @param  array<string,int>  $buckets
+     * @return array<int,string>
+     */
+    private function summarizeQuizSkillBuckets(array $buckets, bool $isStrength, string $subjectName): array
+    {
+        arsort($buckets);
+
+        $prefix = $isStrength ? 'ทำได้ดีด้าน' : 'ควรทบทวนด้าน';
+        $suffix = $subjectName !== '' ? "ในวิชา {$subjectName}" : 'จากแบบฝึกหัดล่าสุด';
+
+        return collect($buckets)
+            ->take(4)
+            ->map(fn (int $count, string $area) => "{$prefix}{$area} ({$count} ข้อ) {$suffix}")
+            ->values()
+            ->all();
     }
 
     /**
@@ -451,8 +608,15 @@ class CareerAdvisorController extends Controller
         CareerRecommendation::query()->where('user_id', $user->id)->delete();
 
         $subjectNameMap = collect($topSubjects)
-            ->filter(fn (array $subject) => ! empty($subject['subject_name']))
-            ->mapWithKeys(fn (array $subject) => [Str::lower($subject['subject_name']) => $subject['id']]);
+            ->map(function (array $subject) {
+                $name = trim((string) ($subject['subject_name'] ?? $subject['name'] ?? ''));
+                return [
+                    'id' => (int) ($subject['id'] ?? 0),
+                    'name' => $name,
+                ];
+            })
+            ->filter(fn (array $subject) => $subject['id'] > 0 && $subject['name'] !== '')
+            ->mapWithKeys(fn (array $subject) => [Str::lower($subject['name']) => $subject['id']]);
 
         foreach ($recommendations as $recommendation) {
             $careerName = trim((string) ($recommendation['career'] ?? ''));
@@ -482,10 +646,10 @@ class CareerAdvisorController extends Controller
             }
 
             if ($hasCareerPathId && $hasCareerPathsTable) {
-                $careerPath = CareerPath::firstOrCreate(
-                    ['name' => $careerName],
-                    ['description' => $reasonText]
-                );
+                $careerPath = CareerPath::firstOrNew(['name' => $careerName]);
+                $careerPath->description = $reasonText;
+                $careerPath->metadata = $this->careerPathMetadata($recommendation);
+                $careerPath->save();
                 $payload['career_path_id'] = $careerPath->id;
             }
 
@@ -554,6 +718,10 @@ class CareerAdvisorController extends Controller
             'score' => $rec->score ?? 0,
             'reason' => $rec->reason,
             'created_at' => optional($rec->created_at)->toDateTimeString(),
+            'analysis_provider' => $metadata['analysis_provider'] ?? null,
+            'analysis_generated_at' => $metadata['analysis_generated_at'] ?? null,
+            'analysis_run_id' => $metadata['analysis_run_id'] ?? null,
+            'latest_quiz_created_at' => $metadata['latest_quiz_created_at'] ?? null,
         ];
     }
 
@@ -584,8 +752,15 @@ class CareerAdvisorController extends Controller
             'subjects' => $this->fitDbVarchar($subjects, 80),
         ];
 
+        foreach (['analysis_provider', 'analysis_generated_at', 'analysis_run_id', 'latest_quiz_created_at'] as $key) {
+            $value = trim((string) ($recommendation[$key] ?? ''));
+            if ($value !== '') {
+                $metadata[$key] = $this->fitDbVarchar($value, $key === 'analysis_run_id' ? 64 : 40);
+            }
+        }
+
         $encoded = json_encode($metadata, JSON_UNESCAPED_UNICODE);
-        if ($encoded !== false && strlen($encoded) <= 240) {
+        if ($encoded !== false && strlen($encoded) <= 2000) {
             return $metadata;
         }
 
@@ -595,7 +770,7 @@ class CareerAdvisorController extends Controller
             $metadata['skills'] = $this->fitDbVarchar($skills, $skillsLimit);
             $metadata['subjects'] = $this->fitDbVarchar($subjects, $subjectsLimit);
             $encoded = json_encode($metadata, JSON_UNESCAPED_UNICODE);
-            if ($encoded !== false && strlen($encoded) <= 240) {
+            if ($encoded !== false && strlen($encoded) <= 2000) {
                 return $metadata;
             }
             $skillsLimit = max(12, $skillsLimit - 6);
@@ -603,6 +778,33 @@ class CareerAdvisorController extends Controller
         }
 
         return null;
+    }
+
+    /**
+     * Keep the shared career-path record informative when viewed directly.
+     *
+     * @param  array<string,mixed>  $recommendation
+     * @return array<string,mixed>
+     */
+    private function careerPathMetadata(array $recommendation): array
+    {
+        $metadata = $this->normalizeRecommendationMetadata($recommendation) ?? [];
+
+        return array_merge($metadata, [
+            'source' => 'career_analysis',
+            'career' => $this->fitDbVarchar((string) ($recommendation['career'] ?? ''), 255),
+        ]);
+    }
+
+    private function careerProviderLabel(): string
+    {
+        return strtolower((string) (
+            config('ai.career_provider')
+            ?: env('AI_CAREER_PROVIDER')
+            ?: config('ai.provider')
+            ?: env('AI_PROVIDER')
+            ?: 'default'
+        ));
     }
 
     private function fitDbVarchar(string $value, int $maxBytes): ?string

@@ -46,12 +46,12 @@ export const AppAlertProvider = ({ children }: PropsWithChildren) => {
         {alerts.map(alert => (
           <div key={alert.id} className="pointer-events-auto">
             <div
-              className={`relative overflow-hidden rounded-[22px] border bg-white/96 px-4 py-4 shadow-[0_18px_60px_rgba(15,23,42,0.18)] backdrop-blur-xl ${
+              className={`relative overflow-hidden rounded-[22px] border px-4 py-4 shadow-[0_18px_60px_rgba(15,23,42,0.28)] ${
                 alert.type === 'success'
-                  ? 'border-emerald-100'
+                  ? 'border-emerald-200 bg-white'
                   : alert.type === 'error'
-                    ? 'border-rose-100'
-                    : 'border-sky-100'
+                    ? 'border-rose-500 bg-rose-950'
+                    : 'border-sky-200 bg-white'
               }`}
               role="status"
               aria-live="polite"
@@ -59,10 +59,10 @@ export const AppAlertProvider = ({ children }: PropsWithChildren) => {
               <div
                 className={`absolute inset-x-0 bottom-0 h-1 ${
                   alert.type === 'success'
-                    ? 'bg-emerald-400'
+                    ? 'bg-emerald-500'
                     : alert.type === 'error'
                       ? 'bg-rose-400'
-                      : 'bg-sky-400'
+                      : 'bg-sky-500'
                 }`}
               />
               <div className="flex items-start gap-3">
@@ -71,22 +71,26 @@ export const AppAlertProvider = ({ children }: PropsWithChildren) => {
                     alert.type === 'success'
                       ? 'bg-emerald-500 text-white'
                       : alert.type === 'error'
-                        ? 'bg-rose-500 text-white'
+                        ? 'bg-rose-500 text-rose-50'
                         : 'bg-sky-500 text-white'
                   }`}
                 >
                   {alert.type === 'success' ? '✓' : alert.type === 'error' ? '×' : 'i'}
                 </div>
                 <div className="min-w-0 flex-1">
-                  <p className="text-[15px] font-semibold text-slate-900">
+                  <p className={`text-[15px] font-bold ${alert.type === 'error' ? 'text-rose-50' : 'text-slate-900'}`}>
                     {alert.type === 'success' ? 'บันทึกสำเร็จ' : alert.type === 'error' ? 'เกิดข้อผิดพลาด' : 'แจ้งเตือน'}
                   </p>
-                  <p className="mt-1 text-sm leading-6 text-slate-600">{alert.text}</p>
+                  <p className={`mt-1 text-sm font-medium leading-6 ${alert.type === 'error' ? 'text-rose-100' : 'text-slate-700'}`}>{alert.text}</p>
                 </div>
                 <button
                   type="button"
                   onClick={() => dismissAlert(alert.id)}
-                  className="rounded-full px-2 py-1 text-xs font-semibold text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+                  className={`rounded-full px-2 py-1 text-xs font-semibold transition ${
+                    alert.type === 'error'
+                      ? 'text-rose-200 hover:bg-white/15 hover:text-rose-50'
+                      : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'
+                  }`}
                 >
                   ปิด
                 </button>

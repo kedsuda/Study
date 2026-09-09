@@ -1,6 +1,7 @@
+import { TimePicker } from '../../components/TimePicker';
 // SubjectsPage.tsx
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useForm } from 'react-hook-form';
+import { Controller, useForm } from 'react-hook-form';
 import { useAppAlert } from '../../context/AppAlertContext';
 import { useAuth } from '../../context/AuthContext';
 import { api, apiFallbackClients } from '../../services/api';
@@ -72,21 +73,6 @@ const resolveSubjectColor = (color?: string | null) => {
   return greenPalette.has(trimmed.toLowerCase()) ? '#f97316' : trimmed;
 };
 
-const buildTimeOptions = (stepMinutes = 5) => {
-  const options: string[] = [];
-  for (let hour = 0; hour < 24; hour += 1) {
-    for (let minute = 0; minute < 60; minute += stepMinutes) {
-      options.push(`${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`);
-    }
-  }
-  return options;
-};
-
-const timeOptions = buildTimeOptions(5);
-const formatTimeOptionLabel = (value: string) => {
-  const [hour = '00', minute = '00'] = value.split(':');
-  return `${hour}.${minute}`;
-};
 const timePattern = /^(?:[01]\d|2[0-3])[:.][0-5]\d(?:(?:[:.])[0-5]\d)?$/;
 
 const normalizeTimeInput = (value?: string | null) => {
@@ -184,10 +170,18 @@ const formatSubjectDayLabel = (value?: string | null) => {
 
 const formatSemesterLabel = (semester?: number | null, academicYear?: number | null) => {
   if (!semester || !academicYear) return null;
-  return `${semester}-${academicYear}`;
+  return `ภาคเรียนที่ ${semester} ปีการศึกษา ${academicYear}`;
 };
 
-const normalizeDateInput = (value?: string | null) => toDisplayDate(value) ?? '';
+const normalizeSubjectName = (value?: string | null) =>
+  (value ?? '').trim().replace(/\s+/g, ' ').toLocaleLowerCase('th-TH');
+
+const normalizeDateInput = (value?: string | null) => {
+  const iso = toIsoDate(value);
+  if (!iso) return '';
+  const [year, month, day] = iso.split('-');
+  return `${day}/${month}/${year}`;
+};
 
 const normalizeTimeSelect = (value?: string | null) => {
   if (!value) return '';
@@ -266,7 +260,57 @@ const buildSchedulePayload = (startDate?: string | null, startTime?: string | nu
   };
 };
 
-const formatScheduleDateDisplay = (value?: string | null) => toDisplayDate(value) ?? '';
+const timeToMinutes = (value?: string | null) => {
+  const normalized = normalizeTimeInput(value);
+  if (!normalized) return null;
+  const [hour, minute] = normalized.split(':').map(Number);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  return hour * 60 + minute;
+};
+
+const getWeekdayIndex = (value?: string | null) => {
+  const iso = toIsoDate(value);
+  if (!iso) return null;
+  const date = new Date(`${iso}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.getDay();
+};
+
+const buildScheduleConflictMessage = (subject: Subject) => {
+  const timeRange = formatSubjectTimeRange(subject.start_time, subject.end_time);
+  return `เวลานี้ซ้อนกับวิชา ${subject.name}${timeRange ? ` เวลา ${timeRange}` : ''} กรุณาเลือกเวลาอื่น เพราะซ้อนกับวิชาอื่น`;
+};
+
+const findLocalScheduleConflict = (
+  subjects: Subject[],
+  schedulePayload: ReturnType<typeof buildSchedulePayload>,
+  semesterId?: number | null,
+  ignoreSubjectId?: number | null
+) => {
+  if (!schedulePayload.startDate || !schedulePayload.startTime || !schedulePayload.endTime) return null;
+
+  const newWeekday = getWeekdayIndex(schedulePayload.startDate);
+  const newStart = timeToMinutes(schedulePayload.startTime);
+  const newEnd = timeToMinutes(schedulePayload.endTime);
+  if (newWeekday === null || newStart === null || newEnd === null || newEnd <= newStart) return null;
+
+  return subjects.find(subject => {
+    if (ignoreSubjectId && subject.id === ignoreSubjectId) return false;
+    if (!subject.start_date || !subject.start_time || !subject.end_time) return false;
+    if (semesterId && subject.semester_id && Number(subject.semester_id) !== Number(semesterId)) return false;
+
+    const existingWeekday = getWeekdayIndex(subject.start_date);
+    if (existingWeekday !== newWeekday) return false;
+
+    const existingStart = timeToMinutes(subject.start_time);
+    const existingEnd = timeToMinutes(subject.end_time);
+    if (existingStart === null || existingEnd === null) return false;
+
+    return newStart < existingEnd && existingStart < newEnd;
+  }) ?? null;
+};
+
+const formatScheduleDateDisplay = normalizeDateInput;
 const isValidDateInput = (value?: string | null) => Boolean(toIsoDate(value));
 
 const extractRoomFromText = (text?: string | null): string | null => {
@@ -344,13 +388,11 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isLoadingSemesters, setIsLoadingSemesters] = useState<boolean>(false);
   const [isCreatingSemester, setIsCreatingSemester] = useState<boolean>(false);
-  const [deletingId, setDeletingId] = useState<number | null>(null);
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [editingSubject, setEditingSubject] = useState<Subject | null>(null);
   const [detailSubject, setDetailSubject] = useState<Subject | null>(null);
-  const [deleteSubjectTarget, setDeleteSubjectTarget] = useState<Subject | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedSemesterFilter, setSelectedSemesterFilter] = useState<string>('all');
+  const [selectedSemesterFilter, setSelectedSemesterFilter] = useState<string>('');
   const [newSemester, setNewSemester] = useState<SemesterCreateForm>({ semester: '1', academic_year: '' });
   const [createSemesterError, setCreateSemesterError] = useState<string>('');
   const mountedRef = useRef(true);
@@ -378,6 +420,7 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
 
   const {
     register,
+    control,
     handleSubmit,
     reset,
     setValue,
@@ -391,12 +434,15 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
   const selectedColor = watch('color');
   const selectedSemesterId = watch('semester_id');
   const isAllDay = watch('all_day');
+  const activeSemesterId = semesterOptions.some(option => String(option.semester_id) === selectedSemesterFilter)
+    ? selectedSemesterFilter
+    : (semesterOptions[0] ? String(semesterOptions[0].semester_id) : '');
   const filteredSubjects = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
 
     return subjects.filter(subject => {
       const semesterMatch =
-        selectedSemesterFilter === 'all' ? true : String(subject.semester_id ?? '') === selectedSemesterFilter;
+        selectedSemesterFilter !== '' && String(subject.semester_id ?? '') === selectedSemesterFilter;
 
       if (!semesterMatch) return false;
       if (!query) return true;
@@ -419,8 +465,7 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
       if (typeof subject.target_hours !== 'number') return total;
       return total + subject.target_hours;
     }, 0);
-    const totalStudyLogs = filteredSubjects.reduce((total, subject) => total + (subject.study_log_count ?? 0), 0);
-    return { scheduledCount, targetHoursTotal, totalStudyLogs };
+    return { scheduledCount, targetHoursTotal };
   }, [filteredSubjects]);
 
   useEffect(() => {
@@ -645,15 +690,25 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
 
       for (const client of clients) {
         try {
-          const [subjectsRes, eventsRes] = await Promise.allSettled([
-            client.get('/subjects'),
+          const subjectRequests =
+            user?.role === 'admin'
+              ? [client.get('/subjects'), client.get('/subjects', { params: { include_all: 1 } })]
+              : [client.get('/subjects')];
+          const [subjectsRes, allSubjectsRes, eventsRes] = await Promise.allSettled([
+            ...subjectRequests,
             client.get('/calendar-events')
           ]);
 
           if (subjectsRes.status !== 'fulfilled') throw subjectsRes.reason;
 
-          const nextSubjects = unwrapCollection(subjectsRes.value.data);
-          const events = eventsRes.status === 'fulfilled' ? unwrapCollection(eventsRes.value.data) : [];
+          const ownSubjects = unwrapCollection(subjectsRes.value.data);
+          const allSubjects =
+            user?.role === 'admin' && allSubjectsRes?.status === 'fulfilled'
+              ? unwrapCollection(allSubjectsRes.value.data)
+              : [];
+          const nextSubjects = ownSubjects.length > 0 ? ownSubjects : allSubjects;
+          const eventResult = user?.role === 'admin' ? eventsRes : allSubjectsRes;
+          const events = eventResult?.status === 'fulfilled' ? unwrapCollection(eventResult.value.data) : [];
 
           if (!mountedRef.current) return;
 
@@ -696,6 +751,12 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
     setValue('semester_id', String(semesterOptions[0].semester_id));
   }, [semesterOptions, selectedSemesterId, setValue]);
 
+  useEffect(() => {
+    if (!semesterOptions.length) return;
+    if (semesterOptions.some(option => String(option.semester_id) === selectedSemesterFilter)) return;
+    setSelectedSemesterFilter(String(semesterOptions[0].semester_id));
+  }, [semesterOptions, selectedSemesterFilter]);
+
   const onSubmit = async (values: SubjectForm) => {
     try {
       setErrorMsg('');
@@ -715,6 +776,17 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
 
       if (!editingSubject && (!Number.isFinite(semesterId) || semesterId <= 0)) {
         setErrorMsg('กรุณาเลือกภาคเรียน');
+        return;
+      }
+
+      const duplicateSubject = subjects.find(subject => {
+        if (editingSubject && subject.id === editingSubject.id) return false;
+        return Number(subject.semester_id ?? 0) === Number(semesterId) && normalizeSubjectName(subject.name) === normalizeSubjectName(name);
+      });
+      if (duplicateSubject) {
+        const msg = 'วิชาซ้ำในภาคเรียนนี้ กรุณาใช้ชื่อวิชาอื่นหรือแก้ไขวิชาเดิม';
+        setErrorMsg(msg);
+        error(msg);
         return;
       }
 
@@ -739,6 +811,14 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
         start_time: schedulePayload.startTime,
         end_time: schedulePayload.endTime
       };
+      const normalizedRoom = values.classroom?.trim() ? values.classroom.trim() : null;
+      const scheduleConflict = findLocalScheduleConflict(subjects, schedulePayload, semesterId, editingSubject?.id);
+      if (scheduleConflict) {
+        const msg = buildScheduleConflictMessage(scheduleConflict);
+        setErrorMsg(msg);
+        error(msg);
+        return;
+      }
 
       if (editingSubject) {
         const form = new URLSearchParams();
@@ -764,8 +844,20 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
 
         for (const client of apiFallbackClients) {
           try {
+            updatedResponse = await client.put(`/subjects/${editingSubject.id}`, form, {
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-HTTP-Method-Override': 'PUT' },
+            });
+            break;
+          } catch (err: any) {
+            lastError = err;
+            const status = err?.response?.status;
+            if (status && status !== 404 && status !== 405 && status !== 500) throw err;
+          }
+
+          try {
             updatedResponse = await client.post(`/subjects/${editingSubject.id}`, form, {
               headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-HTTP-Method-Override': 'PUT' },
+              params: { _method: 'PUT' },
             });
             break;
           } catch (err: any) {
@@ -781,8 +873,16 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
           (updatedResponse.data as any)?.data && typeof (updatedResponse.data as any)?.data === 'object'
             ? (updatedResponse.data as any).data
             : (updatedResponse.data as any);
+        const patchedUpdated: Subject = {
+          ...updated,
+          classroom: normalizedRoom,
+          room: normalizedRoom,
+          start_date: schedulePayload.startDate,
+          start_time: schedulePayload.startTime,
+          end_time: schedulePayload.endTime,
+        };
 
-        setSubjects(prev => prev.map(subject => (subject.id === editingSubject.id ? { ...subject, ...updated } : subject)));
+        setSubjects(prev => prev.map(subject => (subject.id === editingSubject.id ? { ...subject, ...patchedUpdated } : subject)));
         emitSubjectsUpdated();
         success('อัปเดตรายวิชาเรียบร้อยแล้ว');
       } else {
@@ -793,7 +893,7 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
             ? (response.data as any).data
             : (response.data as any);
 
-        let nextSubject = created;
+        let nextSubject: Subject = { ...created, classroom: normalizedRoom, room: normalizedRoom };
         if (schedulePayload.startDate || schedulePayload.startTime || schedulePayload.endTime) {
           try {
             const schedulePatch = await persistSubjectSchedule(created, schedulePayload);
@@ -813,7 +913,7 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
       setEditingSubject(null);
 
       reset({
-        semester_id: semesterOptions[0] ? String(semesterOptions[0].semester_id) : '',
+        semester_id: activeSemesterId,
         name: '',
         description: '',
         classroom: '',
@@ -826,7 +926,7 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
       });
 
       setValue('color', colorOptions[0].value);
-      setValue('semester_id', semesterOptions[0] ? String(semesterOptions[0].semester_id) : '');
+      setValue('semester_id', activeSemesterId);
       setValue('start_date', today);
       setValue('start_time', '');
       setValue('end_time', '');
@@ -842,90 +942,10 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
     }
   };
 
-// =========================================================
-// ✅ DELETE SUBJECT: fallback หลายแบบ + รองรับ proxy/legacy
-// =========================================================
-const isDeleteFallbackStatus = (status?: number) => !status || status === 404 || status === 405 || status === 500;
-const deleteSubject = async (id: number) => {
-  const clients = apiFallbackClients;
-  let lastError: any = null;
-
-  for (const client of clients) {
-    try {
-      const form = new URLSearchParams();
-      form.set('subject_id', String(id));
-      form.set('id', String(id));
-      await client.post('/subjects/delete', form, {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-      });
-      return;
-    } catch (err: any) {
-      lastError = err;
-      const status = err?.response?.status;
-      if (!isDeleteFallbackStatus(status)) throw err;
-    }
-
-    try {
-      const form = new URLSearchParams();
-      form.set('subject_id', String(id));
-      await client.post(`/subjects/${id}/delete`, form, {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-      });
-      return;
-    } catch (err: any) {
-      lastError = err;
-      const status = err?.response?.status;
-      if (!isDeleteFallbackStatus(status)) throw err;
-    }
-
-    try {
-      const form = new URLSearchParams();
-      form.set('_method', 'DELETE');
-      form.set('subject_id', String(id));
-      await client.post(`/subjects/${id}`, form, {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-HTTP-Method-Override': 'DELETE' }
-      });
-      return;
-    } catch (err: any) {
-      lastError = err;
-      const status = err?.response?.status;
-      if (!isDeleteFallbackStatus(status)) throw err;
-    }
-
-    try {
-      await client.delete(`/subjects/${id}`);
-      return;
-    } catch (err: any) {
-      lastError = err;
-      const status = err?.response?.status;
-      if (!isDeleteFallbackStatus(status)) throw err;
-    }
-  }
-
-  throw lastError ?? new Error('ลบวิชาไม่สำเร็จ');
-};
-
-const handleDelete = async (id: number) => {
-  try {
-    setDeletingId(id);
-    await deleteSubject(id);
-    setSubjects(prev => prev.filter(s => s.id !== id));
-    emitSubjectsUpdated();
-    setDeleteSubjectTarget(null);
-    success('ลบรายวิชาเรียบร้อยแล้ว');
-  } catch (err: any) {
-    console.error(err);
-    const message = err?.response?.data?.message || err?.message || 'ลบวิชาไม่สำเร็จ';
-    error(message);
-  } finally {
-    setDeletingId(null);
-  }
-};
-
   const openCreateModal = () => {
     setEditingSubject(null);
     reset({
-      semester_id: semesterOptions[0] ? String(semesterOptions[0].semester_id) : '',
+      semester_id: activeSemesterId,
       name: '',
       description: '',
       classroom: '',
@@ -937,7 +957,7 @@ const handleDelete = async (id: number) => {
       all_day: false
     });
     setValue('color', colorOptions[0].value);
-    setValue('semester_id', semesterOptions[0] ? String(semesterOptions[0].semester_id) : '');
+    setValue('semester_id', activeSemesterId);
     setValue('start_date', today);
     setValue('start_time', '');
     setValue('end_time', '');
@@ -951,6 +971,25 @@ const handleDelete = async (id: number) => {
     setIsCreateModalOpen(false);
     setEditingSubject(null);
     setErrorMsg('');
+  };
+
+  const deleteSubject = async (subject: Subject) => {
+    if (!window.confirm(`ต้องการลบวิชา "${subject.name}" ใช่หรือไม่?\n\nลบได้เฉพาะวิชาที่ไม่มีข้อมูลอื่นเชื่อมโยงอยู่`)) {
+      return;
+    }
+
+    try {
+      await api.delete(`/subjects/${subject.id}`);
+      setSubjects(prev => prev.filter(item => item.id !== subject.id));
+      if (detailSubject?.id === subject.id) setDetailSubject(null);
+      if (editingSubject?.id === subject.id) closeCreateModal();
+      emitSubjectsUpdated();
+      success(`ลบวิชา ${subject.name} เรียบร้อยแล้ว`);
+    } catch (requestError: any) {
+      const message = requestError?.response?.data?.message ?? 'ลบวิชาไม่สำเร็จ';
+      setErrorMsg(message);
+      error(message);
+    }
   };
 
   const openEditModal = (subject: Subject) => {
@@ -1014,7 +1053,7 @@ const handleDelete = async (id: number) => {
           </button>
         </div>
 
-        <div className={`mt-4 grid grid-cols-2 gap-2.5 ${isPopupVariant ? '' : 'xl:grid-cols-4'}`}>
+        <div className={`mt-4 grid grid-cols-2 gap-2.5 ${isPopupVariant ? '' : 'xl:grid-cols-3'}`}>
           <div className="subjects-stat rounded-[18px] border px-3.5 py-3.5 shadow-sm md:rounded-[22px] md:px-4 md:py-4" style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}>
             <p className="subjects-stat-label text-[11px] font-bold uppercase tracking-[0.16em] text-[color:var(--muted)]">วิชาที่แสดง</p>
             <p className="subjects-stat-value mt-1.5 text-xl font-black text-[color:var(--text)] md:mt-2 md:text-2xl">{filteredSubjects.length}</p>
@@ -1022,10 +1061,6 @@ const handleDelete = async (id: number) => {
           <div className="subjects-stat rounded-[18px] border px-3.5 py-3.5 shadow-sm md:rounded-[22px] md:px-4 md:py-4" style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}>
             <p className="subjects-stat-label text-[11px] font-bold uppercase tracking-[0.16em] text-[color:var(--muted)]">ตั้งเวลาแล้ว</p>
             <p className="subjects-stat-value mt-1.5 text-xl font-black text-[color:var(--text)] md:mt-2 md:text-2xl">{adminSummary.scheduledCount}</p>
-          </div>
-          <div className="subjects-stat rounded-[18px] border px-3.5 py-3.5 shadow-sm md:rounded-[22px] md:px-4 md:py-4" style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}>
-            <p className="subjects-stat-label text-[11px] font-bold uppercase tracking-[0.16em] text-[color:var(--muted)]">บันทึกการเรียน</p>
-            <p className="subjects-stat-value mt-1.5 text-xl font-black text-[color:var(--text)] md:mt-2 md:text-2xl">{adminSummary.totalStudyLogs}</p>
           </div>
           <div className="subjects-stat rounded-[18px] border px-3.5 py-3.5 shadow-sm md:rounded-[22px] md:px-4 md:py-4" style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}>
             <p className="subjects-stat-label text-[11px] font-bold uppercase tracking-[0.16em] text-[color:var(--muted)]">เป้าหมายรวม</p>
@@ -1079,10 +1114,9 @@ const handleDelete = async (id: number) => {
               className="flex-1 rounded-xl border px-4 py-3 text-sm font-semibold outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100 md:w-[180px] md:flex-none"
               style={{ color: 'var(--text)', backgroundColor: 'var(--surface-2)', borderColor: 'var(--border)' }}
             >
-              <option value="all">ทุกภาคเรียน</option>
               {semesterOptions.map(option => (
                 <option key={`filter-${option.semester_id}`} value={option.semester_id}>
-                  เทอม {formatSemesterLabel(option.semester, option.academic_year)}
+                  {formatSemesterLabel(option.semester, option.academic_year)}
                 </option>
               ))}
             </select>
@@ -1134,7 +1168,7 @@ const handleDelete = async (id: number) => {
                             </p>
                             <div className="mt-2 flex flex-wrap items-center gap-1.5">
                               <span className="rounded-lg bg-slate-50 px-2 py-1 text-[10px] font-bold text-slate-600">
-                                {semesterLabel ? `เทอม ${semesterLabel}` : 'ไม่ระบุเทอม'}
+                                {semesterLabel ?? 'ไม่ระบุภาคเรียน'}
                               </span>
                               {typeof subject.target_hours === 'number' ? (
                                 <span
@@ -1209,11 +1243,11 @@ const handleDelete = async (id: number) => {
                         </button>
                         <button
                           type="button"
-                          onClick={() => setDeleteSubjectTarget(subject)}
-                          disabled={deletingId === subject.id}
-                          className="flex-1 rounded-lg px-2 py-2 text-[11px] font-medium text-rose-500 transition hover:bg-rose-500/10 disabled:opacity-60 md:px-3 md:text-xs"
+                          onClick={() => void deleteSubject(subject)}
+                          className="rounded-lg px-2 py-2 text-[11px] font-semibold text-rose-600 transition hover:bg-rose-50 md:px-3 md:text-xs"
+                          title="ลบได้เมื่อไม่มีข้อมูลที่เชื่อมโยง"
                         >
-                          {deletingId === subject.id ? 'กำลังลบ...' : 'ลบ'}
+                          ลบ
                         </button>
                       </div>
                     </div>
@@ -1526,33 +1560,38 @@ const handleDelete = async (id: number) => {
 
                     <div>
                       <label className="mb-1 block text-xs uppercase tracking-widest text-muted">เวลาเริ่ม</label>
-                      <select
-                        disabled={isAllDay}
-                        className="w-full rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-3 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/30 font-mono tabular-nums disabled:opacity-60"
-                        {...register('start_time', {
+                      <Controller
+                        name="start_time"
+                        control={control}
+                        rules={{
                           validate: value => {
                             const allDay = watch('all_day');
                             if (allDay) return true;
                             return !value || timePattern.test(value) ? true : 'รูปแบบเวลา 00:00-23:59';
                           }
-                        })}
-                      >
-                        <option value="">--.--</option>
-                        {timeOptions.map(option => (
-                          <option key={option} value={option}>
-                            {formatTimeOptionLabel(option)}
-                          </option>
-                        ))}
-                      </select>
+                        }}
+                        render={({ field }) => (
+                          <TimePicker
+                            value={field.value}
+                            onChange={value => field.onChange(value ? value + ':00' : '')}
+                            onBlur={field.onBlur}
+                            inputRef={field.ref}
+                            disabled={isAllDay}
+                            allowEmpty
+                            label="เวลาเริ่ม"
+                            className="w-full"
+                          />
+                        )}
+                      />
                       {errors.start_time?.message && <p className="mt-1 text-xs text-red-200">{errors.start_time.message}</p>}
                     </div>
 
                     <div>
                       <label className="mb-1 block text-xs uppercase tracking-widest text-muted">เวลาเลิก</label>
-                      <select
-                        disabled={isAllDay}
-                        className="w-full rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-3 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/30 font-mono tabular-nums disabled:opacity-60"
-                        {...register('end_time', {
+                      <Controller
+                        name="end_time"
+                        control={control}
+                        rules={{
                           validate: value => {
                             const allDay = watch('all_day');
                             if (allDay) return true;
@@ -1561,20 +1600,25 @@ const handleDelete = async (id: number) => {
                             const startTime = watch('start_time');
                             return startTime ? true : 'ต้องระบุเวลาเริ่มก่อนเวลาเลิก';
                           }
-                        })}
-                      >
-                        <option value="">--.--</option>
-                        {timeOptions.map(option => (
-                          <option key={option} value={option}>
-                            {formatTimeOptionLabel(option)}
-                          </option>
-                        ))}
-                      </select>
+                        }}
+                        render={({ field }) => (
+                          <TimePicker
+                            value={field.value}
+                            onChange={value => field.onChange(value ? value + ':00' : '')}
+                            onBlur={field.onBlur}
+                            inputRef={field.ref}
+                            disabled={isAllDay}
+                            allowEmpty
+                            label="เวลาเลิก"
+                            className="w-full"
+                          />
+                        )}
+                      />
                       {errors.end_time?.message && <p className="mt-1 text-xs text-red-200">{errors.end_time.message}</p>}
                     </div>
 
                     <div className={isPopupVariant ? 'sm:col-span-2' : 'sm:col-span-2 lg:col-span-3'}>
-                      <p className="text-xs text-muted">รูปแบบเวลา 00.00 ถึง 23.59</p>
+                      <p className="text-xs text-muted">รูปแบบเวลา 00:00 ถึง 23:59</p>
                     </div>
                   </div>
                 </div>
@@ -1619,7 +1663,7 @@ const handleDelete = async (id: number) => {
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-3">
                   <p className="text-xs uppercase tracking-widest text-muted">ภาคเรียน</p>
-                  <p className="mt-2 text-[color:var(--text)]">{formatSemesterLabel(detailSubject.semester, detailSubject.academic_year) ? `เทอม ${formatSemesterLabel(detailSubject.semester, detailSubject.academic_year)}` : 'ไม่ระบุเทอม'}</p>
+                  <p className="mt-2 text-[color:var(--text)]">{formatSemesterLabel(detailSubject.semester, detailSubject.academic_year) ?? 'ไม่ระบุภาคเรียน'}</p>
                 </div>
                 <div className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-3">
                   <p className="text-xs uppercase tracking-widest text-muted">วันและเวลา</p>
@@ -1650,36 +1694,6 @@ const handleDelete = async (id: number) => {
         </div>
       ) : null}
 
-      {deleteSubjectTarget ? (
-        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/60 px-4 py-6 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-[32px] border border-[color:var(--border)] bg-[color:var(--surface)] shadow-[0_24px_80px_rgba(15,23,42,0.35)]">
-            <div className="px-6 py-6">
-              <p className="text-xs uppercase tracking-[0.3em] text-rose-400">Delete</p>
-              <h3 className="mt-3 text-lg font-semibold text-[color:var(--text)]">ยืนยันการลบรายวิชา</h3>
-              <p className="mt-2 text-sm text-muted">
-                ต้องการลบวิชา <span className="font-semibold text-[color:var(--text)]">"{deleteSubjectTarget.name}"</span> ใช่หรือไม่?
-              </p>
-            </div>
-            <div className="flex justify-end gap-3 border-t border-[color:var(--border)] bg-[color:var(--surface-2)]/60 px-6 py-4">
-              <button
-                type="button"
-                onClick={() => setDeleteSubjectTarget(null)}
-                className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] px-5 py-2.5 text-sm font-semibold text-muted transition hover:text-[color:var(--text)]"
-              >
-                ยกเลิก
-              </button>
-              <button
-                type="button"
-                onClick={() => handleDelete(deleteSubjectTarget.id)}
-                disabled={deletingId === deleteSubjectTarget.id}
-                className="rounded-2xl border border-rose-500/20 bg-rose-500/10 px-5 py-2.5 text-sm font-semibold text-rose-300 transition hover:bg-rose-500/20 disabled:opacity-60"
-              >
-                {deletingId === deleteSubjectTarget.id ? 'กำลังลบ...' : 'ลบรายวิชา'}
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
     </div>
   );
 };

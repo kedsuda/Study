@@ -387,7 +387,6 @@ app.get("/",(req,res)=>{
 // =======================
 
 const server = app.listen(PORT,()=>{
-  startLaravelScheduler();
   console.log(`AI Server running on port ${PORT}`);
 });
 

@@ -8,6 +8,8 @@ use App\Http\Resources\FileResource;
 use App\Models\FileAttachment;
 use App\Models\StudyLog;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 
 class FileController extends Controller
@@ -50,6 +52,27 @@ class FileController extends Controller
         Storage::disk('public')->delete($file->file_path);
         $file->delete();
         return response()->json(status: 204);
+    }
+
+    public function updateStatus(Request $request, FileAttachment $file): JsonResponse
+    {
+        abort_unless($file->studyLog->subject->user_id === $request->user()->id, 403, 'Unauthorized');
+
+        $data = $request->validate([
+            'status' => ['required', 'string', 'in:active,archived'],
+        ]);
+
+        if (Schema::hasColumn($file->getTable(), 'status')) {
+            $file->status = $data['status'];
+        }
+
+        if (Schema::hasColumn($file->getTable(), 'archived_at')) {
+            $file->archived_at = $data['status'] === 'archived' ? now() : null;
+        }
+
+        $file->save();
+
+        return response()->json(new FileResource($file->fresh()));
     }
 
     private function resolveType(?string $extension, ?string $providedType = null, ?string $mimeType = null): string

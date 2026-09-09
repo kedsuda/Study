@@ -13,7 +13,7 @@ return new class extends Migration {
 
         Schema::create('files', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('study_log_id')->constrained()->cascadeOnDelete();
+            $table->foreignId('study_log_id')->nullable()->constrained()->nullOnDelete();
             $table->string('original_name');
             $table->string('file_path');
             $table->enum('file_type', ['pdf', 'word', 'audio', 'other']);

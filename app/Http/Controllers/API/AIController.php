@@ -61,6 +61,8 @@ class AIController extends Controller
             'file' => ['required', 'file', 'max:51200'],
             'subject_id' => ['nullable', 'integer'],
             'source_mode' => ['nullable', 'in:upload,record'],
+            'summary_period' => ['nullable', 'in:daily,weekly,monthly'],
+            'mood' => ['nullable', 'in:สนุก,เฉย ๆ,เครียด'],
         ]);
 
         $file = request()->file('file');
@@ -73,6 +75,7 @@ class AIController extends Controller
         $user = request()->user();
         $subjectId = request()->input('subject_id');
         $sourceMode = request()->input('source_mode');
+        $summaryPeriod = request()->input('summary_period', 'daily');
         $subject = $this->resolveAudioSubject($user->id, $subjectId);
         if (! $subject) {
             return response()->json([
@@ -80,17 +83,17 @@ class AIController extends Controller
             ], 422);
         }
 
-        $log = $this->createAudioStudyLog($subject, $file, $sourceMode);
+        $log = $this->createAudioStudyLog($subject, $file, $sourceMode, request()->input('mood'));
         $fileRecord = $this->storeAudioFile($subject, $log, $file);
         $job = $this->createAudioJob($user->id, $fileRecord->id, $log->id);
 
         try {
-            $result = $this->aiService->summarizeAudio($file);
+            $result = $this->aiService->summarizeAudio($file, $summaryPeriod);
             $this->finalizeAudioJob($job, $result['transcript'] ?? $result['text'] ?? '', null);
-            $this->storeAudioResults($job, $fileRecord, $log, $result, $sourceMode);
+            $this->storeAudioResults($job, $fileRecord, $log, $result, $sourceMode, $summaryPeriod);
         } catch (\Throwable $e) {
             $this->finalizeAudioJob($job, '', $e->getMessage());
-            $this->storeAudioFailure($job, $fileRecord, $log, $e->getMessage(), $sourceMode);
+            $this->storeAudioFailure($job, $fileRecord, $log, $e->getMessage(), $sourceMode, $summaryPeriod);
             return response()->json([
                 'message' => $e->getMessage() ?: 'ไม่สามารถสรุปเสียงได้',
             ], 422);
@@ -135,6 +138,67 @@ class AIController extends Controller
         })->values();
 
         return response()->json($payload);
+    }
+
+    public function storeAudioSummary(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'subject_id' => ['required', 'integer'],
+            'source_mode' => ['nullable', 'in:upload,record'],
+            'title' => ['nullable', 'string', 'max:255'],
+            'transcript' => ['nullable', 'string'],
+            'summary' => ['nullable', 'string'],
+            'ai_model' => ['nullable', 'string', 'max:100'],
+            'summary_period' => ['nullable', 'in:daily,weekly,monthly'],
+            'mood' => ['nullable', 'in:สนุก,เฉย ๆ,เครียด'],
+        ]);
+
+        $transcript = trim((string) ($data['transcript'] ?? ''));
+        $summary = trim((string) ($data['summary'] ?? ''));
+
+        if ($transcript === '' && $summary === '') {
+            return response()->json([
+                'message' => 'ยังไม่มีข้อความถอดเสียงหรือสรุปสำหรับบันทึก',
+            ], 422);
+        }
+
+        $user = $request->user();
+        $subject = $this->resolveAudioSubject($user->id, (int) $data['subject_id']);
+        if (! $subject) {
+            return response()->json([
+                'message' => 'กรุณาเลือกวิชาเพื่อบันทึกเสียงลงฐานข้อมูล',
+            ], 422);
+        }
+
+        $sourceMode = $data['source_mode'] ?? 'upload';
+        $summaryPeriod = $data['summary_period'] ?? 'daily';
+
+        [$log, $audioSummary] = DB::transaction(function () use ($subject, $data, $sourceMode, $summaryPeriod, $transcript, $summary) {
+            $log = $this->createAudioStudyLogFromTitle($subject, $data['title'] ?? null, $sourceMode, $data['mood'] ?? null);
+            $fileRecord = $this->createBrowserAudioFileRecord($subject, $log, $data['title'] ?? null, $sourceMode, $transcript);
+            $job = $this->createAudioJob((int) $subject->user_id, $fileRecord->id, $log->id);
+            $this->finalizeAudioJob($job, $transcript, null);
+
+            $result = [
+                'transcript' => $transcript,
+                'summary' => $summary,
+                'model' => $data['ai_model'] ?? null,
+            ];
+            $this->storeAudioResults($job, $fileRecord, $log, $result, $sourceMode, $summaryPeriod);
+
+            return [$log, AudioSummary::where('study_log_id', $log->id)->latest()->first()];
+        });
+
+        return response()->json([
+            'id' => $audioSummary->id,
+            'study_log_id' => $log->id,
+            'summary' => $audioSummary->summary,
+            'transcript' => $audioSummary->transcript,
+            'created_at' => $audioSummary->created_at,
+            'title' => $log->title,
+            'subject' => $subject->name,
+            'source_mode' => $sourceMode,
+        ], 201);
     }
 
     public function destroyAudioSummary(AudioSummary $audioSummary): JsonResponse
@@ -190,10 +254,29 @@ class AIController extends Controller
     public function extractDocument(): JsonResponse
     {
         request()->validate([
-            'file' => ['required', 'file', 'max:51200'],
+            'file' => ['nullable', 'file', 'max:51200'],
+            'images' => ['nullable', 'array', 'max:3'],
+            'images.*' => ['file', 'mimetypes:image/jpeg,image/png,image/webp', 'max:6144'],
         ]);
 
+        $images = array_values(array_filter((array) request()->file('images')));
+        if ($images !== []) {
+            try {
+                return response()->json($this->aiService->extractDocumentImageText($images));
+            } catch (\Throwable $e) {
+                return response()->json([
+                    'message' => $e->getMessage() ?: 'ไม่สามารถอ่านข้อความจากภาพในเอกสารได้',
+                ], 422);
+            }
+        }
+
         $file = request()->file('file');
+        if (! $file) {
+            return response()->json([
+                'message' => 'กรุณาเลือกไฟล์เอกสาร',
+            ], 422);
+        }
+
         if (! $this->isAllowedDocument($file?->getClientOriginalExtension())) {
             return response()->json([
                 'message' => 'รองรับเฉพาะไฟล์ PDF, DOC, DOCX หรือ TXT เท่านั้น',
@@ -213,11 +296,31 @@ class AIController extends Controller
 
     public function summarizeDocument(): JsonResponse
     {
-        request()->validate([
-            'file' => ['required', 'file', 'max:51200'],
+        $validated = request()->validate([
+            'file' => ['nullable', 'file', 'max:51200'],
+            'text' => ['nullable', 'string', 'min:20'],
         ]);
 
+        $text = trim((string) ($validated['text'] ?? ''));
+        if ($text !== '') {
+            try {
+                $result = $this->aiService->summarizeDocumentText($text);
+            } catch (\Throwable $e) {
+                return response()->json([
+                    'message' => $e->getMessage() ?: 'ไม่สามารถสรุปเอกสารได้',
+                ], 422);
+            }
+
+            return response()->json($result);
+        }
+
         $file = request()->file('file');
+        if (! $file) {
+            return response()->json([
+                'message' => 'กรุณาเลือกไฟล์หรือส่งข้อความจากเอกสาร',
+            ], 422);
+        }
+
         if (! $this->isAllowedDocument($file?->getClientOriginalExtension())) {
             return response()->json([
                 'message' => 'รองรับเฉพาะไฟล์ PDF, DOC, DOCX หรือ TXT เท่านั้น',
@@ -287,7 +390,7 @@ class AIController extends Controller
         return Subject::where('user_id', $userId)->orderBy('id')->first();
     }
 
-    private function createAudioStudyLog(Subject $subject, UploadedFile $file, ?string $sourceMode = null): StudyLog
+    private function createAudioStudyLog(Subject $subject, UploadedFile $file, ?string $sourceMode = null, ?string $mood = null): StudyLog
     {
         $title = trim(pathinfo($file->getClientOriginalName(), PATHINFO_FILENAME));
         if ($sourceMode === 'record') {
@@ -300,6 +403,26 @@ class AIController extends Controller
             'subject_id' => $subject->id,
             'title' => $title,
             'note' => $sourceMode === 'record' ? 'อัดเสียงสดเพื่อสรุป' : 'อัปโหลดเสียงเพื่อสรุป',
+            'mood' => $mood,
+            'log_date' => Carbon::now()->toDateString(),
+            'log_type' => StudyLog::TYPE_AUDIO_SUMMARY,
+        ]);
+    }
+
+    private function createAudioStudyLogFromTitle(Subject $subject, ?string $title, ?string $sourceMode = null, ?string $mood = null): StudyLog
+    {
+        $title = trim((string) $title);
+        if ($sourceMode === 'record') {
+            $resolvedTitle = $title !== '' ? $title : 'สรุปเสียงจากการอัดสด';
+        } else {
+            $resolvedTitle = $title !== '' ? "สรุปเสียง: {$title}" : 'สรุปเสียงจากไฟล์';
+        }
+
+        return StudyLog::create([
+            'subject_id' => $subject->id,
+            'title' => $resolvedTitle,
+            'note' => $sourceMode === 'record' ? 'อัดเสียงสดเพื่อสรุป' : 'อัปโหลดเสียงเพื่อสรุป',
+            'mood' => $mood,
             'log_date' => Carbon::now()->toDateString(),
             'log_type' => StudyLog::TYPE_AUDIO_SUMMARY,
         ]);
@@ -316,6 +439,28 @@ class AIController extends Controller
             'file_type' => 'audio',
             'mime_type' => $file->getMimeType(),
             'file_size' => $file->getSize(),
+        ]);
+    }
+
+    private function createBrowserAudioFileRecord(
+        Subject $subject,
+        StudyLog $log,
+        ?string $title,
+        ?string $sourceMode,
+        string $transcript
+    ): FileAttachment {
+        $baseName = trim((string) $title);
+        if ($baseName === '') {
+            $baseName = $sourceMode === 'record' ? 'recording.webm' : 'browser-audio-summary.wav';
+        }
+
+        return FileAttachment::create([
+            'study_log_id' => $log->id,
+            'original_name' => $baseName,
+            'file_path' => 'browser-audio-summaries/'.$subject->id.'/'.Carbon::now()->format('YmdHis').'-'.bin2hex(random_bytes(4)).'.txt',
+            'file_type' => 'audio',
+            'mime_type' => 'text/plain',
+            'file_size' => max(0, strlen($transcript)),
         ]);
     }
 
@@ -352,7 +497,8 @@ class AIController extends Controller
         FileAttachment $fileRecord,
         StudyLog $log,
         array $result,
-        ?string $sourceMode = null
+        ?string $sourceMode = null,
+        ?string $summaryPeriod = null
     ): void {
         $transcript = (string) ($result['transcript'] ?? $result['text'] ?? '');
         $summary = (string) ($result['summary'] ?? '');
@@ -374,12 +520,13 @@ class AIController extends Controller
             'ai_model' => $result['model'] ?? null,
             'metadata' => [
                 'source_mode' => $sourceMode ?: 'upload',
+                'summary_period' => $summaryPeriod ?: 'daily',
             ],
         ]);
 
         AudioSummaryV2::create([
             'job_id' => $job->id,
-            'summary_type' => 'medium',
+            'summary_type' => $summaryPeriod ?: 'daily',
             'prompt' => 'สรุปใจความจากเสียงเป็นภาษาไทยแบบเข้าใจง่าย กระชับ ใช้ bullet สั้น ๆ',
             'summary_text' => $summary,
             'provider' => config('ai.provider'),
@@ -393,7 +540,8 @@ class AIController extends Controller
         FileAttachment $fileRecord,
         StudyLog $log,
         ?string $errorMessage,
-        ?string $sourceMode = null
+        ?string $sourceMode = null,
+        ?string $summaryPeriod = null
     ): void {
         AudioSummary::create([
             'file_id' => $fileRecord->id,
@@ -402,12 +550,13 @@ class AIController extends Controller
             'error_message' => $this->normalizeErrorMessage($errorMessage),
             'metadata' => [
                 'source_mode' => $sourceMode ?: 'upload',
+                'summary_period' => $summaryPeriod ?: 'daily',
             ],
         ]);
 
         AudioSummaryV2::create([
             'job_id' => $job->id,
-            'summary_type' => 'medium',
+            'summary_type' => $summaryPeriod ?: 'daily',
             'summary_text' => '',
             'provider' => config('ai.provider'),
             'model' => config('ai.gemini.model') ?: config('ai.openai.summary_model'),

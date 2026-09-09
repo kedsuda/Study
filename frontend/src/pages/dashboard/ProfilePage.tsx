@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { SignOut } from 'phosphor-react';
 import { useAppAlert } from '../../context/AppAlertContext';
 import { useAuth } from '../../context/AuthContext';
 import { api, apiFallbackClients, assetBaseURL } from '../../services/api';
@@ -7,16 +7,7 @@ import { api, apiFallbackClients, assetBaseURL } from '../../services/api';
 type ProfileFormState = {
   name: string;
   education_level: string;
-  profile_pic: File | null;
   previewUrl: string | null;
-};
-
-type CareerRecommendation = {
-  career: string;
-  skills: string;
-  subjects: string;
-  score: number;
-  reason?: string | null;
 };
 
 const resolveProfileUrl = (value?: string | null, fallbackBase?: string) => {
@@ -52,18 +43,14 @@ const resolveProfileUrl = (value?: string | null, fallbackBase?: string) => {
 };
 
 export const ProfilePage = () => {
-  const { user, updateUser } = useAuth();
+  const { user, updateUser, logout } = useAuth();
   const { success, error } = useAppAlert();
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [form, setForm] = useState<ProfileFormState>({
     name: '',
     education_level: '',
-    profile_pic: null,
     previewUrl: null
   });
   const [saving, setSaving] = useState(false);
-  const [editingEnabled, setEditingEnabled] = useState(false);
-  const [careerRecommendation, setCareerRecommendation] = useState<CareerRecommendation | null>(null);
   const [profileImageFailed, setProfileImageFailed] = useState(false);
 
   useEffect(() => {
@@ -77,56 +64,6 @@ export const ProfilePage = () => {
     setProfileImageFailed(false);
   }, [user]);
 
-  useEffect(() => {
-    if (!user) return;
-    let cancelled = false;
-
-    const loadProfilePanels = async () => {
-      try {
-        const careerResponse = await api.post<{ recommendations?: CareerRecommendation[] }>('/career/analyze');
-
-        if (cancelled) return;
-
-        setCareerRecommendation(careerResponse.data?.recommendations?.[0] ?? null);
-      } catch {
-        setCareerRecommendation(null);
-        // Keep profile page usable even when secondary panels fail.
-      }
-    };
-
-    void loadProfilePanels();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [user]);
-
-  useEffect(() => {
-    return () => {
-      if (form.profile_pic && form.previewUrl?.startsWith('blob:')) {
-        URL.revokeObjectURL(form.previewUrl);
-      }
-    };
-  }, [form.previewUrl, form.profile_pic]);
-
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0] ?? null;
-    if (form.profile_pic && form.previewUrl?.startsWith('blob:')) {
-      URL.revokeObjectURL(form.previewUrl);
-    }
-        if (!file) {
-      setForm(prev => ({
-        ...prev,
-        profile_pic: null,
-        previewUrl: resolveProfileUrl(user?.profile_pic ?? user?.avatar, assetBaseURL || api.defaults.baseURL)
-      }));
-      return;
-    }
-    const previewUrl = URL.createObjectURL(file);
-    setProfileImageFailed(false);
-    setForm(prev => ({ ...prev, profile_pic: file, previewUrl }));
-  };
-
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!user) return;
@@ -138,17 +75,11 @@ export const ProfilePage = () => {
     }
     setSaving(true);
     try {
-      const buildPayload = (useMethodOverride = false) => {
-        const payload = new FormData();
-        payload.append('name', trimmedName);
-        payload.append('education_level', trimmedEducationLevel);
-        if (useMethodOverride) {
-          payload.append('_method', 'PUT');
-        }
-        if (form.profile_pic) {
-          payload.append('profile_pic', form.profile_pic);
-        }
-        return payload;
+      // ส่งเป็น JSON เพื่อให้ PHP/Laravel อ่านข้อมูลจาก PUT ได้สม่ำเสมอ
+      // (multipart/FormData กับ PUT อาจทำให้ education_level ไม่ถูกส่งถึงเซิร์ฟเวอร์)
+      const requestPayload = {
+        name: trimmedName,
+        education_level: trimmedEducationLevel || null
       };
 
       let response: any = null;
@@ -156,13 +87,13 @@ export const ProfilePage = () => {
 
       for (const client of apiFallbackClients) {
         try {
-          response = await client.put('/auth/profile', buildPayload());
+          response = await client.put('/auth/profile', requestPayload);
           break;
         } catch (error: any) {
           const status = error?.response?.status;
           if (status === 404 || status === 405) {
             try {
-              response = await client.post('/auth/profile', buildPayload(true));
+              response = await client.post('/auth/profile', { ...requestPayload, _method: 'PUT' });
               break;
             } catch (fallbackError: any) {
               lastError = fallbackError;
@@ -204,16 +135,11 @@ export const ProfilePage = () => {
         ...prev,
         name: nextName,
         education_level: nextEducationLevel,
-        profile_pic: null,
         previewUrl: cacheBustedProfilePic
           ? resolveProfileUrl(cacheBustedProfilePic, assetBaseURL || api.defaults.baseURL)
           : prev.previewUrl
       }));
       success(responseMessage);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-      }
-      setEditingEnabled(false);
     } catch (err: any) {
       error(err?.response?.data?.message ?? 'อัปเดตชื่อผู้ใช้และระดับการศึกษาไม่สำเร็จ');
     } finally {
@@ -229,288 +155,108 @@ export const ProfilePage = () => {
     );
   }
 
+  const providerLabel = user.provider ?? 'อีเมล';
+  const initial = (user.name || user.email || 'U').trim().charAt(0).toUpperCase();
+
   return (
-    <>
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept="image/*"
-        onChange={handleFileChange}
-        className="hidden"
-      />
-
-      <div className="mx-auto w-full max-w-6xl space-y-6 pb-10 text-[color:var(--text)]">
-        <section className="relative overflow-hidden rounded-[30px] border border-[color:var(--border)] bg-[color:var(--surface)] p-6 shadow-[0_18px_48px_rgba(15,23,42,0.12)] md:p-8">
-          <div className="absolute right-0 top-0 h-48 w-48 rounded-full bg-[color:rgba(var(--accent-rgb),0.08)] blur-3xl" />
-          <div className="relative z-10 flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
-            <div className="flex items-center gap-5">
-              <div className="flex h-24 w-24 items-center justify-center overflow-hidden rounded-[26px] text-4xl font-bold text-white shadow-[0_18px_40px_rgba(37,99,235,0.28)]" style={{ background: 'linear-gradient(135deg, #4338ca, #2563eb)' }}>
-                {form.previewUrl ? (
-                  <img
-                    src={form.previewUrl}
-                    alt={user.name ?? 'Profile'}
-                    className="h-full w-full object-cover"
-                    referrerPolicy="no-referrer"
-                    onError={() => {
-                      const fallback = resolveProfileUrl(user.avatar, assetBaseURL || api.defaults.baseURL);
-                      if (fallback && fallback !== form.previewUrl) {
-                        setForm(prev => ({ ...prev, previewUrl: fallback }));
-                        return;
-                      }
-                      setProfileImageFailed(true);
-                      setForm(prev => ({ ...prev, previewUrl: null }));
-                    }}
-                  />
-                ) : (
-                  <span title={profileImageFailed ? 'ไม่สามารถโหลดรูปโปรไฟล์' : undefined}>
-                    {user.name?.charAt(0) ?? 'U'}
-                  </span>
-                )}
-              </div>
-              <div>
-                <p className="text-sm font-medium text-[color:var(--muted)]">{user.provider ?? 'อีเมล'}</p>
-                <h1 className="mt-1 text-2xl font-bold text-[color:var(--text)] md:text-3xl">{user.name}</h1>
-                <p className="mt-1 flex items-center gap-2 text-sm text-[color:var(--muted)]">
-                  <span className="inline-flex h-2.5 w-2.5 rounded-full bg-emerald-500" />
-                  {user.email}
-                </p>
-                <div className="mt-3 inline-flex rounded-full bg-[color:var(--surface-2)] px-3 py-1 text-xs font-semibold text-[color:var(--muted)]">
-                  ระดับการศึกษา: {user.education_level || 'ยังไม่ได้ระบุ'}
-                </div>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => setEditingEnabled(true)}
-              className="inline-flex items-center justify-center gap-2 rounded-2xl px-5 py-3 text-sm font-semibold shadow-[0_14px_30px_rgba(var(--accent-rgb),0.22)] transition hover:brightness-110"
-              style={{ background: 'var(--accent)', color: 'var(--on-accent)', WebkitTextFillColor: 'var(--on-accent)' }}
-            >
-              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M12 5H7a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" />
-                <path d="m16 5 3 3" />
-                <path d="M14 10 19 5" />
-              </svg>
-              ตั้งค่าโปรไฟล์
-            </button>
+    <div className="mx-auto w-full max-w-[760px] space-y-5 pb-10 text-[color:var(--text)]">
+      <section className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-5 shadow-[0_16px_36px_rgba(0,0,0,0.14)] sm:p-6">
+        <div className="flex items-center gap-4">
+          <div
+            className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-xl text-3xl font-semibold text-white"
+            style={{ background: 'linear-gradient(135deg, #8b5cf6, #6d5dd3)' }}
+          >
+            {form.previewUrl ? (
+              <img
+                src={form.previewUrl}
+                alt={user.name ?? 'Profile'}
+                className="h-full w-full object-cover"
+                referrerPolicy="no-referrer"
+                onError={() => {
+                  const fallback = resolveProfileUrl(user.avatar, assetBaseURL || api.defaults.baseURL);
+                  if (fallback && fallback !== form.previewUrl) {
+                    setForm(prev => ({ ...prev, previewUrl: fallback }));
+                    return;
+                  }
+                  setProfileImageFailed(true);
+                  setForm(prev => ({ ...prev, previewUrl: null }));
+                }}
+              />
+            ) : (
+              <span title={profileImageFailed ? 'ไม่สามารถโหลดรูปโปรไฟล์' : undefined}>{initial}</span>
+            )}
           </div>
-        </section>
-
-        <section>
-          <div className="space-y-6">
-            <section className="relative overflow-hidden rounded-[30px] border border-[color:rgba(var(--accent-rgb),0.25)] bg-[linear-gradient(135deg,rgba(var(--accent-rgb),0.16),rgba(var(--accent-rgb),0.06))] p-6 shadow-[0_18px_48px_rgba(15,23,42,0.10)] md:p-8">
-              <div className="absolute right-4 top-4 text-[color:rgba(var(--accent-rgb),0.14)]">
-                <svg viewBox="0 0 24 24" className="h-24 w-24" fill="none" stroke="currentColor" strokeWidth="1">
-                  <path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h15A1.5 1.5 0 0 1 21 7.5v9A1.5 1.5 0 0 1 19.5 18h-15A1.5 1.5 0 0 1 3 16.5Z" />
-                  <path d="M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6" />
-                  <path d="M3 11h18" />
-                </svg>
-              </div>
-              <div className="relative z-10">
-                <div className="inline-flex items-center gap-2 rounded-full bg-[color:rgba(var(--accent-rgb),0.10)] px-3 py-1 text-sm font-semibold text-[color:var(--accent-ink)]">
-                  <span className="inline-flex h-2.5 w-2.5 rounded-full bg-[color:var(--accent)]" />
-                  วิเคราะห์จากผลแบบฝึกหัด
-                </div>
-                <h2 className="mt-4 text-lg text-[color:var(--muted)]">เส้นทางอาชีพที่เหมาะกับคุณ</h2>
-                <div className="mt-2 text-2xl font-bold text-[color:var(--accent-ink)] md:text-4xl">
-                  {careerRecommendation?.career ?? 'ยังไม่มีข้อมูลเพียงพอ'}
-                </div>
-                <div className="mt-4 flex items-center gap-4">
-                  <div className="h-2.5 w-full max-w-xs overflow-hidden rounded-full bg-[color:var(--surface-2)]">
-                    <div
-                      className="h-full rounded-full bg-[color:var(--accent)]"
-                      style={{ width: `${careerRecommendation ? Math.round(careerRecommendation.score) : 0}%` }}
-                    />
-                  </div>
-                  <span className="text-sm font-medium text-[color:var(--muted)]">
-                    ระดับความเหมาะสม {careerRecommendation ? `${Math.round(careerRecommendation.score)}%` : '--'}
-                  </span>
-                </div>
-                <p className="mt-6 max-w-2xl text-sm leading-relaxed text-[color:var(--muted)]">
-                  {careerRecommendation?.reason ||
-                    'ระบบจะแนะนำเมื่อมีผลแบบฝึกหัดจริงที่เพียงพอและชี้ความถนัดได้เท่านั้น'}
-                </p>
-                <div className="mt-6">
-                  <Link
-                    to="/career-advisor"
-                    className="inline-flex items-center gap-2 rounded-xl bg-[color:var(--surface)] px-4 py-2.5 text-sm font-semibold text-[color:var(--accent-ink)] shadow-sm ring-1 ring-[color:rgba(var(--accent-rgb),0.25)] transition hover:bg-[color:rgba(var(--accent-rgb),0.12)]"
-                  >
-                    ดูอาชีพแนะนำทั้งหมด
-                    <span>›</span>
-                  </Link>
-                </div>
-              </div>
-            </section>
-
-            <div>
-              <section className="rounded-[28px] border border-[color:var(--border)] bg-[color:var(--surface)] p-6 shadow-[0_18px_48px_rgba(15,23,42,0.10)]">
-                <div className="flex items-center gap-2">
-                  <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[color:rgba(var(--accent-rgb),0.10)] text-[color:var(--accent-ink)]">
-                    <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M12 20h9" />
-                      <path d="M12 4h9" />
-                      <path d="M4 9h16" />
-                      <path d="M4 15h10" />
-                    </svg>
-                  </span>
-                  <div>
-                    <h3 className="text-lg font-bold text-[color:var(--text)]">ทักษะที่ควรเริ่มพัฒนาก่อน</h3>
-                    <p className="text-sm text-[color:var(--muted)]">สรุปจากสายอาชีพที่เหมาะกับคุณตอนนี้</p>
-                  </div>
-                </div>
-                <div className="mt-5 flex flex-wrap gap-2">
-                  {(careerRecommendation?.skills?.split(',').map(skill => skill.trim()).filter(Boolean) ?? []).slice(0, 6).map(skill => (
-                    <span
-                      key={skill}
-                      className="rounded-xl border px-3 py-1.5 text-sm font-medium text-[color:var(--accent-ink)]"
-                      style={{ borderColor: 'rgba(var(--accent-rgb),0.18)', background: 'rgba(var(--accent-rgb),0.08)' }}
-                    >
-                      {skill}
-                    </span>
-                  ))}
-                  {!careerRecommendation?.skills && (
-                    <span className="text-sm text-[color:var(--muted)]">ยังไม่มีรายการทักษะที่สรุปได้</span>
-                  )}
-                </div>
-              </section>
-
-            </div>
-          </div>
-
-        </section>
-
-      </div>
-
-      {editingEnabled ? (
-        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-lg overflow-hidden rounded-[28px] border border-[color:var(--border)] bg-[color:var(--surface)] shadow-[0_32px_80px_rgba(15,23,42,0.24)]">
-            <div className="flex items-center justify-between border-b border-[color:var(--border)] px-6 py-4">
-              <div>
-                <h2 className="text-xl font-bold text-[color:var(--text)]">อัปเดตโปรไฟล์</h2>
-                <p className="mt-1 text-sm text-[color:var(--muted)]">แก้ไขข้อมูลส่วนตัวของคุณจากหน้าต่างนี้</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setEditingEnabled(false)}
-                className="flex h-10 w-10 items-center justify-center rounded-full bg-[color:var(--surface-2)] text-[color:var(--muted)] transition hover:brightness-95"
-                aria-label="ปิด"
-              >
-                <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M18 6 6 18" />
-                  <path d="m6 6 12 12" />
-                </svg>
-              </button>
-            </div>
-
-            <form onSubmit={handleSubmit} className="space-y-6 px-6 py-6">
-              <div className="flex items-center gap-4">
-                <div className="relative h-20 w-20">
-                  <div className="h-20 w-20 overflow-hidden rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)]">
-                    {form.previewUrl ? (
-                      <img
-                        src={form.previewUrl}
-                        alt="รูปโปรไฟล์"
-                        className="h-full w-full object-cover"
-                        referrerPolicy="no-referrer"
-                        onError={() => {
-                          const fallback = resolveProfileUrl(user.avatar, assetBaseURL || api.defaults.baseURL);
-                          setForm(prev => ({ ...prev, previewUrl: fallback && fallback !== prev.previewUrl ? fallback : null }));
-                        }}
-                      />
-                    ) : (
-                      <div className="flex h-full w-full items-center justify-center text-2xl font-semibold text-[color:var(--muted)]">
-                        {user.name?.charAt(0) ?? 'U'}
-                      </div>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="absolute -bottom-2 -right-2 flex h-9 w-9 items-center justify-center rounded-full border border-white text-white shadow-lg transition hover:scale-105 hover:brightness-110"
-                    style={{ background: 'var(--accent)', color: 'var(--on-accent)', WebkitTextFillColor: 'var(--on-accent)' }}
-                    title="เลือกรูปโปรไฟล์"
-                    aria-label="เลือกรูปโปรไฟล์"
-                  >
-                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M12 5H7a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" />
-                      <path d="m16 5 3 3" />
-                      <path d="M14 10 19 5" />
-                      <path d="M9 13h6" />
-                    </svg>
-                  </button>
-                </div>
-                <div>
-                  <p className="text-sm font-semibold text-[color:var(--text)]">รูปโปรไฟล์</p>
-                  <p className="mt-1 text-sm text-[color:var(--muted)]">เลือกรูปใหม่ได้จากหน้าต่างนี้เท่านั้น</p>
-                </div>
-              </div>
-
-              <div className="space-y-4">
-                <h3 className="text-sm font-bold text-[color:var(--text)]">ข้อมูลบัญชี</h3>
-                <div className="grid gap-4 md:grid-cols-2">
-                  <div>
-                    <label className="mb-1 block text-xs text-[color:var(--muted)]">ผู้ให้บริการ</label>
-                    <input
-                      type="text"
-                      disabled
-                      value={user.provider ?? 'อีเมล'}
-                      className="w-full rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-2.5 text-sm text-[color:var(--muted)] outline-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="mb-1 block text-xs text-[color:var(--muted)]">อีเมล</label>
-                    <input
-                      type="text"
-                      disabled
-                      value={user.email}
-                      className="w-full rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-2.5 text-sm text-[color:var(--muted)] outline-none"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              <div className="space-y-4">
-                <h3 className="text-sm font-bold text-[color:var(--text)]">ข้อมูลส่วนตัว</h3>
-                <div>
-                  <label className="mb-1.5 block text-sm text-[color:var(--text)]">ชื่อผู้ใช้</label>
-                  <input
-                    value={form.name}
-                    onChange={event => setForm(prev => ({ ...prev, name: event.target.value }))}
-                    className="w-full rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-2.5 text-sm text-[color:var(--text)] outline-none transition focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:rgba(var(--accent-rgb),0.22)]"
-                    placeholder="ชื่อของคุณ"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1.5 block text-sm text-[color:var(--text)]">ระดับการศึกษา</label>
-                  <input
-                    value={form.education_level}
-                    onChange={event => setForm(prev => ({ ...prev, education_level: event.target.value }))}
-                    className="w-full rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-2.5 text-sm text-[color:var(--text)] outline-none transition focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:rgba(var(--accent-rgb),0.22)]"
-                    placeholder="เช่น มัธยม / ปริญญาตรี"
-                  />
-                </div>
-              </div>
-
-              <div className="flex gap-3 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setEditingEnabled(false)}
-                  className="flex-1 rounded-xl bg-[color:var(--surface-2)] px-4 py-3 font-medium text-[color:var(--text)] transition hover:brightness-95"
-                >
-                  ยกเลิก
-                </button>
-                <button
-                  type="submit"
-                  disabled={saving}
-                  className="flex-1 rounded-xl px-4 py-3 font-medium shadow-sm transition hover:brightness-110 disabled:opacity-60"
-                  style={{ background: 'var(--accent)', color: 'var(--on-accent)', WebkitTextFillColor: 'var(--on-accent)' }}
-                >
-                  {saving ? 'กำลังบันทึก...' : 'บันทึกโปรไฟล์'}
-                </button>
-              </div>
-            </form>
+          <div className="min-w-0">
+            <h1 className="truncate text-lg font-bold text-[color:var(--text)] sm:text-xl">{user.name}</h1>
+            <p className="mt-1 truncate text-sm text-[color:var(--muted)]">{user.email}</p>
           </div>
         </div>
-      ) : null}
-    </>
+      </section>
+
+      <section className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-5 shadow-[0_16px_36px_rgba(0,0,0,0.12)] sm:p-6">
+        <h2 className="text-base font-bold text-[color:var(--text)]">ข้อมูลบัญชี</h2>
+        <div className="mt-4 space-y-3">
+          <div className="flex min-h-10 items-center justify-between gap-4 rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-2.5">
+            <span className="text-sm text-[color:var(--muted)]">ผู้ให้บริการ</span>
+            <span className="min-w-0 truncate text-right text-sm text-[color:var(--muted)]">{providerLabel}</span>
+          </div>
+          <div className="flex min-h-10 items-center justify-between gap-4 rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-2.5">
+            <span className="text-sm text-[color:var(--muted)]">อีเมล</span>
+            <span className="min-w-0 truncate text-right text-sm text-[color:var(--muted)]">{user.email}</span>
+          </div>
+        </div>
+      </section>
+
+      <section className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-5 shadow-[0_16px_36px_rgba(0,0,0,0.12)] sm:p-6">
+        <h2 className="text-base font-bold text-[color:var(--text)]">อัปเดตโปรไฟล์</h2>
+        <form onSubmit={handleSubmit} className="mt-5 space-y-5">
+          <div>
+            <label className="mb-2 block text-sm text-[color:var(--muted)]">ชื่อผู้ใช้</label>
+            <input
+              value={form.name}
+              onChange={event => setForm(prev => ({ ...prev, name: event.target.value }))}
+              className="w-full rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-3 text-sm font-semibold text-[color:var(--text)] outline-none transition focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:rgba(var(--accent-rgb),0.22)]"
+              placeholder="ชื่อของคุณ"
+            />
+          </div>
+
+          <div>
+            <label className="mb-2 block text-sm text-[color:var(--muted)]">ระดับการศึกษา</label>
+            <select
+              value={form.education_level}
+              onChange={event => setForm(prev => ({ ...prev, education_level: event.target.value }))}
+              className="w-full rounded-xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-3 text-sm text-[color:var(--text)] outline-none transition focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:rgba(var(--accent-rgb),0.22)]"
+            >
+              <option value="">เลือกระดับการศึกษา</option>
+              <option value="ประถมศึกษา">ประถมศึกษา</option>
+              <option value="มัธยมศึกษาตอนต้น">มัธยมศึกษาตอนต้น</option>
+              <option value="มัธยมศึกษาตอนปลาย / ปวช.">มัธยมศึกษาตอนปลาย / ปวช.</option>
+              <option value="ปวส. / อนุปริญญา">ปวส. / อนุปริญญา</option>
+              <option value="ปริญญาตรี">ปริญญาตรี</option>
+              <option value="ปริญญาโท">ปริญญาโท</option>
+              <option value="ปริญญาเอก">ปริญญาเอก</option>
+              <option value="อื่น ๆ">อื่น ๆ</option>
+            </select>
+          </div>
+
+          <button
+            type="submit"
+            disabled={saving}
+            className="w-full rounded-xl bg-[#2f80df] px-4 py-3 text-sm font-bold text-white shadow-[0_12px_24px_rgba(47,128,223,0.24)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {saving ? 'กำลังบันทึก...' : 'บันทึกโปรไฟล์'}
+          </button>
+        </form>
+      </section>
+
+      <button
+        type="button"
+        onClick={() => void logout()}
+        className="flex w-full items-center justify-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-600 transition hover:bg-rose-100"
+      >
+        <SignOut size={18} weight="bold" aria-hidden="true" />
+        ออกจากระบบ
+      </button>
+    </div>
   );
 };

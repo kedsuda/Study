@@ -27,10 +27,10 @@ export const getSemesterKey = (subject?: SemesterSubjectLike | null) => {
 };
 
 export const formatSemesterLabel = (semester?: number | null, academicYear?: number | null) => {
-  if (semester && academicYear) return `เทอม ${semester}/${academicYear}`;
-  if (semester) return `เทอม ${semester}`;
-  if (academicYear) return `ปี ${academicYear}`;
-  return 'ไม่ระบุเทอม';
+  if (semester && academicYear) return `ภาคเรียนที่ ${semester} ปีการศึกษา ${academicYear}`;
+  if (semester) return `ภาคเรียนที่ ${semester}`;
+  if (academicYear) return `ปีการศึกษา ${academicYear}`;
+  return 'ไม่ระบุภาคเรียน';
 };
 
 export const buildSemesterOptions = <T extends SemesterSubjectLike>(subjects: T[]): SemesterOption[] => {
@@ -54,10 +54,10 @@ export const buildSemesterOptions = <T extends SemesterSubjectLike>(subjects: T[
     return (a.semester ?? 0) - (b.semester ?? 0);
   });
 
-  return [{ key: 'all', label: 'ทุกเทอม' }, ...ordered];
+  return ordered;
 };
 
 export const filterBySemester = <T extends SemesterSubjectLike>(subjects: T[], semesterKey: string) => {
-  if (semesterKey === 'all') return subjects;
+  if (!semesterKey || semesterKey === 'all') return subjects;
   return subjects.filter(subject => getSemesterKey(subject) === semesterKey);
 };

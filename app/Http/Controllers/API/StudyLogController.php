@@ -5,24 +5,17 @@ namespace App\Http\Controllers\API;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\StudyLogRequest;
 use App\Http\Resources\StudyLogResource;
-use App\Mail\ScheduleNotificationMail;
-use App\Models\EmailProviderAccount;
 use App\Models\LearningNotification;
-use App\Models\NotificationEmailLog;
 use App\Models\NotificationEmailSetting;
 use App\Models\StudyCalendarEvent;
 use App\Models\StudyLog;
 use App\Models\Subject;
 use App\Models\User;
 use App\Models\AudioSummary;
-use App\Services\Email\GmailApiMailer;
-use App\Services\Notification\NotificationEmailSender;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 
@@ -248,37 +241,7 @@ class StudyLogController extends Controller
             ],
         ]);
 
-        $this->sendStudyLogEmail($user, $notification, $title, $message);
-
         return $notification;
-    }
-
-    private function sendStudyLogEmail(
-        User $user,
-        LearningNotification $notification,
-        string $title,
-        string $message
-    ): void {
-        app(NotificationEmailSender::class)->sendNotification($user, $notification);
-    }
-
-    private function isMailConfigured(): bool
-    {
-        $required = [
-            config('mail.mailers.smtp.host'),
-            config('mail.mailers.smtp.port'),
-            config('mail.mailers.smtp.username'),
-            config('mail.mailers.smtp.password'),
-            config('mail.from.address'),
-        ];
-
-        foreach ($required as $value) {
-            if (! filled($value)) {
-                return false;
-            }
-        }
-
-        return true;
     }
 
     private function resolveEmailSettings(User $user): ?NotificationEmailSetting
@@ -300,50 +263,10 @@ class StudyLogController extends Controller
         );
     }
 
-    private function createEmailLog(
-        int $userId,
-        int $notificationId,
-        string $toEmail,
-        string $subject,
-        string $provider
-    ): ?NotificationEmailLog
-    {
-        if (! Schema::hasTable((new NotificationEmailLog())->getTable())) {
-            return null;
-        }
-
-        return NotificationEmailLog::create([
-            'user_id' => $userId,
-            'learning_notification_id' => $notificationId,
-            'to_email' => $toEmail,
-            'subject' => $subject,
-            'provider' => $provider,
-            'status' => 'queued',
-        ]);
-    }
-
     private function resolveTimezone(User $user): string
     {
         $settings = $this->resolveEmailSettings($user);
         return $settings?->timezone ?: 'Asia/Bangkok';
-    }
-
-    private function resolveGmailAccount(User $user): ?EmailProviderAccount
-    {
-        if (! Schema::hasTable((new EmailProviderAccount())->getTable())) {
-            return null;
-        }
-
-        $query = EmailProviderAccount::where('user_id', $user->id)
-            ->where('provider', 'gmail')
-            ->where('auth_type', 'oauth')
-            ->where('status', 'active');
-
-        if ($user->email) {
-            $query->where('provider_email', $user->email);
-        }
-
-        return $query->first();
     }
 
     private function resolveManualStudyLogId(): ?int

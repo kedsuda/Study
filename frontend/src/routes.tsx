@@ -16,8 +16,8 @@ import { VoiceSummaryPage } from './pages/dashboard/VoiceSummaryPage';
 import { CareerAdvisorPage } from './pages/dashboard/CareerAdvisorPage';
 import { NotificationPage } from './pages/dashboard/NotificationPage';
 import { GoalsPage } from './pages/dashboard/GoalsPage';
+import { LearningStatsPage } from './pages/dashboard/LearningStatsPage';
 import { ProfilePage } from './pages/dashboard/ProfilePage';
-import { StudyCapturePage } from './pages/dashboard/StudyCapturePage';
 import { StudyDigestPage } from './pages/dashboard/StudyDigestPage';
 import { StudyStoragePage } from './pages/dashboard/StudyStoragePage';
 import { RequireAuth } from './components/RequireAuth';
@@ -61,11 +61,12 @@ const getAdminBase = () => {
         'calendar',
         'notifications',
         'profile',
-        'goals',
+    'goals',
+    'learning-stats',
         'voice-summary',
         'document-summary',
+        'archived-summaries',
         'career-advisor',
-        'study-capture',
         'study-digest',
         'study-storage',
         'public',
@@ -169,10 +170,11 @@ const detectBrowserBasename = (): string | undefined => {
     '/notifications',
     '/profile',
     '/goals',
+    '/learning-stats',
     '/voice-summary',
     '/document-summary',
+    '/archived-summaries',
     '/career-advisor',
-    '/study-capture',
     '/study-digest',
     '/study-storage',
   ];
@@ -200,10 +202,11 @@ const detectBrowserBasename = (): string | undefined => {
       'notifications',
       'profile',
       'goals',
+      'learning-stats',
       'voice-summary',
       'document-summary',
+      'archived-summaries',
       'career-advisor',
-      'study-capture',
       'study-digest',
       'study-storage',
       'ai-assistant',
@@ -225,7 +228,6 @@ const routes = [
   /* =========================
    * ✅ ADMIN (redirect to PHP)
    * ========================= */
-  { path: '/admin', element: <AdminRedirect path="/backend/admin.php" /> },
   { path: '/admin-login', element: <AdminRedirect path="/backend/admin_login.php" /> },
   { path: '/admin-logout', element: <AdminRedirect path="/backend/admin_logout.php" /> },
   { path: '/admin.php', element: <AdminRedirect path="/backend/admin.php" /> },
@@ -275,14 +277,17 @@ const routes = [
       { path: 'notifications', element: <NotificationPage /> },
       { path: 'profile', element: <ProfilePage /> },
       { path: 'goals', element: <GoalsPage /> },
+      { path: 'learning-stats', element: <LearningStatsPage /> },
       { path: 'voice-summary', element: <VoiceSummaryPage /> },
       { path: 'document-summary', element: <DocumentSummaryPage /> },
-      { path: 'archived-summaries', element: <Navigate to="/document-summary" replace /> },
+      { path: 'archived-summaries', element: <DocumentSummaryPage /> },
       { path: 'career-advisor', element: <CareerAdvisorPage mode="career" /> },
       { path: 'ai-assistant', element: <CareerAdvisorPage mode="home" /> },
-      { path: 'study-capture', element: <StudyCapturePage /> },
       { path: 'study-digest', element: <StudyDigestPage /> },
-      { path: 'study-storage', element: <StudyStoragePage /> }
+      { path: 'study-storage', element: <StudyStoragePage /> },
+      // Keep the administrator area on the established PHP dashboard.  It contains
+      // the original overview, filters, statistic cards, and chart shown to admins.
+      { path: 'admin', element: <AdminRedirect path="/backend/admin.php" /> }
     ]
   },
 

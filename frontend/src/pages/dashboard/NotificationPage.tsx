@@ -1,3 +1,4 @@
+import { TimePicker } from '../../components/TimePicker';
 import axios from 'axios';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, legacyApi } from '../../services/api';
@@ -9,7 +10,6 @@ import {
   Clock,
   Edit2,
   Plus,
-  RefreshCw,
   Settings,
   Sparkles,
   Trash2,
@@ -22,7 +22,7 @@ import {
   markLocalNotificationAsRead,
   updateLocalNotificationTime,
 } from '../../services/localNotifications';
-import { useSemesterOptions } from '../../hooks/useSemesterOptions';
+import { useDefaultSemesterSelection, useSemesterOptions } from '../../hooks/useSemesterOptions';
 import { filterBySemester, toNumberOrNull } from '../../utils/semester';
 import { subscribeSubjectsUpdated } from '../../utils/subjectSync';
 
@@ -46,33 +46,6 @@ type StudyNotification = {
   status?: string | null;
   channel?: string | null;
 };
-
-type NotificationSettings = {
-  send_time?: string;
-  timezone?: string;
-  email_enabled?: boolean;
-};
-
-type Time24Parts = {
-  hour24: string;
-  minute: string;
-};
-
-type TimePickerProps = {
-  value?: string;
-  onChange: (value: string) => void;
-  className?: string;
-  compact?: boolean;
-};
-type TimeSelectProps = {
-  value: string;
-  options: string[];
-  onChange: (value: string) => void;
-  widthClass?: string;
-};
-
-const NOTIFY_TIME_STORAGE_KEY = 'slt::daily-notify-time';
-const NOTIFY_TIME_EVENT = 'slt:daily-notify-time:changed';
 
 const shouldFallbackRequest = (err: unknown) => {
   if (!axios.isAxiosError(err)) return false;
@@ -118,6 +91,13 @@ const parseNotifyAt = (value: string) => {
   const trimmed = value.trim();
   if (!trimmed) return new Date();
 
+  // Respect the offset from the API before attempting the legacy
+  // timezone-less format used by older notifications.
+  if (/[zZ]|[+-]\d{2}:\d{2}$/.test(trimmed)) {
+    const parsedIso = parseISO(trimmed);
+    if (isValid(parsedIso)) return parsedIso;
+  }
+
   const match = trimmed.match(
     /^(\d{4})[-/](\d{2})[-/](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/
   );
@@ -131,12 +111,6 @@ const parseNotifyAt = (value: string) => {
       Number(minute),
       Number(second || '0')
     );
-  }
-
-  // Fallback for timezone-aware ISO when date-time part is not in the expected format.
-  if (/[zZ]|[+-]\d{2}:\d{2}$/.test(trimmed)) {
-    const parsedIso = parseISO(trimmed);
-    if (isValid(parsedIso)) return parsedIso;
   }
 
   let normalized = trimmed.replace(' ', 'T');
@@ -158,107 +132,6 @@ const normalizeTimeValue = (value?: string, fallback = '00:00') => {
     return fallback;
   }
   return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-};
-
-const persistNotifyTime = (value: string) => {
-  if (typeof window === 'undefined') return;
-  window.localStorage.setItem(NOTIFY_TIME_STORAGE_KEY, value);
-  window.dispatchEvent(new CustomEvent(NOTIFY_TIME_EVENT, { detail: { value } }));
-};
-
-const hour24Options = Array.from({ length: 24 }, (_, idx) => String(idx).padStart(2, '0'));
-const minuteOptions = Array.from({ length: 60 }, (_, idx) => String(idx).padStart(2, '0'));
-
-const toTime24Parts = (value?: string): Time24Parts => {
-  const normalized = normalizeTimeValue(value, '00:00');
-  const [hourRaw, minuteRaw] = normalized.split(':');
-  return {
-    hour24: String(Number(hourRaw ?? '0')).padStart(2, '0'),
-    minute: minuteRaw ?? '00',
-  };
-};
-
-const fromTime24Parts = (parts: Time24Parts): string => {
-  const hour24 = Number(parts.hour24);
-  const minute = Number(parts.minute);
-  if (!Number.isFinite(hour24) || hour24 < 0 || hour24 > 23) return '00:00';
-  if (!Number.isFinite(minute) || minute < 0 || minute > 59) return '00:00';
-  return `${String(hour24).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-};
-
-const TimeSelect = ({ value, options, onChange, widthClass = 'w-[72px]' }: TimeSelectProps) => (
-  <div className={`relative ${widthClass}`}>
-    <select
-      value={value}
-      onChange={event => onChange(event.target.value)}
-      className="h-8 w-full appearance-none rounded-lg border px-3 pr-7 text-sm font-bold shadow-sm outline-none transition"
-      style={{
-        borderColor: 'var(--border)',
-        background: 'color-mix(in srgb, var(--surface) 92%, var(--surface-2) 8%)',
-        color: 'var(--text)',
-      }}
-    >
-      {options.map(option => (
-        <option key={option} value={option}>
-          {option}
-        </option>
-      ))}
-    </select>
-    <svg
-      viewBox="0 0 20 20"
-      className="pointer-events-none absolute right-2 top-1/2 h-4 w-4 -translate-y-1/2"
-      style={{ color: 'var(--muted)' }}
-      fill="currentColor"
-      aria-hidden="true"
-    >
-      <path d="M5.5 7.5L10 12l4.5-4.5" />
-    </svg>
-  </div>
-);
-
-const IPhoneTimePicker = ({ value, onChange, className = '', compact = false }: TimePickerProps) => {
-  const parts = toTime24Parts(value);
-  const controlHeight = compact ? 'h-9' : 'h-11';
-
-  return (
-    <div
-      className={`inline-flex items-center gap-2 rounded-xl border px-2 ${controlHeight} ${
-        ''
-      } ${className}`}
-      style={{
-        borderColor: 'var(--border)',
-        background: 'color-mix(in srgb, var(--surface) 90%, var(--surface-2) 10%)',
-      }}
-      role="group"
-      aria-label="เลือกเวลา"
-    >
-      <TimeSelect
-        value={parts.hour24}
-        options={hour24Options}
-        onChange={nextHour =>
-          onChange(
-            fromTime24Parts({
-              ...parts,
-              hour24: nextHour,
-            })
-          )
-        }
-      />
-      <span className="text-sm font-semibold" style={{ color: 'var(--text)' }}>:</span>
-      <TimeSelect
-        value={parts.minute}
-        options={minuteOptions}
-        onChange={nextMinute =>
-          onChange(
-            fromTime24Parts({
-              ...parts,
-              minute: nextMinute,
-            })
-          )
-        }
-      />
-    </div>
-  );
 };
 
 const normalizeDateInputValue = (value?: string | null): string | null => {
@@ -310,16 +183,16 @@ export const NotificationPage = () => {
   const [createOpen, setCreateOpen] = useState(false);
   const [createSubjectId, setCreateSubjectId] = useState('');
   const [createDate, setCreateDate] = useState(() => formatDateDisplayValue(format(new Date(), 'yyyy-MM-dd')));
-  const [createTime, setCreateTime] = useState('00:00');
+  const [createTime, setCreateTime] = useState(() => format(new Date(), 'HH:mm'));
   const [createSaving, setCreateSaving] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notifyTime, setNotifyTime] = useState('00:00');
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editingTime, setEditingTime] = useState('00:00');
   const [editingDate, setEditingDate] = useState('');
   const [savingId, setSavingId] = useState<number | null>(null);
   const semesterOptions = useSemesterOptions();
+  useDefaultSemesterSelection(semesterOptions, selectedSemesterKey, setSelectedSemesterKey);
   const createDatePickerRef = useRef<HTMLInputElement | null>(null);
   const editDatePickerRef = useRef<HTMLInputElement | null>(null);
 
@@ -350,6 +223,18 @@ export const NotificationPage = () => {
     target.click();
   };
 
+  const toggleCreateForm = () => {
+    setCreateOpen(isOpen => {
+      const willOpen = !isOpen;
+      if (willOpen) {
+        const current = new Date();
+        setCreateDate(formatDateDisplayValue(format(current, 'yyyy-MM-dd')));
+        setCreateTime(format(current, 'HH:mm'));
+      }
+      return willOpen;
+    });
+  };
+
   const isLocalNotification = (notification: StudyNotification) => notification.channel === 'local';
 
   const resolveNotification = (id: number) => notifications.find(item => item.id === id) ?? null;
@@ -357,10 +242,6 @@ export const NotificationPage = () => {
   const formatNotifyLabel = (value?: string | null) => {
     if (!value) return '';
     return format(parseNotifyAt(value), 'd MMM yyyy HH:mm', { locale: th });
-  };
-  const formatNotifyTimeOnly = (value?: string | null) => {
-    if (!value) return '--:--';
-    return format(parseNotifyAt(value), 'HH:mm');
   };
 
   const buildNotifyAtValue = (base: Date, dateValue?: string, timeValue?: string) => {
@@ -419,24 +300,8 @@ export const NotificationPage = () => {
     }
   };
 
-  const fetchSettings = async () => {
-    try {
-      const res = await requestWithFallback(
-        () => api.get<NotificationSettings>('/notifications/settings'),
-        () => legacyApi.get<NotificationSettings>('/notifications/settings'),
-        (response: any) => !isMissingTableResponse(response?.data)
-      );
-      const normalized = normalizeTimeValue(res.data?.send_time);
-      setNotifyTime(normalized);
-      persistNotifyTime(normalized);
-    } catch (err) {
-      // ignore
-    }
-  };
-
   useEffect(() => {
     fetchNotifications();
-    fetchSettings();
     loadSubjects();
   }, []);
 
@@ -458,45 +323,6 @@ export const NotificationPage = () => {
       setCreateSubjectId('');
     }
   }, [createSubjectId, filteredSubjects]);
-
-  const updateNotifyTime = async (value: string) => {
-    if (!value) return;
-    const normalizedTime = normalizeTimeValue(value);
-    const previousNotifications = notifications;
-
-    setNotifications(prev =>
-      prev.map(notification => {
-        if (!isScheduleTimedNotification(notification)) {
-          return notification;
-        }
-
-        const current = parseNotifyAt(notification.notify_at);
-        return {
-          ...notification,
-          notify_at: buildNotifyAtValue(current, format(current, 'yyyy-MM-dd'), normalizedTime),
-        };
-      })
-    );
-
-    try {
-      await requestWithFallback(
-        () =>
-          api.put('/notifications/settings', {
-            send_time: normalizedTime
-          }),
-        () =>
-          legacyApi.put('/notifications/settings', {
-            send_time: normalizedTime
-          }),
-        (response: any) => !isMissingTableResponse(response?.data)
-      );
-      persistNotifyTime(normalizedTime);
-      await fetchNotifications();
-    } catch (err: any) {
-      setNotifications(previousNotifications);
-      setError(err.response?.data?.message ?? 'บันทึกเวลาแจ้งเตือนไม่สำเร็จ');
-    }
-  };
 
   const startEditTime = (notification: StudyNotification) => {
     const parsed = parseNotifyAt(notification.notify_at);
@@ -693,11 +519,8 @@ export const NotificationPage = () => {
               </p>
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 <span className="inline-flex items-center rounded-lg border border-[color:var(--border)] px-2.5 py-1 text-[11px] font-semibold text-muted">
-                  {formatNotifyLabel(notification.notify_at)}
-                </span>
-                <span className="inline-flex items-center rounded-lg border border-[color:rgba(var(--accent-rgb),0.3)] bg-[color:rgba(var(--accent-rgb),0.12)] px-2.5 py-1 text-[11px] font-bold text-accent">
-                  <Clock size={12} className="mr-1" />
-                  {formatNotifyTimeOnly(notification.notify_at)} น.
+                  {notification.delivered_at ? 'แจ้งเมื่อ ' : 'กำหนดแจ้ง '}
+                  {formatNotifyLabel(notification.delivered_at ?? notification.notify_at)}
                 </span>
               </div>
               <p className={`mt-3 whitespace-pre-wrap text-sm ${notification.is_read ? 'text-muted' : 'text-[color:var(--text)]/80'}`}>
@@ -750,7 +573,7 @@ export const NotificationPage = () => {
                       className="sr-only"
                     />
                   </div>
-                  <IPhoneTimePicker
+                  <TimePicker
                     value={editingTime}
                     onChange={value => setEditingTime(normalizeTimeValue(value))}
                     className="w-full sm:w-auto"
@@ -811,7 +634,7 @@ export const NotificationPage = () => {
           </div>
           <button
             type="button"
-            onClick={() => setCreateOpen(prev => !prev)}
+            onClick={toggleCreateForm}
             className="inline-flex items-center justify-center gap-2 rounded-full px-6 py-3 text-sm font-bold text-[color:var(--on-accent)] shadow-[0_12px_26px_rgba(var(--accent-rgb),0.3)] transition hover:-translate-y-0.5"
             style={{ background: 'linear-gradient(135deg, color-mix(in srgb, var(--accent) 92%, white), color-mix(in srgb, var(--accent) 82%, black))' }}
           >
@@ -823,44 +646,7 @@ export const NotificationPage = () => {
 
       {error && <div className="rounded-2xl bg-red-100 px-4 py-3 text-sm text-red-700">{error}</div>}
 
-      <div className="grid gap-5 xl:grid-cols-[330px,1fr]">
-        <aside className="rounded-[2rem] border border-[color:var(--border)] bg-[color:color-mix(in_srgb,var(--surface)_90%,white_10%)] p-5 shadow-[0_10px_38px_rgba(0,0,0,0.06)]">
-          <div className="flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[color:rgba(var(--accent-rgb),0.12)] text-accent"><Clock size={16} /></div>
-            <h3 className="text-2xl font-black tracking-tight">แจ้งเตือนรายวัน</h3>
-          </div>
-          <p className="mt-3 text-xs text-muted">ระบุเวลาสรุปตารางเรียนในแต่ละวัน</p>
-
-          <div className="mt-5 rounded-2xl border border-muted surface-2 p-4 text-center">
-            <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted">Hour</p>
-            <p className="mt-1 text-4xl font-black text-accent">{notifyTime.split(':')[0] ?? '00'}</p>
-            <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.16em] text-muted">Min</p>
-            <p className="mt-1 text-4xl font-black text-accent">{notifyTime.split(':')[1] ?? '00'}</p>
-          </div>
-
-          <div className="mt-4 flex justify-center">
-            <IPhoneTimePicker
-              value={notifyTime}
-              onChange={value => {
-                const normalized = normalizeTimeValue(value);
-                setNotifyTime(normalized);
-                updateNotifyTime(normalized);
-              }}
-            />
-          </div>
-
-          <button
-            type="button"
-            onClick={() => void fetchNotifications()}
-            disabled={loading}
-            className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-2xl px-4 py-3 text-sm font-bold text-[color:var(--on-accent)] transition hover:opacity-95 disabled:opacity-70"
-            style={{ background: 'var(--accent)' }}
-          >
-            <RefreshCw size={16} />
-            อัปเดตเวลา
-          </button>
-        </aside>
-
+      <div className="grid gap-5">
         <div className="space-y-4">
           {createOpen ? (
             <section className="rounded-[28px] border border-muted surface p-5 shadow-soft">
@@ -942,7 +728,7 @@ export const NotificationPage = () => {
                 <div>
                   <label className="text-sm text-muted">เวลา</label>
                   <div className="mt-2">
-                    <IPhoneTimePicker
+                    <TimePicker
                       value={createTime}
                       onChange={value => setCreateTime(normalizeTimeValue(value))}
                       className="w-full justify-center"

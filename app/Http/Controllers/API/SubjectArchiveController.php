@@ -98,6 +98,43 @@ class SubjectArchiveController extends Controller
         return response()->json(status: 204);
     }
 
+    public function update(Request $request, Subject $subject, SubjectArchive $archive): JsonResponse
+    {
+        $this->authorizeSubject($subject);
+
+        if ($archive->user_id !== $request->user()->id || $archive->original_subject_id !== $subject->id) {
+            abort(404, 'Archive not found');
+        }
+
+        $this->ensureArchiveDescriptionColumnSupportsLongText();
+
+        $data = $request->validate([
+            'name' => ['sometimes', 'nullable', 'string', 'max:255'],
+            'description' => ['sometimes', 'nullable', 'string'],
+            'color' => ['sometimes', 'nullable', 'string', 'max:20'],
+            'target_hours' => ['sometimes', 'nullable', 'integer', 'min:0'],
+            'start_date' => ['sometimes', 'nullable', 'date'],
+            'start_time' => ['sometimes', 'nullable', 'string', 'max:32'],
+            'end_time' => ['sometimes', 'nullable', 'string', 'max:32'],
+            'archived_at' => ['sometimes', 'nullable', 'date'],
+        ]);
+
+        $startDate = array_key_exists('start_date', $data) ? $data['start_date'] : $archive->start_date;
+
+        if (array_key_exists('start_time', $data)) {
+            $data['start_time'] = $this->normalizeArchiveTimeValue($data['start_time'], 'start_time', $startDate);
+        }
+
+        if (array_key_exists('end_time', $data)) {
+            $data['end_time'] = $this->normalizeArchiveTimeValue($data['end_time'], 'end_time', $startDate);
+        }
+
+        $archive->fill($data);
+        $archive->save();
+
+        return response()->json(new SubjectArchiveResource($archive));
+    }
+
     public function count(Request $request): JsonResponse
     {
         $count = SubjectArchive::query()

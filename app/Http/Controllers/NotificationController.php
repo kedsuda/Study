@@ -2,24 +2,18 @@
 
 namespace App\Http\Controllers;
 
-use App\Mail\ScheduleNotificationMail;
-use App\Models\EmailProviderAccount;
 use App\Models\LearningNotification;
-use App\Models\NotificationEmailLog;
 use App\Models\NotificationEmailSetting;
+use App\Models\Schedule;
 use App\Models\Subject;
 use App\Models\StudyCalendarEvent;
 use App\Models\StudyLog;
 use App\Models\User;
-use App\Services\Email\GmailApiMailer;
-use App\Services\Notification\NotificationEmailSender;
 use Carbon\Carbon;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 
@@ -32,7 +26,6 @@ class NotificationController extends Controller
         }
 
         $this->ensureDailyScheduleNotifications($request->user());
-        app(NotificationEmailSender::class)->sendDueForUser($request->user());
 
         $notifications = LearningNotification::where('user_id', $request->user()->id)
             ->where(function ($query) {
@@ -95,7 +88,7 @@ class NotificationController extends Controller
             'title' => $title,
             'body' => $message,
             'notify_at' => $notifyAtUtc,
-            // Always keep in-app as primary channel; email is sent by NotificationEmailSender.
+            // Always keep in-app as the primary channel.
             'channel' => $validated['channel'] ?? 'in_app',
             'status' => 'pending',
             'metadata' => [
@@ -107,9 +100,6 @@ class NotificationController extends Controller
                 ],
             ],
         ]);
-
-        // Send email immediately for user-created notifications as well.
-        $this->sendScheduleEmail($request->user(), $notification, $title, $message);
 
         return response()->json($this->serializeNotification($notification, $request->user()), 201);
     }
@@ -140,8 +130,6 @@ class NotificationController extends Controller
             $validated['title'] ?? $title,
             $message
         );
-
-        $this->sendScheduleEmail($user, $notification, $validated['title'] ?? $title, $message);
 
         return response()->json($this->serializeNotification($notification, $user), 201);
     }
@@ -188,8 +176,6 @@ class NotificationController extends Controller
             $subjectId
         );
 
-        $this->sendScheduleEmail($user, $notification, $title, $message);
-
         return response()->json($this->serializeNotification($notification, $user), 201);
     }
 
@@ -205,11 +191,36 @@ class NotificationController extends Controller
         return response()->json($this->serializeNotification($notification, request()->user()));
     }
 
+    public function markAsDelivered(LearningNotification $notification): JsonResponse
+    {
+        if (! $this->hasNotificationTable()) {
+            return response()->json([], 200);
+        }
+
+        $user = request()->user();
+        $this->authorizeNotification($notification, $user->id);
+
+        // Preserve the first moment the alert was actually shown.  notify_at is
+        // only the scheduled time and may be different when the app was closed.
+        if (! $notification->delivered_at) {
+            // `learning_notifications` stores instants in UTC.  Without this
+            // conversion a Bangkok time is written as though it were UTC and
+            // comes back seven hours later on the next API request.
+            $notification->update(['delivered_at' => Carbon::now($this->resolveTimezone($user))->utc()]);
+        }
+
+        return response()->json($this->serializeNotification($notification, $user));
+    }
+
     public function unread(Request $request): JsonResponse
     {
         if (! $this->hasNotificationTable()) {
             return response()->json(['unread_count' => 0]);
         }
+
+        // Keep the bell badge in sync even when the client only asks for its
+        // unread count instead of loading the full notifications page.
+        $this->ensureDailyScheduleNotifications($request->user());
 
         $count = LearningNotification::where('user_id', $request->user()->id)
             ->where(function ($query) {
@@ -353,10 +364,6 @@ class NotificationController extends Controller
             return;
         }
 
-        if (! $this->hasCalendarTable()) {
-            return;
-        }
-
         $timezone = $this->resolveTimezone($user);
         $today = Carbon::now($timezone)->startOfDay();
         $tomorrow = $today->copy()->addDay();
@@ -376,7 +383,7 @@ class NotificationController extends Controller
     ): array
     {
         $dayNameTh = $this->thaiDayName($date);
-        $events = $this->calendarEventsForDate($userId, $date, $timezone);
+        $events = $this->classScheduleForDate($userId, $date, $timezone);
 
         $dateLabel = $relativeLabel ?: ($isTomorrow ? 'พรุ่งนี้' : $date->format('d M Y'));
         $title = $isTomorrow
@@ -444,6 +451,130 @@ class NotificationController extends Controller
         $end = $date->copy()->endOfDay();
 
         return $this->safeCalendarQuery($userId, $start, $end, $subjectId);
+    }
+
+    /**
+     * Returns both dated calendar classes and recurring rows from the legacy
+     * schedules table.  The latter is important for timetables that repeat
+     * every week and therefore do not have a calendar event for every date.
+     */
+    private function classScheduleForDate(int $userId, Carbon $date, string $timezone)
+    {
+        $calendarEvents = $this->calendarEventsForDate($userId, $date, $timezone);
+        $recurringSchedules = $this->recurringSchedulesForDate($userId, $date);
+        $recurringSubjects = $this->recurringSubjectsForDate($userId, $date);
+
+        return $calendarEvents
+            ->concat($recurringSchedules)
+            ->concat($recurringSubjects)
+            ->unique(function ($item) use ($timezone) {
+                // Subjects are returned directly here, so their identifier is
+                // `id` rather than `subject_id` like calendar/schedule rows.
+                // Normalize both shapes before removing duplicate class slots.
+                $subjectId = $item instanceof Subject
+                    ? (int) $item->getKey()
+                    : (int) ($item->subject_id ?? 0);
+
+                return $subjectId.'|'.$this->scheduleItemStartTime($item, $timezone);
+            })
+            ->sortBy(fn ($item) => $this->scheduleItemStartTime($item, $timezone))
+            ->values();
+    }
+
+    private function recurringSchedulesForDate(int $userId, Carbon $date)
+    {
+        if (! Schema::hasTable((new Schedule())->getTable())) {
+            return collect();
+        }
+
+        try {
+            $scheduleTable = (new Schedule())->getTable();
+            $subjectTable = (new Subject())->getTable();
+            $query = Schedule::withoutGlobalScopes()
+                ->with('subject')
+                ->whereHas('subject', fn ($subjectQuery) => $subjectQuery
+                    ->withoutGlobalScopes()
+                    ->where("{$subjectTable}.user_id", $userId));
+
+            if (Schema::hasColumn($scheduleTable, 'schedule_type')) {
+                $query->where(function ($scheduleQuery) {
+                    $scheduleQuery->whereNull('schedule_type')
+                        ->orWhere('schedule_type', 'class');
+                });
+            }
+
+            return $query->get()
+                ->filter(fn (Schedule $schedule) => $this->scheduleMatchesDate($schedule, $date))
+                ->values();
+        } catch (\Throwable $e) {
+            return collect();
+        }
+    }
+
+    /**
+     * The timetable page treats a subject's start_date as the weekday on which
+     * that subject recurs.  Reuse that same convention for today's and
+     * tomorrow's notifications instead of only matching one dated calendar
+     * event.
+     */
+    private function recurringSubjectsForDate(int $userId, Carbon $date)
+    {
+        $subjectTable = (new Subject())->getTable();
+
+        if (! Schema::hasTable($subjectTable) || ! Schema::hasColumn($subjectTable, 'start_date')) {
+            return collect();
+        }
+
+        try {
+            return Subject::withoutGlobalScopes()
+                ->where('user_id', $userId)
+                ->whereNotNull('start_date')
+                ->get()
+                ->filter(function (Subject $subject) use ($date) {
+                    try {
+                        return Carbon::parse($subject->start_date)->dayOfWeek === $date->dayOfWeek;
+                    } catch (\Throwable $e) {
+                        return false;
+                    }
+                })
+                ->values();
+        } catch (\Throwable $e) {
+            return collect();
+        }
+    }
+
+    private function scheduleMatchesDate(Schedule $schedule, Carbon $date): bool
+    {
+        if ($this->scheduleDayMatchesDate($schedule->day_of_week, $date)) {
+            return true;
+        }
+
+        // Older imported timetable rows can contain relative labels such as
+        // "วันนี้".  Their stored start time still has the original weekday,
+        // which is the stable value to use for a repeating timetable.
+        try {
+            return $schedule->start_time && Carbon::parse($schedule->start_time)->dayOfWeek === $date->dayOfWeek;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    private function scheduleDayMatchesDate(mixed $dayOfWeek, Carbon $date): bool
+    {
+        $day = Str::lower(trim((string) $dayOfWeek));
+        $day = preg_replace('/^วัน/u', '', $day) ?? $day;
+        $englishDay = Str::lower($date->format('l'));
+        $thaiDays = [
+            'monday' => 'จันทร์',
+            'tuesday' => 'อังคาร',
+            'wednesday' => 'พุธ',
+            'thursday' => 'พฤหัสบดี',
+            'friday' => 'ศุกร์',
+            'saturday' => 'เสาร์',
+            'sunday' => 'อาทิตย์',
+        ];
+
+        return $day === $englishDay || $day === Str::lower($thaiDays[$englishDay] ?? '');
     }
 
     private function calendarEventsForRange(int $userId, Carbon $start, Carbon $end, ?int $subjectId = null)
@@ -574,35 +705,6 @@ class NotificationController extends Controller
         }
     }
 
-    private function sendScheduleEmail(
-        User $user,
-        LearningNotification $notification,
-        string $title,
-        string $message
-    ): void {
-        // Respect notify_at: do not force immediate send.
-        app(NotificationEmailSender::class)->sendNotification($user, $notification, false);
-    }
-
-    private function isMailConfigured(): bool
-    {
-        $required = [
-            config('mail.mailers.smtp.host'),
-            config('mail.mailers.smtp.port'),
-            config('mail.mailers.smtp.username'),
-            config('mail.mailers.smtp.password'),
-            config('mail.from.address'),
-        ];
-
-        foreach ($required as $value) {
-            if (! filled($value)) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
     private function resolveEmailSettings(User $user): ?NotificationEmailSetting
     {
         if (! Schema::hasTable((new NotificationEmailSetting())->getTable())) {
@@ -634,46 +736,6 @@ class NotificationController extends Controller
             $payload['id'] = $nextId > 0 ? $nextId : 1;
             return NotificationEmailSetting::create($payload);
         }
-    }
-
-    private function createEmailLog(
-        int $userId,
-        int $notificationId,
-        string $toEmail,
-        string $subject,
-        string $provider
-    ): ?NotificationEmailLog
-    {
-        if (! Schema::hasTable((new NotificationEmailLog())->getTable())) {
-            return null;
-        }
-
-        return NotificationEmailLog::create([
-            'user_id' => $userId,
-            'learning_notification_id' => $notificationId,
-            'to_email' => $toEmail,
-            'subject' => $subject,
-            'provider' => $provider,
-            'status' => 'queued',
-        ]);
-    }
-
-    private function resolveGmailAccount(User $user): ?EmailProviderAccount
-    {
-        if (! Schema::hasTable((new EmailProviderAccount())->getTable())) {
-            return null;
-        }
-
-        $query = EmailProviderAccount::where('user_id', $user->id)
-            ->where('provider', 'gmail')
-            ->where('auth_type', 'oauth')
-            ->where('status', 'active');
-
-        if ($user->email) {
-            $query->where('provider_email', $user->email);
-        }
-
-        return $query->first();
     }
 
     private function resolveTimezone(User $user): string
@@ -766,7 +828,7 @@ class NotificationController extends Controller
                 : Carbon::now($timezone);
 
             $notifyAt = Carbon::parse($current->toDateString().' '.$time, $timezone);
-            $notification->update(['notify_at' => $notifyAt]);
+            $notification->update(['notify_at' => $notifyAt->utc()]);
         }
     }
 
@@ -786,10 +848,14 @@ class NotificationController extends Controller
         return $dayMap[$dayNameEn] ?? $dayNameEn;
     }
 
-    private function formatEventLabel(StudyCalendarEvent $event, string $timezone): string
+    private function formatEventLabel(mixed $event, string $timezone): string
     {
-        $baseLabel = $event->subject?->name ?: ($event->title ?: 'กิจกรรมไม่ระบุ');
-        $eventType = (string) ($event->event_type ?? data_get($event->metadata, 'type') ?? '');
+        $baseLabel = $event instanceof Subject
+            ? $event->name
+            : ($event->subject?->name ?: ($event->title ?: 'กิจกรรมไม่ระบุ'));
+        $eventType = $event instanceof Schedule || $event instanceof Subject
+            ? 'class'
+            : (string) ($event->event_type ?? data_get($event->metadata, 'type') ?? '');
         $typeLabel = match ($eventType) {
             'class' => 'เรียน',
             'exam' => 'สอบ',
@@ -803,17 +869,71 @@ class NotificationController extends Controller
             return $description !== '' ? "{$label} ({$description})" : $label;
         }
 
-        $start = $event->start_time?->timezone($timezone)?->format('H:i') ?? '';
-        $end = $event->end_time?->timezone($timezone)?->format('H:i');
+        $start = $this->scheduleItemStartTime($event, $timezone);
+        $end = $this->scheduleItemEndTime($event, $timezone);
         $time = $start;
 
         if ($end) {
             $time = $start ? "{$start}-{$end}" : $end;
         }
 
-        $line = $time ? "{$label} เวลา {$time}" : $label;
+        $line = $time ? "{$label} เวลา {$time}" : "{$label} เวลา ไม่ระบุ";
+        $room = $this->scheduleItemRoom($event);
+        $line .= ' ห้อง '.($room !== '' ? $room : 'ไม่ระบุ');
 
         return $description !== '' ? "{$line} ({$description})" : $line;
+    }
+
+    private function scheduleItemStartTime(mixed $item, string $timezone): string
+    {
+        return $this->formatScheduleTime($item->start_time ?? null, $timezone);
+    }
+
+    private function scheduleItemEndTime(mixed $item, string $timezone): string
+    {
+        return $this->formatScheduleTime($item->end_time ?? null, $timezone);
+    }
+
+    private function formatScheduleTime(mixed $value, string $timezone): string
+    {
+        if ($value instanceof \DateTimeInterface) {
+            return Carbon::instance($value)->timezone($timezone)->format('H:i');
+        }
+
+        $raw = trim((string) $value);
+        if ($raw === '') {
+            return '';
+        }
+
+        if (preg_match('/(?:^|[ T])(\d{1,2}:\d{2})(?::\d{2})?$/', $raw, $matches)) {
+            return str_pad($matches[1], 5, '0', STR_PAD_LEFT);
+        }
+
+        try {
+            return Carbon::parse($raw, $timezone)->format('H:i');
+        } catch (\Throwable $e) {
+            return '';
+        }
+    }
+
+    private function scheduleItemRoom(mixed $item): string
+    {
+        $room = trim((string) ($item->room ?? ''));
+        if ($room !== '') {
+            return $room;
+        }
+
+        $room = trim((string) ($item->location ?? ''));
+        if ($room !== '') {
+            return $room;
+        }
+
+        $metadataRoom = data_get($item->metadata, 'room');
+        if (is_string($metadataRoom) && trim($metadataRoom) !== '') {
+            return trim($metadataRoom);
+        }
+
+        return trim((string) ($item->subject?->room ?? ''));
     }
 
     private function upsertScheduleNotification(
@@ -825,9 +945,12 @@ class NotificationController extends Controller
         ?int $subjectId = null,
         string $channel = 'email'
     ): LearningNotification {
+        // Keep DATETIME values in UTC.  All API output is converted back to the
+        // user's configured timezone in serializeNotification().
+        $storedNotifyAt = $notifyAt->copy()->utc();
         $query = LearningNotification::where('user_id', $userId)
             ->where('channel', $channel)
-            ->whereDate('notify_at', $notifyAt->toDateString());
+            ->whereDate('notify_at', $storedNotifyAt->toDateString());
 
         if ($subjectId) {
             $query->where('subject_id', $subjectId);
@@ -845,7 +968,7 @@ class NotificationController extends Controller
                 'subject_id' => $subjectId,
                 'title' => $this->fitNotificationTitle($title),
                 'body' => $this->fitNotificationBody($message),
-                'notify_at' => $notifyAt,
+                'notify_at' => $storedNotifyAt,
                 'status' => $notification->status ?? 'pending',
                 'metadata' => $metadata,
             ]);
@@ -859,7 +982,7 @@ class NotificationController extends Controller
             'calendar_event_id' => null,
             'title' => $this->fitNotificationTitle($title),
             'body' => $this->fitNotificationBody($message),
-            'notify_at' => $notifyAt,
+            'notify_at' => $storedNotifyAt,
             'channel' => $channel,
             'status' => 'pending',
             'metadata' => $metadata,
@@ -874,11 +997,11 @@ class NotificationController extends Controller
         bool $isTomorrow,
         string $relativeLabel
     ): void {
-        if ($this->isDailyScheduleDismissedForDate($user->id, $type, $notifyAt->toDateString())) {
+        $timezone = $this->resolveTimezone($user);
+        if ($this->isDailyScheduleDismissedForDate($user->id, $type, $notifyAt->toDateString(), $timezone)) {
             return;
         }
 
-        $timezone = $this->resolveTimezone($user);
         [$title, $message] = $this->buildScheduleCopy($user->id, $date, $isTomorrow, $timezone, $relativeLabel);
 
         $sameTypeNotifications = LearningNotification::where('user_id', $user->id)
@@ -900,7 +1023,7 @@ class NotificationController extends Controller
             $metadata['is_read'] = false;
         }
 
-        $resolvedNotifyAt = $this->resolveStoredNotifyAt($metadata, $notifyAt, $timezone);
+        $resolvedNotifyAt = $this->resolveStoredNotifyAt($metadata, $notifyAt, $timezone)->utc();
 
         if ($notification) {
             $notification->update([
@@ -925,9 +1048,6 @@ class NotificationController extends Controller
             ]);
         }
 
-        if ($notification->status !== 'sent') {
-            $this->sendScheduleEmail($user, $notification, $title, $message);
-        }
     }
 
     private function mergeMetadata(?array $metadata, array $updates): array
@@ -949,8 +1069,11 @@ class NotificationController extends Controller
     {
         $payload = $notification->toArray();
         $timezone = $this->resolveTimezone($user);
-        $payload['notify_at'] = $notification->notify_at?->timezone($timezone)->format('Y-m-d H:i:s');
-        $payload['delivered_at'] = $notification->delivered_at?->timezone($timezone)->format('Y-m-d H:i:s');
+        // The timezone offset is deliberately included.  A plain date-time
+        // string makes browsers interpret the same notification differently
+        // depending on the visitor's computer timezone.
+        $payload['notify_at'] = $notification->notify_at?->timezone($timezone)->toIso8601String();
+        $payload['delivered_at'] = $notification->delivered_at?->timezone($timezone)->toIso8601String();
 
         return $payload;
     }
@@ -976,16 +1099,15 @@ class NotificationController extends Controller
         string $timezone
     ): string {
         $labels = $events
-            ->map(fn ($event) => $this->fitNotificationBody($this->formatEventLabel($event, $timezone), 42))
+            ->map(fn ($event) => $this->formatEventLabel($event, $timezone))
             ->filter(fn ($label) => $label !== '')
             ->values();
 
-        $visible = $labels->take(3)->implode('; ');
-        $hiddenCount = max(0, $labels->count() - 3);
-        $suffix = $hiddenCount > 0 ? "; +{$hiddenCount} รายการ" : '';
+        $items = $labels->map(fn ($label) => "- {$label}")->implode("\n");
 
         return $this->fitNotificationBody(
-            "{$dateLabel} ({$dayNameTh}) คุณมี {$labels->count()} รายการ: {$visible}{$suffix}"
+            "{$dateLabel} ({$dayNameTh}) คุณมี {$labels->count()} รายการ\n{$items}",
+            1000
         );
     }
 
@@ -1139,13 +1261,13 @@ class NotificationController extends Controller
         ], true);
     }
 
-    private function isDailyScheduleDismissedForDate(int $userId, string $type, string $date): bool
+    private function isDailyScheduleDismissedForDate(int $userId, string $type, string $date, string $timezone): bool
     {
         return LearningNotification::where('user_id', $userId)
             ->where('status', 'dismissed')
-            ->whereDate('notify_at', $date)
-            ->get(['metadata'])
-            ->contains(fn (LearningNotification $item) => data_get($item->metadata, 'type') === $type);
+            ->get(['notify_at', 'metadata'])
+            ->contains(fn (LearningNotification $item) => data_get($item->metadata, 'type') === $type
+                && $item->notify_at?->timezone($timezone)->toDateString() === $date);
     }
 
     private function buildSubjectReminderBody(Carbon $notifyAt, string $subjectName): string

@@ -1,10 +1,16 @@
 // DocumentSummaryPage.tsx
 import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation } from 'react-router-dom';
+import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker';
+import html2canvas from 'html2canvas';
+import { jsPDF } from 'jspdf';
+import { FileText, Mic } from 'lucide-react';
 import { api, apiFallbackClients, assetBaseURL } from '../../services/api';
 import { getLastSubjectKey } from '../../constants/storage';
 import { useAppAlert } from '../../context/AppAlertContext';
 import { useAuth } from '../../context/AuthContext';
 import { useSemesterOptions } from '../../hooks/useSemesterOptions';
+import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { VoiceSummaryPage } from './VoiceSummaryPage';
 import { subscribeSubjectsUpdated } from '../../utils/subjectSync';
 import { resolveStudyFileUrl, uploadStudyFileToSupabase } from '../../utils/studyFiles';
@@ -31,6 +37,11 @@ type SavedSummary = {
   period?: SummaryCategory | null;
   subject_name?: string;
   original_subject_id?: number | null;
+  file_id?: number | null;
+  file_status?: string | null;
+  file_archived_at?: string | null;
+  source_type?: SummarySource;
+  audio_summary_id?: number | null;
 };
 
 type ArchivedSummary = {
@@ -50,6 +61,7 @@ type ArchivedSummary = {
 
 type SummaryPeriod = 'all' | 'daily' | 'weekly' | 'monthly';
 type SummaryCategory = Exclude<SummaryPeriod, 'all'>;
+type SummarySource = 'audio-file' | 'live-audio' | 'document-file';
 
 type SubjectOption = {
   id: number;
@@ -154,13 +166,33 @@ const normalizeSummaryId = (value: unknown) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 };
+const normalizeFileStatus = (value: unknown) => {
+  const status = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return status === 'archived' ? 'archived' : 'active';
+};
 const isDocumentSummaryTitle = (title: string) => {
   const normalized = title.trim().toLowerCase();
   return normalized.startsWith('สรุปเอกสาร');
 };
 
+const repairSpacedThaiText = (value: string) => {
+  if (!value) return '';
+
+  const thaiChars = value.match(/[\u0E00-\u0E7F]/g)?.length ?? 0;
+  const spacedThaiPairs = value.match(/[\u0E00-\u0E7F][ \t\u00A0]+(?=[\u0E00-\u0E7F])/g)?.length ?? 0;
+  if (thaiChars < 20 || spacedThaiPairs < 8 || spacedThaiPairs / Math.max(1, thaiChars) < 0.12) {
+    return value;
+  }
+
+  return value
+    .replace(/([\u0E00-\u0E7F])[ \t\u00A0]+(?=[\u0E00-\u0E7F])/g, '$1')
+    .replace(/[ \t\u00A0]{2,}/g, ' ')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .trim();
+};
+
 const buildLocalSummary = (text: string) => {
-  const cleaned = text.trim();
+  const cleaned = repairSpacedThaiText(text).trim();
   if (!cleaned) return '';
 
   const lines = cleaned
@@ -172,7 +204,156 @@ const buildLocalSummary = (text: string) => {
   const selected = source.filter(line => line.length >= 12).slice(0, 5);
   if (!selected.length) return cleaned.slice(0, 300);
 
-  return selected.map(line => `- ${line}`).join('\n');
+  return [
+    'สรุปภาพรวม:',
+    selected[0],
+    '',
+    'ประเด็นสำคัญ:',
+    ...selected.slice(1, 6).map(line => `- ${line}`),
+  ].join('\n');
+};
+
+type SummaryBlock =
+  | { type: 'heading'; text: string }
+  | { type: 'bullet'; items: string[] }
+  | { type: 'paragraph'; text: string };
+
+const cleanSummaryLine = (value: string) => value
+  .replace(/^#{1,6}\s*/, '')
+  .replace(/^\*\*(.+)\*\*:?$/, '$1')
+  .replace(/\*\*/g, '')
+  .replace(/__+/g, '')
+  .trim();
+
+const parseSummaryBlocks = (value: string): SummaryBlock[] => {
+  const normalized = repairSpacedThaiText(value)
+    .replace(/\r\n|\r/g, '\n')
+    .replace(/```[\s\S]*?```/g, block => block.replace(/```/g, '').trim())
+    .replace(/\\n/g, '\n')
+    .trim();
+
+  if (!normalized) return [];
+
+  const blocks: SummaryBlock[] = [];
+  let bulletItems: string[] = [];
+  const flushBullets = () => {
+    if (bulletItems.length) {
+      blocks.push({ type: 'bullet', items: bulletItems });
+      bulletItems = [];
+    }
+  };
+
+  normalized.split('\n').forEach(rawLine => {
+    const line = rawLine.trim();
+    if (!line) {
+      flushBullets();
+      return;
+    }
+
+    const bulletMatch = line.match(/^[-*•]\s+(.+)$/) ?? line.match(/^\d+[.)]\s+(.+)$/);
+    if (bulletMatch) {
+      bulletItems.push(cleanSummaryLine(bulletMatch[1]));
+      return;
+    }
+
+    flushBullets();
+    const cleaned = cleanSummaryLine(line);
+    const isHeading =
+      /^#{1,6}\s+/.test(line) ||
+      /[:：]$/.test(cleaned) ||
+      /^(สรุป|ประเด็น|หัวข้อ|สิ่งที่|Action|ข้อควร|คำแนะนำ)/i.test(cleaned);
+
+    blocks.push({ type: isHeading ? 'heading' : 'paragraph', text: cleaned });
+  });
+
+  flushBullets();
+  return blocks;
+};
+
+const SummaryText = ({ text }: { text: string }) => {
+  const blocks = parseSummaryBlocks(text);
+  if (!blocks.length) return null;
+
+  return (
+    <div className="space-y-4 text-slate-800 dark:text-slate-200">
+      {blocks.map((block, index) => {
+        if (block.type === 'heading') {
+          return (
+            <h4 key={`${block.type}-${index}`} className="text-base font-bold leading-7 text-slate-950 dark:text-indigo-100">
+              {block.text}
+            </h4>
+          );
+        }
+
+        if (block.type === 'bullet') {
+          return (
+            <ul key={`${block.type}-${index}`} className="list-disc space-y-2 pl-5 leading-7">
+              {block.items.map((item, itemIndex) => (
+                <li key={`${index}-${itemIndex}`}>{item}</li>
+              ))}
+            </ul>
+          );
+        }
+
+        return (
+          <p key={`${block.type}-${index}`} className="leading-7">
+            {block.text}
+          </p>
+        );
+      })}
+    </div>
+  );
+};
+
+const extractPdfInBrowser = async (file: File) => {
+  const pdfjs = await import('pdfjs-dist');
+  // Keep the PDF worker inside the application bundle. Some shared-hosting
+  // Apache configurations serve standalone .mjs files with the wrong MIME
+  // type, which makes pdf.js fail before it can read otherwise valid PDFs.
+  if (!pdfjs.GlobalWorkerOptions.workerPort) {
+    pdfjs.GlobalWorkerOptions.workerPort = new PdfWorker();
+  }
+
+  const buffer = await file.arrayBuffer();
+  const loadingTask = pdfjs.getDocument({ data: new Uint8Array(buffer) });
+  const pdf = await loadingTask.promise;
+  const pages: string[] = [];
+  const ocrImages: File[] = [];
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    const textContent = await page.getTextContent();
+    const items = textContent.items as Array<{ str?: string }>;
+    const pageText = items
+      .map(item => (typeof item.str === 'string' ? item.str.trim() : ''))
+      .filter(Boolean)
+      .join(' ');
+
+    if (pageText) {
+      pages.push(pageText);
+    } else if (ocrImages.length < 12) {
+      const unscaledViewport = page.getViewport({ scale: 1 });
+      const scale = Math.min(2, 1600 / Math.max(1, unscaledViewport.width));
+      const viewport = page.getViewport({ scale });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.ceil(viewport.width));
+      canvas.height = Math.max(1, Math.ceil(viewport.height));
+      const canvasContext = canvas.getContext('2d', { alpha: false });
+
+      if (canvasContext) {
+        await page.render({ canvas, canvasContext, viewport }).promise;
+        const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.86));
+        if (blob) {
+          ocrImages.push(new File([blob], `pdf-page-${pageNumber}.jpg`, { type: 'image/jpeg' }));
+        }
+      }
+    }
+  }
+
+  return {
+    text: repairSpacedThaiText(pages.join('\n\n')).trim(),
+    ocrImages,
+  };
 };
 
 const isDocumentSummary = (summary: any, logTitle?: string) => {
@@ -206,8 +387,11 @@ const formatSummaryDate = (value?: string) => {
   if (!value) return '';
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
-  return parsed.toLocaleString('th-TH');
+  return parsed.toLocaleDateString('th-TH');
 };
+
+const normalizeAudioSummarySource = (value: unknown): Extract<SummarySource, 'audio-file' | 'live-audio'> =>
+  String(value ?? '').trim().toLowerCase() === 'record' ? 'live-audio' : 'audio-file';
 
 const extractErrorMessage = (error: any, fallback: string) => {
   const message = error?.response?.data?.message;
@@ -235,7 +419,8 @@ type DocumentSummaryPageProps = {
 export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPageProps) => {
   const { error } = useAppAlert();
   const { user } = useAuth();
-  const isArchivePage = false;
+  const location = useLocation();
+  const isArchivePage = location.pathname.includes('archived-summaries');
   
   // UI State
   const [inputMode, setInputMode] = useState<'document' | 'audio'>('document');
@@ -256,6 +441,26 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       (isLocalNetworkHost || isDev);
     return isLocalhost ? [api] : apiFallbackClients;
   }, []);
+  const postDocumentData = async <T,>(endpoint: string, payload: FormData) => {
+    let lastError: unknown = null;
+
+    for (const client of subjectFetchClients) {
+      try {
+        return await client.post<T>(endpoint, payload);
+      } catch (requestError) {
+        lastError = requestError;
+        const status = Number((requestError as any)?.response?.status);
+        // A validation/auth/server response proves that this API base URL is
+        // reachable. Retrying the same payload against every fallback only
+        // duplicates work and fills the console with identical failures.
+        if (Number.isFinite(status) && status !== 404) {
+          throw requestError;
+        }
+      }
+    }
+
+    throw lastError;
+  };
   const [statusText, setStatusText] = useState('อัปโหลดไฟล์เอกสารเพื่อให้ AI ช่วยสรุปเนื้อหาแบบอ่านง่าย');
   const [isLoading, setIsLoading] = useState(false);
   const [summary, setSummary] = useState<string | null>(null);
@@ -270,6 +475,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   const [selectedSemesterKey, setSelectedSemesterKey] = useState<string>('all');
   const [selectedSubjectId, setSelectedSubjectId] = useState('');
   const [selectedMood, setSelectedMood] = useState('');
+  const [isMoodDropdownOpen, setIsMoodDropdownOpen] = useState(false);
   const [dbStatus, setDbStatus] = useState<string | null>(null);
   const [dbError, setDbError] = useState<string | null>(null);
   const [dbFileUrl, setDbFileUrl] = useState<string | null>(null);
@@ -281,6 +487,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   const [, setSummaryModel] = useState<string | null>(null);
   const [, setSummarySavedLogId] = useState<number | null>(null);
   const [savedSummary, setSavedSummary] = useState<SavedSummary | null>(null);
+  const [currentSummarySource, setCurrentSummarySource] = useState<SummarySource | null>(null);
   const [savedSummaries, setSavedSummaries] = useState<SavedSummary[]>([]);
   const [summaryPeriod, setSummaryPeriod] = useState<SummaryPeriod>('all');
   const [savedSummaryPage, setSavedSummaryPage] = useState(1);
@@ -290,6 +497,12 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   const [savedSummarySignature, setSavedSummarySignature] = useState<string | null>(null);
   const [, setSelectedArchiveIds] = useState<number[]>([]);
   const [deletingSummaryId, setDeletingSummaryId] = useState<number | null>(null);
+  const [confirmState, setConfirmState] = useState<{ title: string; description: string; confirmLabel: string; onConfirm: () => Promise<void> | void } | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const [editingArchive, setEditingArchive] = useState<ArchivedSummary | null>(null);
+  const [archiveEditTitle, setArchiveEditTitle] = useState('');
+  const [archiveEditDescription, setArchiveEditDescription] = useState('');
+  const [savingArchiveEdit, setSavingArchiveEdit] = useState(false);
   const lastSubjectKey = useMemo(() => getLastSubjectKey(user?.id), [user?.id]);
   const [archivedSummaries, setArchivedSummaries] = useState<ArchivedSummary[]>([]);
   const selectedSubject = useMemo(
@@ -308,7 +521,12 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   const archiveDisplaySummaries = archivedSummaries;
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const moodDropdownRef = useRef<HTMLDivElement | null>(null);
   const saveSummaryPeriodRef = useRef<SummaryCategory>('daily');
+  const selectedMoodOption = useMemo(
+    () => moodOptions.find(option => option.value === selectedMood) ?? null,
+    [selectedMood]
+  );
   const summaryPeriodOptions: { key: SummaryPeriod; label: string }[] = [
     { key: 'all', label: 'ทั้งหมด' },
     { key: 'daily', label: 'รายวัน' },
@@ -320,6 +538,17 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     { key: 'weekly', label: 'รายสัปดาห์' },
     { key: 'monthly', label: 'รายเดือน' }
   ];
+
+  useEffect(() => {
+    const tab = new URLSearchParams(location.search).get('tab');
+    if (isArchivePage) {
+      setActiveHistoryTab('archived');
+      return;
+    }
+    if (tab === 'archived') {
+      setActiveHistoryTab('archived');
+    }
+  }, [isArchivePage, location.search]);
 
   const fetchSubjects = async (cancelledRef?: { current: boolean }) => {
     let list: SubjectOption[] = [];
@@ -379,6 +608,20 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   }, [saveSummaryPeriod]);
 
   useEffect(() => {
+    if (!isMoodDropdownOpen) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (moodDropdownRef.current?.contains(event.target as Node)) return;
+      setIsMoodDropdownOpen(false);
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [isMoodDropdownOpen]);
+
+  useEffect(() => {
     const cancelledRef = { current: false };
     void fetchSubjects(cancelledRef);
     const unsubscribe = subscribeSubjectsUpdated(() => {
@@ -391,10 +634,10 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   }, [lastSubjectKey, isArchivePage, subjectFetchClients]);
 
   useEffect(() => {
-    if (selectedSemesterKey === 'all') return;
+    if (semesterFilterOptions.length === 0) return;
     const exists = semesterFilterOptions.some(option => option.key === selectedSemesterKey);
     if (!exists) {
-      setSelectedSemesterKey('all');
+      setSelectedSemesterKey(semesterFilterOptions[0].key);
     }
   }, [selectedSemesterKey, semesterFilterOptions]);
 
@@ -435,6 +678,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
         const pushLogSummaries = (logs: any[], subject?: SubjectOption | null) => {
           logs.forEach((log: any) => {
             const title = typeof log?.title === 'string' ? log.title : '';
+            const files = Array.isArray(log?.files) ? log.files : [];
             const summaries = Array.isArray(log?.summaries) ? log.summaries : [];
             summaries.forEach((summaryItem: any) => {
               const content = typeof summaryItem?.content === 'string' ? summaryItem.content : '';
@@ -442,6 +686,10 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
               if (!isDocumentSummary(summaryItem, title)) return;
               const normalizedId = normalizeSummaryId(summaryItem?.id);
               if (normalizedId === null) return;
+              const fileId = normalizeSummaryId(summaryItem?.metadata?.file_id);
+              const sourceFile = fileId
+                ? files.find((file: any) => normalizeSummaryId(file?.id) === fileId)
+                : null;
               const period = normalizeSummaryPeriod(summaryItem?.metadata?.period, title);
               items.push({
                 id: normalizedId,
@@ -451,32 +699,24 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                 period,
                 subject_name: subject?.name,
                 original_subject_id: subject?.id ?? null,
+                file_id: fileId,
+                file_status: sourceFile ? normalizeFileStatus(sourceFile?.status) : null,
+                file_archived_at: typeof sourceFile?.archived_at === 'string' ? sourceFile.archived_at : null,
+                source_type: 'document-file',
               });
             });
           });
         };
 
         if (isArchivePage) {
-          const targetSubjects = selectedSubjectId
-            ? semesterFilteredSubjects.filter(subject => String(subject.id) === selectedSubjectId)
-            : semesterFilteredSubjects;
-
-          if (targetSubjects.length === 0) {
-            setSavedSummary(null);
-            setSavedSummaries([]);
-            return;
-          }
-
           const results = await Promise.allSettled(
-            targetSubjects.map(subject => api.get(`/subjects/${subject.id}/study-logs`))
+            subjects.map(async subject => {
+              const res = await api.get(`/subjects/${subject.id}/study-logs`);
+              const payload = Array.isArray(res.data) ? res.data : res.data?.data;
+              pushLogSummaries(Array.isArray(payload) ? payload : [], subject);
+            })
           );
-
-          results.forEach((result, index) => {
-            if (result.status !== 'fulfilled') return;
-            const payload = Array.isArray(result.value.data) ? result.value.data : result.value.data?.data;
-            const logs = Array.isArray(payload) ? payload : [];
-            pushLogSummaries(logs, targetSubjects[index] ?? null);
-          });
+          void results;
         } else {
           if (!selectedSubjectId) {
             setSavedSummary(null);
@@ -489,6 +729,34 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
           const logs = Array.isArray(payload) ? payload : [];
           const selectedSubject = subjects.find(item => String(item.id) === selectedSubjectId) ?? null;
           pushLogSummaries(logs, selectedSubject);
+        }
+
+        if (selectedSubjectId && !isArchivePage) {
+          try {
+            const response = await api.get('/ai/summaries/audio', { params: { subject_id: selectedSubjectId } });
+            const payload = Array.isArray(response.data) ? response.data : response.data?.data;
+            const audioSummaries = Array.isArray(payload) ? payload : [];
+            const selectedSubject = subjects.find(item => String(item.id) === selectedSubjectId) ?? null;
+
+            audioSummaries.forEach((audioSummary: any) => {
+              const audioId = normalizeSummaryId(audioSummary?.id);
+              const content = String(audioSummary?.summary ?? audioSummary?.transcript ?? '').trim();
+              if (audioId === null || !content) return;
+              items.push({
+                // Keep the two summary stores in one list without ID collisions.
+                id: -audioId,
+                audio_summary_id: audioId,
+                content,
+                title: typeof audioSummary?.title === 'string' ? audioSummary.title : 'สรุปจากไฟล์เสียง',
+                created_at: audioSummary?.created_at,
+                subject_name: selectedSubject?.name,
+                original_subject_id: selectedSubject?.id ?? null,
+                source_type: normalizeAudioSummarySource(audioSummary?.source_mode),
+              });
+            });
+          } catch {
+            // The document history remains available if the optional audio history cannot be loaded.
+          }
         }
 
         const toTime = (value?: string) => (value ? new Date(value).getTime() : 0);
@@ -584,13 +852,27 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
 
   const isSummarySaved = Boolean(summarySaveSignature && summarySaveSignature === savedSummarySignature);
   const canSaveSummary = Boolean(summarySaveSignature) && !isSummarySaved && !isSavingSummary;
-  const activeSummaries = useMemo(() => savedSummaries, [savedSummaries]);
+  const activeSummaries = useMemo(
+    () => savedSummaries.filter(item => normalizeFileStatus(item.file_status) !== 'archived'),
+    [savedSummaries]
+  );
   const subjectNameById = useMemo(
     () => new Map(subjects.map(subject => [subject.id, subject.name])),
     [subjects]
   );
   
-  const archivedItems = useMemo<SavedSummary[]>(
+  const fileArchivedItems = useMemo<SavedSummary[]>(
+    () =>
+      savedSummaries
+        .filter(item => normalizeFileStatus(item.file_status) === 'archived')
+        .map(item => ({
+          ...item,
+          created_at: item.file_archived_at ?? item.created_at,
+        })),
+    [savedSummaries]
+  );
+
+  const legacyArchivedItems = useMemo<SavedSummary[]>(
     () =>
       archiveDisplaySummaries.map(item => ({
         id: item.id,
@@ -604,6 +886,24 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
         original_subject_id: item.original_subject_id ?? null,
       })),
     [archiveDisplaySummaries, subjectNameById]
+  );
+
+  const archivedItems = useMemo<SavedSummary[]>(
+    () => {
+      const fileArchiveKeys = new Set(
+        fileArchivedItems.map(item =>
+          `${item.original_subject_id ?? 'none'}::${item.title ?? ''}::${item.content}`
+        )
+      );
+
+      return [
+        ...fileArchivedItems,
+        ...legacyArchivedItems.filter(item =>
+          !fileArchiveKeys.has(`${item.original_subject_id ?? 'none'}::${item.title ?? ''}::${item.content}`)
+        ),
+      ];
+    },
+    [fileArchivedItems, legacyArchivedItems]
   );
   
   const archivedSummaryKeys = useMemo(
@@ -622,8 +922,10 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       isArchivePage && selectedSubjectId
         ? summarySource.filter(item => item.original_subject_id === Number(selectedSubjectId))
         : summarySource;
-    if (summaryPeriod === 'all') return subjectFiltered;
-    return subjectFiltered.filter(item => item.period === summaryPeriod);
+    const periodFiltered = summaryPeriod === 'all'
+      ? subjectFiltered
+      : subjectFiltered.filter(item => item.period === summaryPeriod);
+    return periodFiltered;
   }, [summarySource, summaryPeriod, isArchivePage, selectedSubjectId]);
   
   const savedSummaryPageSize = 10;
@@ -634,12 +936,28 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   }, [filteredSummaries, savedSummaryPage]);
   
   const filteredArchivedSummaries = useMemo(() => {
-    if (summaryPeriod === 'all') return archivedItems;
-    return archivedItems.filter(item => item.period === summaryPeriod);
-  }, [archivedItems, summaryPeriod]);
+    const semesterSubjectIds = new Set(semesterFilteredSubjects.map(subject => subject.id));
+    const subjectFiltered =
+      selectedSubjectId
+        ? archivedItems.filter(item => item.original_subject_id === Number(selectedSubjectId))
+        : isArchivePage && selectedSemesterKey !== 'all'
+          ? archivedItems.filter(item => item.original_subject_id != null && semesterSubjectIds.has(item.original_subject_id as number))
+          : archivedItems;
+    if (summaryPeriod === 'all') return subjectFiltered;
+    return subjectFiltered.filter(item => item.period === summaryPeriod);
+  }, [archivedItems, isArchivePage, selectedSemesterKey, selectedSubjectId, semesterFilteredSubjects, summaryPeriod]);
   
   const activeSummaryText = summary || savedSummary?.content || '';
-  const activeSummaryTitle = savedSummary?.title ?? 'ผลลัพธ์การสรุป';
+  const activeSummarySource =
+    currentSummarySource ??
+    savedSummary?.source_type ??
+    (inputMode === 'audio' ? 'audio-file' : 'document-file');
+  const activeSummarySourceLabel =
+    activeSummarySource === 'document-file' ? 'สรุปจากไฟล์' : 'ผลการสรุปจากเสียง';
+  // A document result must clearly state that its source is an uploaded file,
+  // even when a previously saved summary is still selected in the history.
+  const activeSummaryTitle =
+    activeSummarySource === 'document-file' ? activeSummarySourceLabel : savedSummary?.title ?? activeSummarySourceLabel;
   const hasResultContent = activeSummaryText.trim() !== '';
   const savedCountLabel = savedSummaries.length > 99 ? '99+' : String(savedSummaries.length);
   const archiveCountLabel = filteredArchivedSummaries.length > 99 ? '99+' : String(filteredArchivedSummaries.length);
@@ -653,6 +971,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   }, [selectedSubjectId, selectedSemesterKey, summaryPeriod, savedSummaries.length]);
 
   const isAlreadyArchived = (item: SavedSummary) =>
+    normalizeFileStatus(item.file_status) === 'archived' ||
     archivedSummaryKeys.has(
       `${item.original_subject_id ?? selectedSubjectId ?? 'none'}::${item.title ?? ''}::${item.content}`
     );
@@ -682,6 +1001,25 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       if (!target) return;
 
       try {
+        if (target.file_id) {
+          const res = await api.patch(`/files/${target.file_id}/status`, { status: 'archived' });
+          const payload = res.data?.data ?? res.data;
+          const archivedAt = typeof payload?.archived_at === 'string' ? payload.archived_at : new Date().toISOString();
+          setSavedSummaries(prev =>
+            prev.map(item =>
+              item.id === target.id
+                ? { ...item, file_status: 'archived', file_archived_at: archivedAt }
+                : item
+            )
+          );
+          setStatusText('เก็บถาวรเรียบร้อยแล้ว');
+          setSelectedArchiveIds(prev => prev.filter(item => item !== id));
+          window.dispatchEvent(new Event('slt:archive-refresh'));
+          localStorage.setItem(lastSubjectKey, fallbackSubjectId);
+          setActiveHistoryTab('archived');
+          return;
+        }
+
         const res = await api.post(`/subjects/${fallbackSubjectId}/summary-archives`, {
           name: target.title ?? 'สรุปเอกสาร',
           description: target.content,
@@ -709,6 +1047,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
         setSelectedArchiveIds(prev => prev.filter(item => item !== id));
         window.dispatchEvent(new Event('slt:archive-refresh'));
         localStorage.setItem(lastSubjectKey, fallbackSubjectId);
+        setActiveHistoryTab('archived');
       } catch (error) {
       setGeneralError(extractErrorMessage(error, 'เก็บถาวรไม่สำเร็จ'));
     }
@@ -722,6 +1061,26 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
 
     if (!targetSubjectId) {
       setGeneralError('ไม่พบวิชาของรายการที่ต้องการนำกลับ');
+      return;
+    }
+
+    if (summaryItem.file_id) {
+      try {
+        await api.patch(`/files/${summaryItem.file_id}/status`, { status: 'active' });
+        setSavedSummaries(prev =>
+          prev.map(item =>
+            item.id === summaryItem.id
+              ? { ...item, file_status: 'active', file_archived_at: null }
+              : item
+          )
+        );
+        window.dispatchEvent(new Event('slt:archive-refresh'));
+        localStorage.setItem(lastSubjectKey, targetSubjectId);
+        setActiveHistoryTab('saved');
+        setStatusText('เอาออกจากเก็บถาวรเรียบร้อยแล้ว');
+      } catch (error) {
+        setGeneralError(extractErrorMessage(error, 'นำกลับไม่สำเร็จ'));
+      }
       return;
     }
 
@@ -747,6 +1106,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   const closeViewedSummary = () => {
     setSavedSummary(null);
     setSummary(null);
+    setCurrentSummarySource(null);
     setSummaryError(null);
     setGeneralError(null);
     setStatusText('ปิดข้อความที่เลือกแล้ว');
@@ -759,33 +1119,224 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     }
     setSummary(item.content);
     setSavedSummary(item);
+    setCurrentSummarySource(item.source_type ?? 'document-file');
     setSummaryError(null);
     setGeneralError(null);
     setStatusText('แสดงสรุปที่เลือกเรียบร้อยแล้ว');
     document.getElementById('result-section')?.scrollIntoView({ behavior: 'smooth' });
   };
 
-  const deleteSavedSummary = async (item: SavedSummary) => {
-    if (!Number.isFinite(item.id) || item.id <= 0) return;
-    const confirmed = window.confirm(`ต้องการลบสรุป "${item.title ?? 'สรุปเอกสาร'}" ใช่หรือไม่?`);
-    if (!confirmed) return;
+  const openConfirmDialog = (config: { title: string; description: string; confirmLabel: string; onConfirm: () => Promise<void> | void }) => {
+    setConfirmState(config);
+    setConfirmBusy(false);
+  };
 
-    setGeneralError(null);
-    setDeletingSummaryId(item.id);
+  const handleConfirmDialogCancel = () => {
+    setConfirmState(null);
+    setConfirmBusy(false);
+  };
+
+  const handleConfirmDialogConfirm = async () => {
+    if (!confirmState) return;
+    setConfirmBusy(true);
+    try {
+      await confirmState.onConfirm();
+    } finally {
+      setConfirmBusy(false);
+      setConfirmState(null);
+    }
+  };
+
+  const deleteSavedSummary = async (item: SavedSummary) => {
+    const summaryId = item.audio_summary_id ?? item.id;
+    if (!Number.isFinite(summaryId) || summaryId <= 0) return;
+    openConfirmDialog({
+      title: 'ลบสรุป',
+      description: `ต้องการลบสรุป "${item.title ?? 'สรุปเอกสาร'}" ใช่หรือไม่?`,
+      confirmLabel: 'ลบสรุป',
+      onConfirm: async () => {
+        setGeneralError(null);
+        setDeletingSummaryId(item.id);
+
+        try {
+          await api.delete(item.audio_summary_id ? `/ai/summaries/audio/${summaryId}` : `/summaries/${summaryId}`);
+          setSavedSummaries(prev => prev.filter(summaryItem => summaryItem.id !== item.id));
+          setSelectedArchiveIds(prev => prev.filter(summaryId => summaryId !== item.id));
+          if (savedSummary?.id === item.id) {
+            setSavedSummary(null);
+            setSummary(null);
+          }
+          setStatusText('ลบสรุปเรียบร้อยแล้ว');
+        } catch (error) {
+          setGeneralError(extractErrorMessage(error, 'ลบสรุปไม่สำเร็จ'));
+        } finally {
+          setDeletingSummaryId(current => (current === item.id ? null : current));
+        }
+      },
+    });
+  };
+
+  const safeDownloadName = (value?: string | null) => {
+    const cleaned = (value || 'สรุปที่เก็บถาวร')
+      .replace(/[\\/:*?"<>|]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return `${cleaned || 'สรุปที่เก็บถาวร'}.pdf`;
+  };
+
+  const downloadSummaryItem = async (item: SavedSummary) => {
+    if (typeof document === 'undefined') return;
+
+    const title = item.title?.trim() || 'สรุปที่เก็บถาวร';
+    const subject = item.subject_name?.trim() || '';
+    const period = item.period ? summaryCategoryLabels[item.period] : '';
+    const createdAt = item.created_at ? formatSummaryDate(item.created_at) : '';
+
+    const container = document.createElement('div');
+    container.style.position = 'fixed';
+    container.style.left = '-10000px';
+    container.style.top = '0';
+    container.style.width = '794px';
+    container.style.boxSizing = 'border-box';
+    container.style.padding = '48px';
+    container.style.background = '#ffffff';
+    container.style.color = '#111827';
+    container.style.fontFamily = '"TH Sarabun New", "Sarabun", "Leelawadee UI", Tahoma, sans-serif';
+    container.style.lineHeight = '1.7';
+
+    const heading = document.createElement('h1');
+    heading.textContent = title;
+    heading.style.margin = '0';
+    heading.style.fontSize = '24px';
+    heading.style.lineHeight = '1.35';
+    heading.style.color = '#111827';
+
+    const meta = document.createElement('div');
+    meta.style.marginTop = '12px';
+    meta.style.fontSize = '13px';
+    meta.style.color = '#4b5563';
+    meta.textContent = [subject ? `วิชา: ${subject}` : '', period ? `ช่วงเวลา: ${period}` : '', createdAt ? `วันที่: ${createdAt}` : '']
+      .filter(Boolean)
+      .join('  |  ');
+
+    const content = document.createElement('div');
+    content.textContent = item.content || '';
+    content.style.marginTop = '20px';
+    content.style.paddingTop = '20px';
+    content.style.borderTop = '1px solid #e5e7eb';
+    content.style.whiteSpace = 'pre-wrap';
+    content.style.wordBreak = 'break-word';
+    content.style.fontSize = '15px';
+    content.style.color = '#1f2937';
+
+    container.appendChild(heading);
+    if (meta.textContent) container.appendChild(meta);
+    container.appendChild(content);
+    document.body.appendChild(container);
 
     try {
-      await api.delete(`/summaries/${item.id}`);
-      setSavedSummaries(prev => prev.filter(summaryItem => summaryItem.id !== item.id));
-      setSelectedArchiveIds(prev => prev.filter(summaryId => summaryId !== item.id));
-      if (savedSummary?.id === item.id) {
-        setSavedSummary(null);
-        setSummary(null);
+      const canvas = await html2canvas(container, {
+        backgroundColor: '#ffffff',
+        scale: 2,
+        useCORS: true,
+      });
+      const pdf = new jsPDF({ orientation: 'p', unit: 'mm', format: 'a4' });
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const imageHeight = (canvas.height * pageWidth) / canvas.width;
+      const imageData = canvas.toDataURL('image/jpeg', 0.95);
+
+      let remainingHeight = imageHeight;
+      let y = 0;
+      pdf.addImage(imageData, 'JPEG', 0, y, pageWidth, imageHeight);
+      remainingHeight -= pageHeight;
+
+      while (remainingHeight > 0) {
+        y -= pageHeight;
+        pdf.addPage();
+        pdf.addImage(imageData, 'JPEG', 0, y, pageWidth, imageHeight);
+        remainingHeight -= pageHeight;
       }
-      setStatusText('ลบสรุปเรียบร้อยแล้ว');
-    } catch (error) {
-      setGeneralError(extractErrorMessage(error, 'ลบสรุปไม่สำเร็จ'));
+
+      pdf.save(safeDownloadName(title));
+      setStatusText('ดาวน์โหลด PDF เรียบร้อยแล้ว');
+    } catch {
+      setGeneralError('ดาวน์โหลด PDF ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง');
     } finally {
-      setDeletingSummaryId(current => (current === item.id ? null : current));
+      container.remove();
+    }
+  };
+
+  const openArchiveEditor = (item: SavedSummary) => {
+    const archive = archivedSummaries.find(archiveItem => archiveItem.id === item.id);
+    if (!archive) {
+      setGeneralError('ไม่พบรายการเก็บถาวรที่ต้องการแก้ไข');
+      return;
+    }
+
+    setEditingArchive(archive);
+    setArchiveEditTitle(archive.name || item.title || 'สรุปที่เก็บถาวร');
+    setArchiveEditDescription(archive.description || item.content || '');
+    setGeneralError(null);
+  };
+
+  const closeArchiveEditor = () => {
+    if (savingArchiveEdit) return;
+    setEditingArchive(null);
+    setArchiveEditTitle('');
+    setArchiveEditDescription('');
+  };
+
+  const saveArchiveEdit = async () => {
+    if (!editingArchive) return;
+
+    const title = archiveEditTitle.trim();
+    const description = archiveEditDescription.trim();
+    if (!title || !description) {
+      setGeneralError('กรุณากรอกชื่อและเนื้อหาสรุปให้ครบ');
+      return;
+    }
+
+    const targetSubjectId = editingArchive.original_subject_id;
+    if (!targetSubjectId) {
+      setGeneralError('ไม่พบวิชาของรายการที่ต้องการแก้ไข');
+      return;
+    }
+
+    setSavingArchiveEdit(true);
+    setGeneralError(null);
+    const editingArchiveId = editingArchive.id;
+
+    try {
+      const response = await api.put(`/subjects/${targetSubjectId}/summary-archives/${editingArchive.id}`, {
+        name: title,
+        description,
+      });
+      const payload = response.data?.data ?? response.data;
+      const updatedArchive: ArchivedSummary = {
+        ...editingArchive,
+        name: typeof payload?.name === 'string' ? payload.name : title,
+        description: typeof payload?.description === 'string' ? payload.description : description,
+        archived_at: payload?.archived_at ?? editingArchive.archived_at,
+      };
+      setArchivedSummaries(prev =>
+        prev.map(item => (item.id === updatedArchive.id ? { ...item, ...updatedArchive } : item))
+      );
+      setSavedSummary(current =>
+        current?.id === editingArchiveId
+          ? { ...current, title: updatedArchive.name, content: updatedArchive.description }
+          : current
+      );
+      setSummary(current => (savedSummary?.id === editingArchiveId ? updatedArchive.description : current));
+      setStatusText('แก้ไขสรุปที่เก็บถาวรเรียบร้อยแล้ว');
+      window.dispatchEvent(new Event('slt:archive-refresh'));
+      setEditingArchive(null);
+      setArchiveEditTitle('');
+      setArchiveEditDescription('');
+    } catch (error) {
+      setGeneralError(extractErrorMessage(error, 'แก้ไขสรุปที่เก็บถาวรไม่สำเร็จ'));
+    } finally {
+      setSavingArchiveEdit(false);
     }
   };
 
@@ -803,6 +1354,9 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
 
     setSelectedFile(file);
     setSummary(null);
+    setSavedSummary(null);
+    setIsResultSectionCollapsed(false);
+    setCurrentSummarySource('document-file');
     setOriginalText(null);
     setSummaryError(null);
     setOriginalError(null);
@@ -931,7 +1485,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       :root { color-scheme: light; }
       body {
         margin: 24px;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Tahoma, Arial, sans-serif;
+        font-family: "TH Sarabun New", "Sarabun", "Leelawadee UI", Tahoma, sans-serif;
         color: #111827;
         background: #ffffff;
       }
@@ -1011,7 +1565,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       const fallbackTitle =
         savedSummary?.title?.trim() ||
         stripExtension(selectedFile?.name ?? '').trim() ||
-        'สรุปเอกสาร';
+        (activeSummarySource === 'document-file' ? 'สรุปเอกสาร' : 'สรุปจากเสียง');
 
       const archiveResponse = await api.post(`/subjects/${archiveSubjectId}/summary-archives`, {
         name: `${periodLabel}: ${fallbackTitle}`,
@@ -1142,22 +1696,67 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
 
   const processDocument = async (file: File) => {
     setIsLoading(true);
+    const isPdfFile = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+    let browserExtractedText = '';
+    let browserOcrImages: File[] = [];
+
+    if (isPdfFile) {
+      try {
+        setStatusText('กำลังอ่านข้อความจาก PDF...');
+        const browserPdf = await extractPdfInBrowser(file);
+        browserExtractedText = browserPdf.text;
+        browserOcrImages = browserPdf.ocrImages;
+      } catch (pdfError) {
+        console.warn('browser pdf text extraction failed', pdfError);
+      }
+    }
+
+    if (browserExtractedText.trim().length < 20 && browserOcrImages.length > 0) {
+      try {
+        const ocrTextParts: string[] = [];
+        for (let start = 0; start < browserOcrImages.length; start += 3) {
+          const imageBatch = browserOcrImages.slice(start, start + 3);
+          setStatusText(
+            `PDF เป็นภาพ กำลังอ่านข้อความหน้า ${start + 1}-${start + imageBatch.length} ด้วย Groq Vision...`
+          );
+          const ocrForm = new FormData();
+          imageBatch.forEach(image => ocrForm.append('images[]', image, image.name));
+          const ocrResult = await postDocumentData<DocumentExtractResult>(extractEndpoint, ocrForm);
+          const batchText = String(ocrResult.data?.text ?? '').trim();
+          if (batchText) {
+            ocrTextParts.push(batchText);
+            browserExtractedText = ocrTextParts.join('\n\n').trim();
+          }
+        }
+      } catch (ocrError) {
+        console.warn('Groq Vision PDF OCR failed', ocrError);
+      }
+    }
 
     const summaryForm = new FormData();
-    summaryForm.append('file', file, file.name);
+    if (browserExtractedText.trim().length >= 20) {
+      summaryForm.append('text', browserExtractedText);
+    } else {
+      summaryForm.append('file', file, file.name);
+    }
 
     const extractForm = new FormData();
     extractForm.append('file', file, file.name);
 
     try {
+      setStatusText('กำลังสรุปเนื้อหาจากไฟล์...');
       const [summaryResult, extractResult] = await Promise.allSettled([
-        api.post<DocumentSummaryResult>(summaryEndpoint, summaryForm),
-        api.post<DocumentExtractResult>(extractEndpoint, extractForm)
+        postDocumentData<DocumentSummaryResult>(summaryEndpoint, summaryForm),
+        browserExtractedText.trim().length >= 20
+          ? Promise.resolve({ data: { text: browserExtractedText } } as { data: DocumentExtractResult })
+          : postDocumentData<DocumentExtractResult>(extractEndpoint, extractForm)
       ]);
 
       let hasSuccess = false;
       let summaryTextValue = '';
       let extractTextValue = '';
+      let summaryFailureMessage = '';
+      let extractFailureMessage = '';
 
       if (summaryResult.status === 'fulfilled') {
         const payload = summaryResult.value.data;
@@ -1183,7 +1782,8 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
           hasSuccess = true;
         }
       } else {
-        setSummaryError(extractErrorMessage(summaryResult.reason, 'ไม่สามารถสรุปเนื้อหาได้ กรุณาลองใหม่'));
+        summaryFailureMessage = extractErrorMessage(summaryResult.reason, 'ไม่สามารถสรุปเนื้อหาได้ กรุณาลองใหม่');
+        setSummaryError(summaryFailureMessage);
       }
 
       if (extractResult.status === 'fulfilled') {
@@ -1191,7 +1791,8 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       }
 
       if (summaryResult.status !== 'fulfilled' || summaryTextValue === '') {
-        const fallbackSummary = buildLocalSummary(extractTextValue);
+        const fallbackSourceText = extractTextValue || browserExtractedText;
+        const fallbackSummary = buildLocalSummary(fallbackSourceText);
         if (fallbackSummary) {
           setSummary(fallbackSummary);
           setSummaryModel('local');
@@ -1206,14 +1807,15 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
         setOriginalText(extractResult.value.data?.text ?? '');
         hasSuccess = true;
       } else {
-        setOriginalError(extractErrorMessage(extractResult.reason, 'ไม่สามารถดึงต้นฉบับจากไฟล์ได้ กรุณาลองใหม่'));
+        extractFailureMessage = extractErrorMessage(extractResult.reason, 'ไม่สามารถดึงต้นฉบับจากไฟล์ได้ กรุณาลองใหม่');
+        setOriginalError(extractFailureMessage);
       }
 
       if (hasSuccess) {
         setStatusText('สรุปเสร็จแล้ว! ตรวจสอบต้นฉบับและสรุปได้ทันที');
         document.getElementById('result-section')?.scrollIntoView({ behavior: 'smooth' });
       } else {
-        setGeneralError('เกิดข้อผิดพลาดระหว่างการสรุปเอกสาร');
+        setGeneralError(summaryFailureMessage || extractFailureMessage || 'เกิดข้อผิดพลาดระหว่างการสรุปเอกสาร');
         setStatusText('เกิดข้อผิดพลาดในการประมวลผลเอกสาร กรุณาลองอีกครั้ง');
       }
     } catch (err) {
@@ -1233,6 +1835,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       setSummary(payload.summary);
       setSummaryError(null);
       setSavedSummary(null);
+      setCurrentSummarySource(payload.source === 'record' ? 'live-audio' : 'audio-file');
     }
 
     if (transcriptText) {
@@ -1258,16 +1861,24 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     }
 
     setGeneralError(null);
+    setCurrentSummarySource('document-file');
+    setIsResultSectionCollapsed(false);
     setStatusText('กำลังสรุปเนื้อหาจากไฟล์...');
     processDocument(selectedFile);
     void saveFileToDatabase(selectedFile);
   };
 
   return (
-    <div
-      className={`doc-summary-page relative overflow-hidden bg-transparent font-sans ${embedded ? 'pb-0' : 'min-h-screen pb-[7.5rem] md:pb-16'}`}
-      style={{ ['--doc-accent-soft' as string]: 'rgba(var(--accent-rgb),0.10)' }}
-    >
+    <>
+      <div
+        className={`doc-summary-page relative overflow-hidden bg-transparent font-sans ${embedded ? 'pb-0' : 'min-h-screen pb-[7.5rem] md:pb-16'}`}
+        style={{
+          ['--accent' as string]: '#ec3d93',
+          ['--accent-rgb' as string]: '236, 61, 147',
+          ['--accent-ink' as string]: '#c32675',
+          ['--doc-accent-soft' as string]: 'rgba(236, 61, 147, 0.10)',
+        }}
+      >
       {/* Print View */}
       <div className="hidden print:block text-slate-900 bg-white">
         <h1 className="text-xl font-semibold">สรุปเอกสาร</h1>
@@ -1284,10 +1895,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
             position: absolute;
             inset: 0;
             pointer-events: none;
-            background:
-              linear-gradient(135deg, rgba(var(--accent-rgb), 0.10), transparent 36%),
-              linear-gradient(90deg, transparent 0%, rgba(34, 197, 94, 0.07) 58%, transparent 100%),
-              linear-gradient(180deg, rgba(255,255,255,0.34), transparent 34%);
+            background: #ffffff;
           }
           .doc-summary-header,
           .doc-summary-card {
@@ -1311,7 +1919,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
           }
           .doc-summary-header {
             border-radius: 30px;
-            padding: 22px;
+            padding: 24px;
           }
           .doc-upload-zone {
             min-height: 260px;
@@ -1357,7 +1965,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
             gap: 8px;
             border-radius: 999px;
             padding: 8px 12px;
-            background: rgba(255,255,255,0.70);
+            background: rgba(255,255,255,0.82);
             border: 1px solid rgba(148,163,184,0.22);
             color: var(--text);
             font-size: 12px;
@@ -1387,6 +1995,13 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
             .doc-history-tabs button,
             .doc-save-period-tabs button {
               flex: 1 0 auto;
+            }
+            .doc-save-period-tabs button {
+              min-height: 44px;
+              padding-left: 18px;
+              padding-right: 18px;
+              font-size: 14px;
+              font-weight: 700;
             }
             .doc-toolbar-btn {
               flex: 1 1 calc(50% - 8px);
@@ -1422,9 +2037,11 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
               >
                 Smart Summary
               </span>
-              <h1 className="text-2xl font-bold tracking-wide text-[color:var(--text)] md:text-3xl">สรุปเนื้อหาด้วย AI</h1>
+              <h1 className="text-2xl font-bold tracking-wide text-[color:var(--text)] md:text-3xl">
+                {isArchivePage ? 'วิชาเก็บถาวร' : 'สรุปเนื้อหาด้วย AI'}
+              </h1>
               <p className="mt-1 max-w-2xl text-sm leading-6 text-[color:var(--muted)]">
-                อัปโหลดเอกสารหรือเสียง แล้วจัดเก็บสรุปแยกตามวิชาและช่วงเวลา
+              
               </p>
             </div>
           </div>
@@ -1444,7 +2061,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
           <section
             className="doc-summary-card doc-summary-card-input rounded-3xl p-6 shadow-[0_24px_60px_rgba(15,23,42,0.08)] dark:shadow-2xl"
             style={{
-              background: 'var(--surface)',
+              background: '#ffffff',
               border: '1px solid var(--border)',
               backdropFilter: 'blur(22px)'
             }}
@@ -1526,7 +2143,13 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                 <h3 className="text-[15px] font-bold leading-tight text-slate-800 dark:text-white">ใส่เนื้อหา <span className="text-sm font-normal text-slate-400">เอกสาร หรือ ไฟล์เสียง</span></h3>
               </div>
             </div>
-            {/* Input Type Toggle */}
+
+
+
+
+
+
+{/* Input Type Toggle */}
             <div
               className="doc-input-toggle flex p-1.5 backdrop-blur-md rounded-2xl mb-6 w-full max-w-md mx-auto"
               style={{
@@ -1538,6 +2161,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
               <button 
                 type="button"
                 onClick={() => setInputMode('document')}
+                aria-pressed={inputMode === 'document'}
                 className={`flex-1 flex items-center justify-center space-x-2 border py-2.5 rounded-lg text-sm font-semibold transition-all ${
                   inputMode === 'document'
                     ? 'text-slate-900 shadow'
@@ -1553,12 +2177,13 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                     : undefined
                 }
               >
-                <span>📄</span>
+                <FileText className="h-4 w-4" aria-hidden="true" />
                 <span>เอกสาร</span>
               </button>
               <button 
                 type="button"
                 onClick={() => setInputMode('audio')}
+                aria-pressed={inputMode === 'audio'}
                 className={`flex-1 flex items-center justify-center space-x-2 border py-2.5 rounded-lg text-sm font-semibold transition-all ${
                   inputMode === 'audio'
                     ? 'text-slate-900 shadow'
@@ -1574,15 +2199,116 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                     : undefined
                 }
               >
-                <span>🎙️</span>
+                <Mic className="h-4 w-4" aria-hidden="true" />
                 <span>ไฟล์เสียง</span>
               </button>
             </div>
 
-            {/* Main Input Area */}
+            <hr className="border-white/60 dark:border-white/10 my-8" />
+
+            {/* 🌟 ย้าย Step 3 ออกมานอกเงื่อนไข เพื่อให้แสดงผลตลอดเวลา 🌟 */}
+            <div className="mb-4 flex items-center gap-3">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-bold text-white" style={{ background: 'var(--accent)' }}>3</span>
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--accent)' }}>ขั้นที่ 3</p>
+                <h3 className="text-[15px] font-bold leading-tight text-slate-800 dark:text-white">ตั้งค่าการสรุป <span className="text-sm font-normal text-slate-400">รูปแบบ / อารมณ์</span></h3>
+              </div>
+            </div>
+
+            {/* Preferences */}
+            <div className="flex flex-col items-start gap-4 mb-8">
+              <div className="flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
+                <span className="text-sm text-slate-700 dark:text-slate-300 font-medium">รูปแบบการสรุป:</span>
+                <div
+                  className="doc-save-period-tabs flex rounded-xl p-1 border backdrop-blur-sm"
+                  style={{
+                    background: 'var(--surface-2)',
+                    borderColor: 'var(--border)'
+                  }}
+                >
+                  {saveSummaryPeriodOptions.map(option => (
+                    <button 
+                      key={option.key}
+                      type="button"
+                      onClick={() => setSaveSummaryPeriod(option.key)}
+                      className={`px-4 py-1.5 rounded-lg text-sm transition-all ${saveSummaryPeriod === option.key ? 'shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'}`}
+                      style={
+                        saveSummaryPeriod === option.key
+                          ? {
+                              background: 'var(--accent)',
+                              color: '#ffffff',
+                              border: '1px solid var(--accent)'
+                            }
+                          : undefined
+                      }
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="relative z-20 w-full sm:w-[260px]" ref={moodDropdownRef}>
+                  <button
+                    type="button"
+                    className="doc-mood-select flex w-full items-center rounded-xl pl-4 pr-10 py-2.5 text-left text-sm text-slate-800 backdrop-blur-md transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-[color:var(--accent)]/30 dark:text-white"
+                    style={{
+                      background: 'var(--surface)',
+                      border: '1px solid var(--border)'
+                    }}
+                    aria-haspopup="listbox"
+                    aria-expanded={isMoodDropdownOpen}
+                    onClick={() => setIsMoodDropdownOpen(open => !open)}
+                  >
+                    <span className="min-w-0 flex-1 truncate font-medium">
+                      {selectedMoodOption?.label ?? 'เลือกอารมณ์ก่อนบันทึกสรุป'}
+                    </span>
+                  </button>
+                  <span className={`pointer-events-none absolute right-3 top-[19px] text-xs text-slate-500 transition-transform dark:text-slate-400 ${isMoodDropdownOpen ? 'rotate-180' : ''}`}>▼</span>
+
+                  {isMoodDropdownOpen && (
+                    <div
+                      className="absolute left-0 right-0 top-full mt-1 overflow-hidden rounded-lg bg-white py-1 text-sm text-slate-900 shadow-xl ring-1 ring-slate-200 dark:bg-slate-900 dark:text-white dark:ring-slate-700"
+                      role="listbox"
+                    >
+                      <button
+                        type="button"
+                        className={`flex w-full items-center px-4 py-2 text-left font-semibold transition-colors ${selectedMood === '' ? 'bg-blue-600 text-white' : 'hover:bg-blue-50 dark:hover:bg-slate-800'}`}
+                        role="option"
+                        aria-selected={selectedMood === ''}
+                        onClick={() => {
+                          setSelectedMood('');
+                          setIsMoodDropdownOpen(false);
+                        }}
+                      >
+                        <span className="truncate">เลือกอารมณ์ก่อนบันทึกสรุป</span>
+                      </button>
+                      {moodOptions.map(option => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          className={`flex w-full items-center px-4 py-2 text-left font-semibold transition-colors ${selectedMood === option.value ? 'bg-blue-600 text-white' : 'hover:bg-blue-50 dark:hover:bg-slate-800'}`}
+                          role="option"
+                          aria-selected={selectedMood === option.value}
+                          onClick={() => {
+                            setSelectedMood(option.value);
+                            setIsMoodDropdownOpen(false);
+                          }}
+                        >
+                          <span className="truncate">{option.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+              </div>
+            </div>
+
+            <hr className="border-white/60 dark:border-white/10 my-8" />
+
+            {/* Main Input Area (แยกโหมดเอกสาร และ โหมดไฟล์เสียง) */}
             {inputMode === 'document' ? (
               <>
-                {/* Upload Dropzone */}
+                {/* Upload Dropzone (ของเอกสาร) */}
                 <div 
                   onDrop={handleDrop}
                   onDragOver={handleDragOver}
@@ -1636,72 +2362,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                   />
                 </div>
 
-                <hr className="border-white/60 dark:border-white/10 my-8" />
-
-                {/* Step 3 */}
-                <div className="mb-4 flex items-center gap-3">
-                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-bold text-white" style={{ background: 'var(--accent)' }}>3</span>
-                  <div>
-                    <p className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--accent)' }}>ขั้นที่ 3</p>
-                    <h3 className="text-[15px] font-bold leading-tight text-slate-800 dark:text-white">ตั้งค่าการสรุป <span className="text-sm font-normal text-slate-400">รูปแบบ / อารมณ์</span></h3>
-                  </div>
-                </div>
-
-                {/* Preferences */}
-                <div className="flex flex-col md:flex-row items-center justify-between gap-6">
-                  <div className="flex flex-col sm:flex-row items-center gap-4 w-full md:w-auto">
-                    <span className="text-sm text-slate-700 dark:text-slate-300 font-medium">รูปแบบการสรุป:</span>
-                    <div
-                      className="doc-save-period-tabs flex rounded-xl p-1 border backdrop-blur-sm"
-                      style={{
-                      background: 'var(--surface-2)',
-                      borderColor: 'var(--border)'
-                    }}
-                    >
-                      {saveSummaryPeriodOptions.map(option => (
-                        <button 
-                          key={option.key}
-                          type="button"
-                          onClick={() => setSaveSummaryPeriod(option.key)}
-                          className={`px-4 py-1.5 rounded-lg text-sm transition-all ${saveSummaryPeriod === option.key ? 'shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'}`}
-                          style={
-                            saveSummaryPeriod === option.key
-                              ? {
-                                  background: 'var(--accent)',
-                                  color: '#ffffff',
-                                  border: '1px solid var(--accent)'
-                                }
-                              : undefined
-                          }
-                        >
-                          {option.label}
-                        </button>
-                      ))}
-                    </div>
-
-                    <div className="relative w-full sm:w-auto mt-2 sm:mt-0">
-                      <select 
-                        value={selectedMood}
-                        onChange={event => setSelectedMood(event.target.value)}
-                        className="doc-mood-select w-full sm:w-auto appearance-none text-slate-800 dark:text-white text-sm rounded-xl pl-10 pr-10 py-2.5 focus:outline-none backdrop-blur-md transition-all cursor-pointer"
-                        style={{
-                      background: 'var(--surface)',
-                      border: '1px solid var(--border)'
-                    }}
-                      >
-                        <option value="" className="bg-white text-slate-900 dark:bg-slate-900 dark:text-white">เลือกอารมณ์ก่อนบันทึกสรุป</option>
-                        {moodOptions.map(option => (
-                          <option key={option.value} value={option.value} className="bg-white text-slate-900 dark:bg-slate-900 dark:text-white">{option.label}</option>
-                        ))}
-                      </select>
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 dark:text-slate-300">😊</span>
-                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-500 dark:text-slate-400 pointer-events-none">▼</span>
-                    </div>
-                  </div>
-
-                </div>
-
-                {/* Submit */}
+                {/* Submit (เฉพาะเอกสาร) */}
                 <button
                   type="button"
                   onClick={startSummary}
@@ -1730,13 +2391,22 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
               <div
                 className="rounded-2xl p-2 backdrop-blur-md"
                 style={{
-                  background: 'var(--surface-2)',
+                  background: '#ffffff',
                   border: '1px solid var(--border)'
                 }}
               >
-                <VoiceSummaryPage key={inputMode} embedded onSummaryReady={handleVoiceSummaryReady} />
+                <VoiceSummaryPage
+                  key={inputMode}
+                  embedded
+                  summaryPeriod={saveSummaryPeriod}
+                  onSummaryPeriodChange={setSaveSummaryPeriod}
+                  onSummaryReady={handleVoiceSummaryReady}
+                />
               </div>
             )}
+
+
+
 
             {/* Status / Errors Alerts */}
             <div className="mt-6 space-y-3">
@@ -1774,96 +2444,80 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
           </section>
         )}
 
-        {/* Section 2: Output Result */}
-        <section
-          id="result-section"
-          className="doc-summary-card doc-summary-card-result rounded-3xl p-6 shadow-[0_24px_60px_rgba(15,23,42,0.08)] dark:shadow-2xl"
-          style={{
+        {/* Summary result */}
+        {!isArchivePage && (hasResultContent || summaryError) && (
+          <section
+            id="result-section"
+            className="doc-summary-card mt-6 rounded-3xl p-6 shadow-[0_24px_60px_rgba(15,23,42,0.08)] dark:shadow-2xl"
+            style={{
               background: 'var(--surface)',
               border: '1px solid var(--border)',
-              backdropFilter: 'blur(22px)'
+              backdropFilter: 'blur(22px)',
             }}
-        >
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
-            <div className="flex items-center space-x-2">
-              <span className="text-lg">📝</span>
-              <h2 className="text-lg font-semibold text-slate-800 dark:text-white">ผลลัพธ์การสรุป</h2>
-            </div>
-            
-            <div className="flex items-center space-x-2 flex-wrap gap-y-2">
-              <button 
-                type="button" 
-                onClick={() => setIsResultSectionCollapsed(prev => !prev)}
-                className="doc-toolbar-btn flex items-center space-x-1.5 px-3 py-1.5 bg-white/80 dark:bg-white/5 hover:bg-white dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-xs font-medium rounded-lg transition-colors text-slate-700 dark:text-slate-200 backdrop-blur-md shadow-sm dark:shadow-none"
-              >
-                <span>↕️</span>
-                <span>{isResultSectionCollapsed ? 'ขยายผลลัพธ์' : 'ย่อผลลัพธ์'}</span>
-              </button>
-              
-              {savedSummary && (
-                 <button
-                   type="button"
-                   onClick={closeViewedSummary}
-                   className="doc-toolbar-btn flex items-center space-x-1.5 px-3 py-1.5 bg-white/70 dark:bg-white/5 hover:bg-white dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-xs font-medium rounded-lg transition-colors text-slate-700 dark:text-slate-200 backdrop-blur-md shadow-sm dark:shadow-none"
-                 >
-                   <span>ปิดข้อความที่ดู</span>
-                 </button>
-              )}
-
-              <button 
-                type="button" 
-                onClick={handlePrintPdf}
-                className="doc-toolbar-btn flex items-center space-x-1.5 px-3 py-1.5 bg-white/70 dark:bg-white/5 hover:bg-white dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-xs font-medium rounded-lg transition-colors text-slate-700 dark:text-slate-200 backdrop-blur-md shadow-sm dark:shadow-none"
-              >
-                <span>🖨️</span>
-                <span>พิมพ์ / PDF</span>
-              </button>
-
-              <button 
-                type="button"
-                onClick={handleSaveSummary}
-                disabled={!canSaveSummary}
-                className="doc-toolbar-btn doc-toolbar-btn-primary flex items-center space-x-1.5 px-4 py-1.5 text-xs font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed backdrop-blur-md shadow-sm dark:shadow-none"
-                style={{
-                  background: 'var(--accent)',
-                  color: '#ffffff',
-                  border: '1px solid var(--accent)'
-                }}
-              >
-                <span>💾</span>
-                <span>{isSavingSummary ? 'กำลังบันทึก...' : isSummarySaved ? 'บันทึกแล้ว' : 'บันทึกสรุป'}</span>
-              </button>
-            </div>
-          </div>
-
-          {!isResultSectionCollapsed && (
-            <div
-              className={`doc-result-panel w-full min-h-[300px] rounded-2xl border transition-all backdrop-blur-sm ${hasResultContent ? 'p-6' : 'border-dashed flex flex-col items-center justify-center'}`}
-              style={{
-                borderColor: 'var(--border)',
-                background: 'var(--surface-2)'
-              }}
-            >
-              {!hasResultContent ? (
-                <div className="doc-result-empty text-center opacity-70">
-                  <div className="text-4xl mb-3 text-slate-400 dark:text-slate-300">✨</div>
-                  <p className="text-slate-500 dark:text-slate-300 text-sm mb-2">อัปโหลดข้อมูลและกด <span className="text-accent font-medium">สร้างสรุปเนื้อหา</span> เพื่อให้ AI ทำงาน</p>
-                  {summaryError && <p className="text-sm text-rose-500 dark:text-rose-300">{summaryError}</p>}
+          >
+            <div className="flex flex-col gap-4 border-b pb-4 sm:flex-row sm:items-start sm:justify-between" style={{ borderColor: 'var(--border)' }}>
+              <div className="flex min-w-0 items-start gap-3">
+                <span
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg"
+                  style={{ background: 'rgba(var(--accent-rgb),0.12)', color: 'var(--accent)' }}
+                  aria-hidden="true"
+                >
+                  ✨
+                </span>
+                <div>
+                  <p className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--accent)' }}>Summary result</p>
+                  <h2 className="text-lg font-bold text-[color:var(--text)]">{activeSummaryTitle}</h2>
+                  {selectedSubjectName && (
+                    <p className="mt-1 text-xs text-[color:var(--muted)]">วิชา: {selectedSubjectName}</p>
+                  )}
                 </div>
-              ) : (
-                <div className="text-slate-700 dark:text-slate-200 text-sm leading-relaxed space-y-4 animate-in fade-in duration-500">
-                  <p className="text-xs font-semibold uppercase tracking-widest text-accent mb-2">AI Summary</p>
-                  <h3 className="text-lg font-semibold text-slate-900 dark:text-indigo-200">{activeSummaryTitle}</h3>
-                  <div className="whitespace-pre-wrap leading-7 text-slate-800 dark:text-slate-200">
-                    {activeSummaryText}
-                  </div>
+              </div>
+
+              {hasResultContent && (
+                <div className="flex flex-wrap gap-2 sm:justify-end">
+                  <button
+                    type="button"
+                    onClick={handlePrintPdf}
+                    className="rounded-xl border px-3 py-2 text-xs font-semibold text-[color:var(--text)] transition hover:bg-black/5 dark:hover:bg-white/10"
+                    style={{ borderColor: 'var(--border)' }}
+                  >
+                    พิมพ์ / PDF
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleSaveSummary()}
+                    disabled={!canSaveSummary}
+                    className="rounded-xl px-3 py-2 text-xs font-semibold text-white transition disabled:cursor-not-allowed disabled:opacity-50"
+                    style={{ background: 'var(--accent)' }}
+                  >
+                    {isSavingSummary ? 'กำลังบันทึก...' : isSummarySaved ? 'บันทึกแล้ว' : 'บันทึกสรุป'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsResultSectionCollapsed(collapsed => !collapsed)}
+                    className="rounded-xl border px-3 py-2 text-xs font-semibold text-[color:var(--text)] transition hover:bg-black/5 dark:hover:bg-white/10"
+                    style={{ borderColor: 'var(--border)' }}
+                    aria-expanded={!isResultSectionCollapsed}
+                  >
+                    {isResultSectionCollapsed ? 'แสดงผลสรุป' : 'ซ่อนผลสรุป'}
+                  </button>
                 </div>
               )}
             </div>
-          )}
-        </section>
 
-        {/* Section 3: History / Archives */}
+            {summaryError ? (
+              <p className="mt-5 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-500/40 dark:bg-rose-500/20 dark:text-rose-200">
+                {summaryError}
+              </p>
+            ) : hasResultContent && !isResultSectionCollapsed ? (
+              <div className="mt-5 rounded-2xl border p-5" style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}>
+                <SummaryText text={activeSummaryText} />
+              </div>
+            ) : null}
+          </section>
+        )}
+
+        {/* History / Archives */}
         <section
           className="doc-summary-card doc-summary-card-history rounded-3xl p-6 shadow-[0_24px_60px_rgba(15,23,42,0.08)] dark:shadow-2xl"
           style={{
@@ -1896,11 +2550,10 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                 border: '1px solid var(--border)'
               }}
             >
-               {[
-                 { id: 'saved', label: 'สรุปที่บันทึกไว้', icon: '💾', count: undefined },
+             {[ 
                  { id: 'original', label: 'ข้อความต้นฉบับ', icon: '📄', count: undefined },
                  { id: 'archived', label: 'สรุปที่เก็บถาวร', icon: '📦', count: filteredArchivedSummaries.length }
-               ].map((tab) => (
+               ].filter(tab => !isArchivePage || tab.id === 'archived').map((tab) => (
                  <button
                    key={tab.id}
                    type="button"
@@ -1929,9 +2582,39 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
           </div>
 
           <div className="mt-6">
+            {isArchivePage && (
+              <div className="mb-5 grid gap-3 md:grid-cols-2">
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-[color:var(--muted)]">ภาคเรียน</label>
+                  <select
+                    value={selectedSemesterKey}
+                    onChange={event => setSelectedSemesterKey(event.target.value)}
+                    className="w-full rounded-xl px-4 py-3 text-sm text-slate-800 outline-none dark:text-white"
+                    style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
+                  >
+                    {semesterFilterOptions.map(option => (
+                      <option key={option.key} value={option.key}>{option.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-[color:var(--muted)]">วิชา</label>
+                  <select
+                    value={selectedSubjectId}
+                    onChange={event => setSelectedSubjectId(event.target.value)}
+                    className="w-full rounded-xl px-4 py-3 text-sm text-slate-800 outline-none dark:text-white"
+                    style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
+                  >
+                    {semesterFilteredSubjects.map(subject => (
+                      <option key={subject.id} value={subject.id}>{subject.name}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            )}
             
             {/* Filter Pills for Saved Tab */}
-            {activeHistoryTab === 'saved' && (
+            {(activeHistoryTab === 'saved' || activeHistoryTab === 'archived') && (
               <div className="flex space-x-2 mb-4 overflow-x-auto pb-2 scrollbar-hide">
                 {summaryPeriodOptions.map(option => (
                   <button 
@@ -2014,7 +2697,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                                </div>
                              </div>
 
-                             <p className="line-clamp-3 text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                             <p className="whitespace-pre-wrap text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
                                {item.content}
                              </p>
 
@@ -2167,7 +2850,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                                  </div>
                                </div>
 
-                               <p className="line-clamp-3 text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
+                               <p className="whitespace-pre-wrap text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
                                  {item.content}
                                </p>
 
@@ -2181,6 +2864,16 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                                     className="rounded-lg border border-slate-300 dark:border-white/20 bg-white/80 dark:bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 transition hover:bg-white dark:hover:bg-white/10 backdrop-blur-md shadow-sm dark:shadow-none"
                                   >
                                     {savedSummary?.id === item.id ? 'ปิดเนื้อหา' : 'ดูเนื้อหา'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={event => {
+                                      event.stopPropagation();
+                                      void downloadSummaryItem(item);
+                                    }}
+                                    className="rounded-lg border border-slate-300 dark:border-white/20 bg-white/80 dark:bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 transition hover:bg-white dark:hover:bg-white/10 backdrop-blur-md shadow-sm dark:shadow-none"
+                                  >
+                                    ดาวน์โหลด
                                   </button>
                                   <button
                                     type="button"
@@ -2221,6 +2914,107 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
         </section>
 
       </div>
-    </div>
+      </div>
+      {editingArchive && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 px-4 py-6 backdrop-blur-sm">
+          <div
+            className="w-full max-w-3xl rounded-2xl p-5 shadow-2xl"
+            style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
+          >
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-bold text-[color:var(--text)]">แก้ไขสรุปที่เก็บถาวร</h2>
+                <p className="mt-1 text-xs text-[color:var(--muted)]">
+                  {editingArchive.archived_at ? formatSummaryDate(editingArchive.archived_at) : 'รายการเก็บถาวร'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeArchiveEditor}
+                disabled={savingArchiveEdit}
+                className="rounded-lg border border-slate-300 bg-white/80 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-white disabled:opacity-50 dark:border-white/20 dark:bg-white/5 dark:text-slate-200 dark:hover:bg-white/10"
+              >
+                ปิด
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-[color:var(--muted)]">ชื่อสรุป</label>
+                <input
+                  value={archiveEditTitle}
+                  onChange={event => setArchiveEditTitle(event.target.value)}
+                  className="w-full rounded-xl px-4 py-3 text-sm text-slate-800 outline-none dark:text-white"
+                  style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-[color:var(--muted)]">เนื้อหาสรุป</label>
+                <textarea
+                  value={archiveEditDescription}
+                  onChange={event => setArchiveEditDescription(event.target.value)}
+                  rows={12}
+                  className="w-full resize-y rounded-xl px-4 py-3 text-sm leading-7 text-slate-800 outline-none dark:text-white"
+                  style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
+                />
+              </div>
+            </div>
+
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() =>
+                  printSummaryItem({
+                    title: archiveEditTitle,
+                    content: archiveEditDescription,
+                    created_at: editingArchive.archived_at ?? null,
+                    subject_name: editingArchive.subject_name ?? selectedSubjectName,
+                    period: editingArchive.period ?? null,
+                  })
+                }
+                className="rounded-xl border border-slate-300 bg-white/80 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-white dark:border-white/20 dark:bg-white/5 dark:text-slate-200 dark:hover:bg-white/10"
+              >
+                พิมพ์
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void downloadSummaryItem({
+                    id: editingArchive.id,
+                    title: archiveEditTitle,
+                    content: archiveEditDescription,
+                    created_at: editingArchive.archived_at,
+                    subject_name: editingArchive.subject_name,
+                    period: editingArchive.period ?? null,
+                    original_subject_id: editingArchive.original_subject_id ?? null,
+                  })
+                }
+                className="rounded-xl border border-slate-300 bg-white/80 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-white dark:border-white/20 dark:bg-white/5 dark:text-slate-200 dark:hover:bg-white/10"
+              >
+                ดาวน์โหลด
+              </button>
+              <button
+                type="button"
+                onClick={saveArchiveEdit}
+                disabled={savingArchiveEdit}
+                className="rounded-xl px-4 py-2 text-sm font-semibold text-white transition disabled:opacity-50"
+                style={{ background: 'var(--accent)' }}
+              >
+                {savingArchiveEdit ? 'กำลังบันทึก...' : 'บันทึกการแก้ไข'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      <ConfirmDialog
+        isOpen={Boolean(confirmState)}
+        title={confirmState?.title ?? ''}
+        description={confirmState?.description ?? ''}
+        confirmLabel={confirmState?.confirmLabel ?? 'ยืนยัน'}
+        onConfirm={handleConfirmDialogConfirm}
+        onCancel={handleConfirmDialogCancel}
+        busy={confirmBusy}
+      />
+    </>
   );
 };

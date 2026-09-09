@@ -25,8 +25,11 @@ class StudyCalendarEventResource extends JsonResource
             'title' => $this->title,
             'description' => $this->description,
             'room' => $this->room ?? ($metadata['room'] ?? null),
-            'start_time' => $this->start_time?->copy()?->setTimezone($timezone)?->toIso8601String(),
-            'end_time' => $this->end_time?->copy()?->setTimezone($timezone)?->toIso8601String(),
+            // Calendar datetimes are stored as local timetable values.  Use
+            // shiftTimezone so the wall-clock time remains the same when the
+            // API adds the Bangkok offset (e.g. 15:00 stays 15:00, not 22:00).
+            'start_time' => $this->start_time?->copy()?->shiftTimezone($timezone)?->toIso8601String(),
+            'end_time' => $this->end_time?->copy()?->shiftTimezone($timezone)?->toIso8601String(),
             'status' => $this->status,
             'type' => $eventType,
             'event_type' => $eventType,

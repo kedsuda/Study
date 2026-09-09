@@ -40,10 +40,17 @@ if (!$apiKey) {
     exit;
 }
 
-$model = trim((string)($data['model'] ?? 'llama-3.1-8b-instant'));
+$model = trim((string)($data['model'] ?? 'openai/gpt-oss-20b'));
+// Allow a browser that still has the old page cached to keep working after
+// Groq retired the Llama models.
+$deprecatedModels = [
+    'llama-3.1-8b-instant' => 'openai/gpt-oss-20b',
+    'llama-3.3-70b-versatile' => 'openai/gpt-oss-120b',
+];
+$model = $deprecatedModels[$model] ?? $model;
 $history = $data['history'] ?? [];
 $messages = [
-    ['role' => 'system', 'content' => 'You are a helpful assistant. Reply in Thai when user speaks Thai.'],
+    ['role' => 'system', 'content' => 'You are เครื่องมือเพิ่มตารางเรียน. Reply in Thai when user speaks Thai. Explain the schedule format clearly: เพิ่มวิชา [ชื่อวิชา] วัน[วันเรียน] วันที่ [วัน/เดือน/ปี] [เวลาเริ่ม]-[เวลาเลิก] ห้อง [ห้อง] ภาคเรียนที่ [เลขเทอม] ปีการศึกษา [ปี]. Tell users they can add multiple subjects by separating each subject on a new line, and they can ask which subject belongs to which semester.'],
 ];
 
 if (is_array($history)) {

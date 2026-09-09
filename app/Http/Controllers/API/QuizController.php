@@ -12,7 +12,6 @@ use App\Models\Quiz;
 use App\Models\StudyLog;
 use App\Models\Subject;
 use App\Services\AI\AIService;
-use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
 use Illuminate\Http\UploadedFile;
@@ -27,8 +26,9 @@ class QuizController extends Controller
     {
     }
 
-    public function index(Subject $subject): AnonymousResourceCollection
+    public function index(int $subject): AnonymousResourceCollection
     {
+        $subject = $this->resolveSubject($subject);
         $this->authorizeSubject($subject);
         $userId = request()->user()->id;
         $quizzes = $subject->quizzes()
@@ -38,8 +38,9 @@ class QuizController extends Controller
         return QuizResource::collection($quizzes);
     }
 
-    public function store(QuizGenerationRequest $request, Subject $subject): JsonResponse
+    public function store(QuizGenerationRequest $request, int $subject): JsonResponse
     {
+        $subject = $this->resolveSubject($subject);
         $this->authorizeSubject($subject);
         $this->ensureQuizQuestionColumnsSupportLongText();
 
@@ -53,7 +54,7 @@ class QuizController extends Controller
 
         $quiz = DB::transaction(function () use ($subject, $quizDto) {
             $quiz = $subject->quizzes()->create([
-                'title' => $this->limitText((string) ($quizDto['title'] ?? $subject->name), 240),
+                'title' => $this->limitText($quizDto['title'] ?? $subject->name, 240),
                 'description' => $this->limitNullableText($quizDto['description'] ?? null, 240),
                 'ai_model' => $quizDto['model'] ?? null,
                 'metadata' => $this->normalizeQuizMetadata($quizDto['metadata'] ?? null),
@@ -69,8 +70,9 @@ class QuizController extends Controller
         return response()->json(new QuizResource($quiz->load('questions')), 201);
     }
 
-    public function storeFromFile(Subject $subject): JsonResponse
+    public function storeFromFile(int $subject): JsonResponse
     {
+        $subject = $this->resolveSubject($subject);
         $this->authorizeSubject($subject);
         $this->ensureQuizQuestionColumnsSupportLongText();
         $usedFallbackQuiz = false;
@@ -120,18 +122,10 @@ class QuizController extends Controller
 
         try {
             $quiz = DB::transaction(function () use ($subject, $file, $storedPath, $quizDto) {
-                $logTitle = trim(pathinfo($file->getClientOriginalName(), PATHINFO_FILENAME));
-                $logTitle = $logTitle !== '' ? "แบบฝึกหัดจากไฟล์: {$logTitle}" : 'แบบฝึกหัดจากไฟล์เอกสาร';
-
-                $log = StudyLog::create([
-                    'subject_id' => $subject->id,
-                    'title' => $logTitle,
-                    'note' => 'อัปโหลดไฟล์เพื่อสร้างแบบฝึกหัด',
-                    'log_date' => Carbon::now()->toDateString(),
-                ]);
-
                 $fileRecord = FileAttachment::create([
-                    'study_log_id' => $log->id,
+                    // The uploaded document is a quiz asset; it must not create
+                    // a study log or appear in the study-summary menu.
+                    'study_log_id' => null,
                     'original_name' => $file->getClientOriginalName(),
                     'file_path' => $storedPath,
                     'file_type' => $this->resolveFileType($file->getClientOriginalExtension()),
@@ -142,12 +136,11 @@ class QuizController extends Controller
                 $metadata = array_merge($quizDto['metadata'] ?? [], [
                     'source' => 'document',
                     'file_id' => $fileRecord->id,
-                    'study_log_id' => $log->id,
                     'file_name' => $file->getClientOriginalName(),
                 ]);
 
                 $quiz = $subject->quizzes()->create([
-                    'title' => $this->limitText((string) ($quizDto['title'] ?? $subject->name), 240),
+                    'title' => $this->limitText($quizDto['title'] ?? $subject->name, 240),
                     'description' => $this->limitNullableText($quizDto['description'] ?? null, 240),
                     'ai_model' => $quizDto['model'] ?? null,
                     'metadata' => $this->normalizeQuizMetadata($metadata),
@@ -181,7 +174,14 @@ class QuizController extends Controller
     public function show(Quiz $quiz): QuizResource
     {
         $this->authorizeQuiz($quiz);
-        return new QuizResource($quiz->load('questions'));
+        $quiz->load('questions');
+
+        if ($quiz->questions->isEmpty()) {
+            $this->repairEmptyQuizQuestions($quiz);
+            $quiz->refresh()->load('questions');
+        }
+
+        return new QuizResource($quiz);
     }
 
     public function destroy(Quiz $quiz): JsonResponse
@@ -198,6 +198,72 @@ class QuizController extends Controller
         return response()->json(status: 204);
     }
 
+    public function summary(): JsonResponse
+    {
+        $user = request()->user();
+
+        if (! $user || ! Schema::hasTable('quiz_attempts') || ! Schema::hasTable('quizzes') || ! Schema::hasTable('subjects')) {
+            return response()->json([
+                'attempt_count' => 0,
+                'attempted_quiz_count' => 0,
+                'average_score' => null,
+                'latest_score' => null,
+                'best_score' => null,
+                'passed_count' => 0,
+                'pass_rate' => null,
+            ]);
+        }
+
+        $attempts = DB::table('quiz_attempts')
+            ->join('quizzes', 'quizzes.id', '=', 'quiz_attempts.quiz_id')
+            ->join('subjects', 'subjects.id', '=', 'quizzes.subject_id')
+            ->where('quiz_attempts.user_id', $user->id)
+            ->where('subjects.user_id', $user->id)
+            ->orderBy('quiz_attempts.created_at')
+            ->orderBy('quiz_attempts.id')
+            ->get([
+                'quiz_attempts.id',
+                'quiz_attempts.quiz_id',
+                'quiz_attempts.score',
+                'quiz_attempts.answers',
+                'quiz_attempts.passed',
+                'quiz_attempts.created_at',
+            ]);
+
+        $scores = $attempts
+            ->map(function ($attempt) {
+                $answers = json_decode((string) ($attempt->answers ?? '[]'), true);
+                $total = is_array($answers) ? count($answers) : 0;
+                $score = (int) ($attempt->score ?? 0);
+
+                return [
+                    'quiz_id' => (int) ($attempt->quiz_id ?? 0),
+                    'score' => $score,
+                    'total' => $total,
+                    'percentage' => $total > 0 ? round(($score / $total) * 100, 1) : null,
+                    'passed' => (bool) ($attempt->passed ?? false),
+                    'created_at' => $attempt->created_at,
+                ];
+            })
+            ->filter(fn (array $attempt) => $attempt['percentage'] !== null)
+            ->values();
+
+        $attemptCount = $scores->count();
+        $latest = $scores->last();
+
+        return response()->json([
+            'attempt_count' => $attemptCount,
+            'attempted_quiz_count' => $scores->pluck('quiz_id')->filter()->unique()->count(),
+            'average_score' => $attemptCount > 0 ? round((float) $scores->avg('percentage'), 1) : null,
+            'latest_score' => $latest ? (float) $latest['percentage'] : null,
+            'best_score' => $attemptCount > 0 ? (float) $scores->max('percentage') : null,
+            'passed_count' => $scores->filter(fn (array $attempt) => $attempt['passed'])->count(),
+            'pass_rate' => $attemptCount > 0
+                ? round(($scores->filter(fn (array $attempt) => $attempt['passed'])->count() / $attemptCount) * 100, 1)
+                : null,
+        ]);
+    }
+
     public function submitAttempt(QuizAttemptRequest $request, Quiz $quiz): JsonResponse
     {
         $this->authorizeQuiz($quiz);
@@ -211,7 +277,7 @@ class QuizController extends Controller
             $attemptPayload = [
                 'user_id' => $user->id,
                 'quiz_id' => $quiz->id,
-                'answers' => $this->encodeAttemptAnswers($data['answers']),
+                'answers' => $this->encodeAttemptAnswers($this->formatAttemptAnswers($result['answers'] ?? [])),
                 'score' => (int) $result['score'],
                 'passed' => $percentage >= 60,
                 'created_at' => now(),
@@ -235,12 +301,23 @@ class QuizController extends Controller
 
     private function authorizeSubject(Subject $subject): void
     {
-        abort_unless($subject->user_id === request()->user()->id, 403, 'Unauthorized');
+        $user = request()->user();
+
+        abort_unless($user && ((int) $subject->user_id === (int) $user->id || $user->role === 'admin'), 403, 'Unauthorized');
     }
 
     private function authorizeQuiz(Quiz $quiz): void
     {
-        abort_unless($quiz->subject->user_id === request()->user()->id, 403, 'Unauthorized');
+        $subject = Subject::withoutGlobalScope('user')->find($quiz->subject_id);
+        abort_unless($subject, 404, 'Subject not found');
+
+        $this->authorizeSubject($subject);
+        $quiz->setRelation('subject', $subject);
+    }
+
+    private function resolveSubject(int $subjectId): Subject
+    {
+        return Subject::withoutGlobalScope('user')->findOrFail($subjectId);
     }
 
     private function isAllowedDocument(?string $extension): bool
@@ -262,15 +339,96 @@ class QuizController extends Controller
         };
     }
 
+    private function repairEmptyQuizQuestions(Quiz $quiz): void
+    {
+        if ($quiz->questions()->exists()) {
+            return;
+        }
+
+        $metadata = is_array($quiz->metadata) ? $quiz->metadata : [];
+        $sourceText = $this->quizRepairSourceText($quiz, $metadata);
+        $questionTypes = $metadata['requested_types'] ?? ['multiple_choice', 'short_answer'];
+        $questionTypes = is_array($questionTypes) ? $questionTypes : ['multiple_choice', 'short_answer'];
+
+        $quizDto = $this->aiService->generateLocalQuizFromText($quiz->subject, $sourceText, [
+            'title' => $quiz->title ?: null,
+            'difficulty' => $metadata['difficulty'] ?? 'medium',
+            'question_count' => 5,
+            'question_types' => $questionTypes,
+        ], [
+            'source' => $metadata['source'] ?? 'repair',
+            'fallback_mode' => 'repaired-empty-quiz',
+        ]);
+
+        DB::transaction(function () use ($quiz, $quizDto) {
+            if ($quiz->questions()->exists()) {
+                return;
+            }
+
+            foreach ($quizDto['questions'] as $question) {
+                $quiz->questions()->create($this->formatQuestionPayload($question));
+            }
+        });
+    }
+
+    /**
+     * @param  array<string,mixed>  $metadata
+     */
+    private function quizRepairSourceText(Quiz $quiz, array $metadata): string
+    {
+        $pieces = [];
+        $fileId = isset($metadata['file_id']) ? (int) $metadata['file_id'] : null;
+        if ($fileId) {
+            $file = FileAttachment::find($fileId);
+            if ($file && $file->file_path && Storage::disk('public')->exists($file->file_path)) {
+                try {
+                    $path = Storage::disk('public')->path($file->file_path);
+                    $uploaded = new UploadedFile(
+                        $path,
+                        $file->original_name ?: basename($path),
+                        $file->mime_type,
+                        null,
+                        true
+                    );
+                    $text = $this->aiService->extractDocumentTextBestEffort($uploaded);
+                    if (is_string($text) && trim($text) !== '') {
+                        $pieces[] = $text;
+                    }
+                } catch (\Throwable) {
+                    // Continue with study-log and subject context.
+                }
+            }
+        }
+
+        $studyLogId = isset($metadata['study_log_id']) ? (int) $metadata['study_log_id'] : null;
+        if ($studyLogId) {
+            $log = StudyLog::find($studyLogId);
+            if ($log) {
+                $pieces[] = trim(implode("\n", array_filter([
+                    $log->title ? 'หัวข้อ: '.$log->title : null,
+                    $log->note ? 'บันทึก: '.$log->note : null,
+                ])));
+            }
+        }
+
+        $pieces[] = trim(implode("\n", array_filter([
+            $quiz->title ? 'ชื่อแบบฝึกหัด: '.$quiz->title : null,
+            $quiz->subject?->name ? 'วิชา: '.$quiz->subject->name : null,
+            $quiz->subject?->description ? 'รายละเอียดวิชา: '.$quiz->subject->description : null,
+        ])));
+
+        return trim(implode("\n\n", array_filter($pieces)));
+    }
+
     /**
      * @param  array<string, mixed>  $question
      * @return array<string, mixed>
      */
     private function formatQuestionPayload(array $question): array
     {
-        $questionText = trim((string) ($question['question_text'] ?? 'Question'));
-        $correctAnswer = trim((string) ($question['correct_answer'] ?? ''));
-        $explanation = trim((string) ($question['explanation'] ?? ''));
+        $questionText = $this->cleanUtf8Text($question['question_text'] ?? 'Question');
+        $correctAnswer = $this->cleanUtf8Text($question['correct_answer'] ?? '');
+        $explanation = $this->cleanUtf8Text($question['explanation'] ?? '');
 
         return [
             'question_text' => $questionText !== '' ? $questionText : 'Question',
@@ -279,6 +437,44 @@ class QuizController extends Controller
             'correct_answer' => $correctAnswer !== '' ? $correctAnswer : null,
             'explanation' => $explanation !== '' ? $explanation : null,
         ];
+    }
+
+    private function cleanUtf8Text(mixed $value): string
+    {
+        if (is_array($value)) {
+            $value = implode(' ', array_filter(array_map(
+                fn ($item) => $this->cleanUtf8Text($item),
+                $value
+            ), fn (string $item) => $item !== ''));
+        } elseif (is_object($value)) {
+            $value = method_exists($value, '__toString') ? (string) $value : '';
+        } elseif (is_bool($value)) {
+            $value = $value ? 'true' : 'false';
+        } elseif ($value === null) {
+            $value = '';
+        } else {
+            $value = (string) $value;
+        }
+
+        $value = trim($value);
+
+        if ($value === '') {
+            return '';
+        }
+
+        if (! mb_check_encoding($value, 'UTF-8')) {
+            if (function_exists('mb_scrub')) {
+                $value = mb_scrub($value, 'UTF-8');
+            } else {
+                $converted = @iconv('UTF-8', 'UTF-8//IGNORE', $value);
+                $value = is_string($converted) ? $converted : '';
+            }
+        }
+
+        $value = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', ' ', $value) ?? $value;
+        $value = preg_replace('/[ \t]+/u', ' ', $value) ?? $value;
+
+        return trim($value);
     }
 
     /**
@@ -292,7 +488,7 @@ class QuizController extends Controller
         }
 
         $options = array_values(array_filter(array_map(
-            fn ($option) => trim((string) $option),
+            fn ($option) => $this->cleanUtf8Text($option),
             $value
         ), static fn (string $option) => $option !== ''));
 
@@ -305,9 +501,9 @@ class QuizController extends Controller
         return strlen($encoded ?: '[]');
     }
 
-    private function limitText(string $value, int $limit): string
+    private function limitText(mixed $value, int $limit): string
     {
-        $trimmed = trim($value);
+        $trimmed = $this->cleanUtf8Text($value);
         if ($trimmed === '') {
             return '';
         }
@@ -321,7 +517,7 @@ class QuizController extends Controller
 
     private function limitNullableText(mixed $value, int $limit): ?string
     {
-        $trimmed = trim((string) ($value ?? ''));
+        $trimmed = $this->cleanUtf8Text($value);
         if ($trimmed === '') {
             return null;
         }
@@ -372,15 +568,15 @@ class QuizController extends Controller
         }
 
         $normalized = [
-            'source' => isset($metadata['source']) ? (string) $metadata['source'] : null,
-            'difficulty' => isset($metadata['difficulty']) ? (string) $metadata['difficulty'] : null,
+            'source' => isset($metadata['source']) ? $this->cleanUtf8Text($metadata['source']) : null,
+            'difficulty' => isset($metadata['difficulty']) ? $this->cleanUtf8Text($metadata['difficulty']) : null,
             'file_id' => isset($metadata['file_id']) ? (int) $metadata['file_id'] : null,
             'study_log_id' => isset($metadata['study_log_id']) ? (int) $metadata['study_log_id'] : null,
         ];
 
         if (! empty($metadata['requested_types']) && is_array($metadata['requested_types'])) {
             $normalized['requested_types'] = array_values(array_slice(array_map(
-                static fn ($type) => (string) $type,
+                fn ($type) => $this->cleanUtf8Text($type),
                 $metadata['requested_types']
             ), 0, 3));
         }
@@ -389,8 +585,16 @@ class QuizController extends Controller
             $normalized['summary_ids'] = array_values(array_slice(array_map('intval', $metadata['summary_ids']), 0, 5));
         }
 
+        if (! empty($metadata['study_log_ids']) && is_array($metadata['study_log_ids'])) {
+            $normalized['study_log_ids'] = array_values(array_slice(array_map('intval', $metadata['study_log_ids']), 0, 6));
+        }
+
+        if (! empty($metadata['file_ids']) && is_array($metadata['file_ids'])) {
+            $normalized['file_ids'] = array_values(array_slice(array_map('intval', $metadata['file_ids']), 0, 6));
+        }
+
         if (! empty($metadata['file_name'])) {
-            $normalized['file_name'] = $this->limitText((string) $metadata['file_name'], 60);
+            $normalized['file_name'] = $this->limitText($metadata['file_name'], 60);
         }
 
         $normalized = array_filter($normalized, static fn ($value) => $value !== null && $value !== [] && $value !== '');
@@ -399,20 +603,20 @@ class QuizController extends Controller
             return null;
         }
 
-        $encoded = json_encode($normalized, JSON_UNESCAPED_UNICODE);
+        $encoded = json_encode($normalized, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
         $maxLength = $this->resolveQuizMetadataColumnLength();
         if ($encoded !== false && strlen($encoded) <= $maxLength) {
             return $normalized;
         }
 
         unset($normalized['file_name']);
-        $encoded = json_encode($normalized, JSON_UNESCAPED_UNICODE);
+        $encoded = json_encode($normalized, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
         if ($encoded !== false && strlen($encoded) <= $maxLength) {
             return $normalized;
         }
 
-        unset($normalized['requested_types'], $normalized['summary_ids']);
-        $encoded = json_encode($normalized, JSON_UNESCAPED_UNICODE);
+        unset($normalized['requested_types'], $normalized['summary_ids'], $normalized['study_log_ids'], $normalized['file_ids']);
+        $encoded = json_encode($normalized, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
         if ($encoded !== false && strlen($encoded) <= $maxLength) {
             return $normalized;
         }
@@ -453,6 +657,28 @@ class QuizController extends Controller
         return is_string($encoded) && $encoded !== '' ? $encoded : '[]';
     }
 
+    /**
+     * @param  array<int, mixed>  $answers
+     * @return array<int, array<string, mixed>>
+     */
+    private function formatAttemptAnswers(array $answers): array
+    {
+        return array_values(array_map(function ($answer) {
+            $question = $answer->question ?? null;
+
+            return [
+                'question_id' => (int) ($answer->question_id ?? 0),
+                'selected_answer' => $this->cleanUtf8Text($answer->selected_answer ?? ''),
+                'is_correct' => (bool) ($answer->is_correct ?? false),
+                'score' => (int) ($answer->score ?? 0),
+                'correct_answer' => $this->cleanUtf8Text($question?->correct_answer ?? ''),
+                'explanation' => $this->cleanUtf8Text($question?->explanation ?? ''),
+                'question_text' => $this->cleanUtf8Text($question?->question_text ?? ''),
+                'question_type' => $this->cleanUtf8Text($question?->question_type ?? ''),
+            ];
+        }, $answers));
+    }
+
     private function ensureQuizQuestionColumnsSupportLongText(): void
     {
         if (! Schema::hasTable('quiz_questions')) {
@@ -473,10 +699,10 @@ class QuizController extends Controller
                 ->keyBy('column_name');
 
             $definitions = [
-                'question_text' => 'TEXT NOT NULL',
-                'options' => 'LONGTEXT NULL',
-                'correct_answer' => 'TEXT NULL',
-                'explanation' => 'TEXT NULL',
+                'question_text' => 'TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL',
+                'options' => 'LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL',
+                'correct_answer' => 'TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL',
+                'explanation' => 'TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL',
             ];
 
             foreach ($definitions as $column => $definition) {
@@ -499,6 +725,8 @@ class QuizController extends Controller
 
                 DB::statement("ALTER TABLE `quiz_questions` MODIFY `{$column}` {$definition}");
             }
+
+            DB::statement('ALTER TABLE `quiz_questions` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
         } catch (\Throwable) {
             // Keep request flow alive; if schema update cannot run, the original DB error will surface.
         }

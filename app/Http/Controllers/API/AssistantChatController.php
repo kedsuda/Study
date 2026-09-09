@@ -5,11 +5,14 @@ namespace App\Http\Controllers\API;
 use App\Http\Controllers\Controller;
 use App\Models\ChatHistory;
 use App\Services\AI\AIService;
+use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 class AssistantChatController extends Controller
 {
+    private const ASSISTANT_TIMEZONE = 'Asia/Bangkok';
+
     public function __construct(private readonly AIService $aiService)
     {
     }
@@ -65,6 +68,7 @@ class AssistantChatController extends Controller
             'message' => $messageText,
             'attachment_url' => $attachmentUrl !== '' ? $attachmentUrl : null,
             'is_deleted' => false,
+            'created_at' => Carbon::now(self::ASSISTANT_TIMEZONE)->format('Y-m-d H:i:s'),
         ]);
 
         $history = ChatHistory::query()
@@ -102,6 +106,7 @@ class AssistantChatController extends Controller
             'message' => $assistantReply,
             'attachment_url' => null,
             'is_deleted' => false,
+            'created_at' => Carbon::now(self::ASSISTANT_TIMEZONE)->format('Y-m-d H:i:s'),
         ]);
 
         $messages = ChatHistory::query()
@@ -120,6 +125,10 @@ class AssistantChatController extends Controller
             'user_message' => $this->transformMessage($userMessage),
             'assistant_message' => $this->transformMessage($assistantMessage),
             'messages' => $messages,
+            // This must reflect a real database write, not wording produced by
+            // the language model.
+            'schedule_updated' => $this->aiService->assistantScheduleWasUpdated(),
+            'subjects_updated' => $this->aiService->assistantSubjectsWereUpdated(),
         ]);
     }
 
@@ -182,8 +191,19 @@ class AssistantChatController extends Controller
             'message' => (string) ($message->message ?? ''),
             'attachment_url' => $message->attachment_url,
             'is_deleted' => (bool) $message->is_deleted,
-            'created_at' => optional($message->created_at)?->toIso8601String(),
+            'created_at' => $this->formatMessageCreatedAt($message),
         ];
+    }
+
+    private function formatMessageCreatedAt(ChatHistory $message): ?string
+    {
+        $createdAt = $message->getRawOriginal('created_at');
+
+        if (! $createdAt) {
+            return null;
+        }
+
+        return Carbon::parse((string) $createdAt, self::ASSISTANT_TIMEZONE)->toIso8601String();
     }
 
     private function resolveAssistantFallbackMessage(\Throwable $error): string

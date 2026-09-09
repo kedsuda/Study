@@ -1,12 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 import { format } from 'date-fns';
+import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker';
+import { BookOpen, Calendar, FileText, LoaderCircle, Send, Sparkles } from 'lucide-react';
+import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { api, assetBaseURL } from '../../services/api';
 import { getLastSubjectKey } from '../../constants/storage';
 import { useAppAlert } from '../../context/AppAlertContext';
 import { useAuth } from '../../context/AuthContext';
-import { resolveStudyFileUrl, uploadStudyFileToSupabase } from '../../utils/studyFiles';
+import { downloadStudyFileBlob, isSupabaseStudyFilePath, resolveStudyFileUrl, uploadStudyFileToSupabase } from '../../utils/studyFiles';
 
 interface Subject {
   id: number;
@@ -23,12 +26,16 @@ interface StudyFile {
   file_path: string;
   file_url?: string | null;
   file_type: string;
+  mime_type?: string | null;
+  file_size?: number | null;
 }
 
 interface Summary {
   id: number;
   content: string;
   created_at: string;
+  ai_model?: string | null;
+  metadata?: Record<string, unknown> | null;
 }
 
 interface AudioSummary {
@@ -60,6 +67,108 @@ interface StudyLogForm {
 }
 
 const storageBase = assetBaseURL || (api.defaults.baseURL ?? '').replace(/\/api\/?$/, '');
+const documentExtensions = new Set(['pdf', 'doc', 'docx', 'txt']);
+
+const normalizeDateInputValue = (value: string) => {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+
+  const match = trimmed.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!match) return '';
+
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  const year = Number(match[3]);
+  if (!Number.isFinite(day) || !Number.isFinite(month) || !Number.isFinite(year)) return '';
+
+  const date = new Date(year, month - 1, day);
+  if (Number.isNaN(date.getTime())) return '';
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) return '';
+
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+};
+
+const formatDateDisplayValue = (value: string) => {
+  const normalized = normalizeDateInputValue(value);
+  if (!normalized) return value;
+  const [year, month, day] = normalized.split('-');
+  return `${day}/${month}/${year}`;
+};
+
+const getFileExtension = (filename?: string | null) => {
+  const value = filename?.trim() ?? '';
+  const parts = value.split('.');
+  return parts.length > 1 ? (parts.pop() ?? '').toLowerCase() : '';
+};
+
+const isDocumentAttachment = (file: StudyFile) => {
+  const extension = getFileExtension(file.original_name);
+  return documentExtensions.has(extension) || file.file_type === 'pdf' || file.file_type === 'word';
+};
+
+const extractPdfTextInBrowser = async (file: File) => {
+  const pdfjs = await import('pdfjs-dist');
+  if (!pdfjs.GlobalWorkerOptions.workerPort) {
+    pdfjs.GlobalWorkerOptions.workerPort = new PdfWorker();
+  }
+
+  const buffer = await file.arrayBuffer();
+  const loadingTask = pdfjs.getDocument({ data: new Uint8Array(buffer) });
+  const pdf = await loadingTask.promise;
+  const pages: string[] = [];
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    const textContent = await page.getTextContent();
+    const items = textContent.items as Array<{ str?: string }>;
+    const pageText = items
+      .map(item => (typeof item.str === 'string' ? item.str.trim() : ''))
+      .filter(Boolean)
+      .join(' ');
+
+    if (pageText) {
+      pages.push(pageText);
+    }
+  }
+
+  return pages.join('\n\n').trim();
+};
+
+const summarizeStoredDocumentFile = async (file: StudyFile) => {
+  let blob = await downloadStudyFileBlob(file.file_path);
+  if (!blob) {
+    const fileUrl = file.file_url || resolveStudyFileUrl(file.file_path, storageBase);
+    const response = await fetch(fileUrl);
+    if (!response.ok) {
+      throw new Error(`โหลดไฟล์แนบไม่สำเร็จ (${response.status})`);
+    }
+    blob = await response.blob();
+  }
+
+  const formData = new FormData();
+  const uploadFile = new File([blob], file.original_name, {
+    type: file.mime_type || blob.type || 'application/octet-stream',
+  });
+
+  if (getFileExtension(file.original_name) === 'pdf') {
+    try {
+      const extractedText = await extractPdfTextInBrowser(uploadFile);
+      if (extractedText.trim().length >= 20) {
+        formData.append('text', extractedText);
+      }
+    } catch (pdfError) {
+      console.warn('browser pdf text extraction failed', pdfError);
+    }
+  }
+
+  if (!formData.has('text')) {
+    formData.append('file', uploadFile, file.original_name);
+  }
+
+  const summaryResponse = await api.post('/ai/summarize/document', formData);
+  return summaryResponse.data as { summary?: string; text?: string; model?: string };
+};
 
 export const StudyLogPage = () => {
   const { user } = useAuth();
@@ -72,9 +181,15 @@ export const StudyLogPage = () => {
   const [loading, setLoading] = useState(true);
   const [deletingLogId, setDeletingLogId] = useState<number | null>(null);
   const [deletingFileId, setDeletingFileId] = useState<number | null>(null);
-  const [deletingSummaryId, setDeletingSummaryId] = useState<string | null>(null);
+  const [generatingSummaryId, setGeneratingSummaryId] = useState<number | null>(null);
+  const [showAllLogs, setShowAllLogs] = useState(false);
+  const [confirmState, setConfirmState] = useState<{ title: string; description: string; confirmLabel: string; onConfirm: () => Promise<void> | void } | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const datePickerRef = useRef<HTMLInputElement | null>(null);
   const selectedLogIdFromState = Number((location.state as { selectedLogId?: number } | null)?.selectedLogId);
   const lastSubjectKey = useMemo(() => getLastSubjectKey(user?.id), [user?.id]);
+  const defaultLogDate = useMemo(() => format(new Date(), 'yyyy-MM-dd'), []);
+  const [logDateDisplay, setLogDateDisplay] = useState(() => formatDateDisplayValue(defaultLogDate));
 
   useEffect(() => {
     if (subjectId) {
@@ -85,15 +200,19 @@ export const StudyLogPage = () => {
     register,
     handleSubmit,
     reset,
+    setValue,
     formState: { isSubmitting }
   } = useForm<StudyLogForm>({
     defaultValues: {
       title: '',
       note: '',
-      log_date: format(new Date(), 'yyyy-MM-dd'),
-      duration_minutes: 60
+      log_date: defaultLogDate,
+      duration_minutes: 60,
+      mood: ''
     }
   });
+  const logDateField = register('log_date', { required: true });
+  const moodOptions = ['สนุก', 'เฉย ๆ', 'เครียด', 'มั่นใจ', 'ต้องทบทวน'];
 
   useEffect(() => {
     if (!subjectId) return;
@@ -120,9 +239,26 @@ export const StudyLogPage = () => {
 
   const onSubmit = async (data: StudyLogForm) => {
     if (!subjectId) return;
-    const response = await api.post<StudyLog>(`/subjects/${subjectId}/study-logs`, data);
-    setLogs(prev => [response.data, ...prev]);
-    reset();
+    const normalizedLogDate = normalizeDateInputValue(data.log_date);
+    if (!normalizedLogDate) {
+      error('กรุณากรอกวันที่เป็น วัน/เดือน/ปี');
+      return;
+    }
+    const response = await api.post<StudyLog>(`/subjects/${subjectId}/study-logs`, {
+      ...data,
+      log_date: normalizedLogDate,
+    });
+    const payload = (response.data as any)?.data ?? response.data;
+    setLogs(prev => [payload, ...prev]);
+    setSelectedLog(payload);
+    reset({
+      title: '',
+      note: '',
+      log_date: defaultLogDate,
+      duration_minutes: 60,
+      mood: ''
+    });
+    setLogDateDisplay(formatDateDisplayValue(defaultLogDate));
   };
 
   const uploadFile = async (logId: number, file: File) => {
@@ -131,110 +267,171 @@ export const StudyLogPage = () => {
       return;
     }
 
-    const uploaded = await uploadStudyFileToSupabase({
-      file,
-      userId: user?.id,
-      subject: {
-        id: subject.id,
-        name: subject.name,
-        semester: subject.semester,
-        academic_year: subject.academic_year,
-      },
-    });
+    try {
+      let response;
+      try {
+        const uploaded = await uploadStudyFileToSupabase({
+          file,
+          userId: user?.id,
+          subject: {
+            id: subject.id,
+            name: subject.name,
+            semester: subject.semester,
+            academic_year: subject.academic_year,
+          },
+        });
 
-    const response = await api.post<StudyFile>(`/study-logs/${logId}/files`, {
-      original_name: file.name,
-      storage_path: uploaded.storagePath,
-      file_type: uploaded.fileType,
-      mime_type: file.type || null,
-      file_size: file.size,
-    });
-    setLogs(prev =>
-      prev.map(log => (log.id === logId ? { ...log, files: [...log.files, response.data] } : log))
-    );
+        response = await api.post<StudyFile>(`/study-logs/${logId}/files`, {
+          original_name: file.name,
+          storage_path: uploaded.storagePath,
+          file_type: uploaded.fileType,
+          mime_type: file.type || null,
+          file_size: file.size,
+        });
+      } catch (storageError) {
+        console.warn('supabase upload failed, falling back to local storage', storageError);
+        const uploadForm = new FormData();
+        uploadForm.append('file', file, file.name);
+        response = await api.post<StudyFile>(`/study-logs/${logId}/files`, uploadForm);
+      }
+
+      const filePayload = (response.data as any)?.data ?? response.data;
+      setLogs(prev =>
+        prev.map(log => (log.id === logId ? { ...log, files: [...log.files, filePayload] } : log))
+      );
+      setSelectedLog(prev =>
+        prev?.id === logId ? { ...prev, files: [...prev.files, filePayload] } : prev
+      );
+      success('อัปโหลดไฟล์เรียบร้อยแล้ว');
+    } catch (err: any) {
+      error(err?.response?.data?.message || err?.message || 'อัปโหลดไฟล์ไม่สำเร็จ');
+    }
   };
 
-  const requestSummary = async (logId: number) => {
-    const response = await api.post<Summary>(`/study-logs/${logId}/summaries`);
-    setLogs(prev =>
-      prev.map(log => (log.id === logId ? { ...log, summaries: [response.data, ...log.summaries] } : log))
-    );
+  const openConfirmDialog = (config: { title: string; description: string; confirmLabel: string; onConfirm: () => Promise<void> | void }) => {
+    setConfirmState(config);
+    setConfirmBusy(false);
+  };
+
+  const handleConfirmDialogCancel = () => {
+    setConfirmState(null);
+    setConfirmBusy(false);
+  };
+
+  const handleConfirmDialogConfirm = async () => {
+    if (!confirmState) return;
+    setConfirmBusy(true);
+    try {
+      await confirmState.onConfirm();
+    } finally {
+      setConfirmBusy(false);
+      setConfirmState(null);
+    }
   };
 
   const deleteLog = async (logId: number) => {
     if (!subjectId) return;
-    const confirmed = window.confirm('ต้องการลบบันทึกการเรียนนี้ใช่หรือไม่?');
-    if (!confirmed) return;
-
-    setDeletingLogId(logId);
-    try {
-      await api.delete(`/subjects/${subjectId}/study-logs/${logId}`);
-      let nextLogs: StudyLog[] = [];
-      setLogs(prev => {
-        nextLogs = prev.filter(log => log.id !== logId);
-        return nextLogs;
-      });
-      setSelectedLog(prev => (prev?.id === logId ? nextLogs[0] ?? null : prev));
-      success('ลบบันทึกการเรียนเรียบร้อยแล้ว');
-    } catch {
-      error('ลบบันทึกการเรียนไม่สำเร็จ');
-    } finally {
-      setDeletingLogId(null);
-    }
+    openConfirmDialog({
+      title: 'ลบบันทึกการเรียน',
+      description: 'ต้องการลบบันทึกการเรียนนี้ใช่หรือไม่?',
+      confirmLabel: 'ลบ',
+      onConfirm: async () => {
+        setDeletingLogId(logId);
+        try {
+          await api.delete(`/subjects/${subjectId}/study-logs/${logId}`);
+          let nextLogs: StudyLog[] = [];
+          setLogs(prev => {
+            nextLogs = prev.filter(log => log.id !== logId);
+            return nextLogs;
+          });
+          setSelectedLog(prev => (prev?.id === logId ? nextLogs[0] ?? null : prev));
+          success('ลบบันทึกการเรียนเรียบร้อยแล้ว');
+        } catch {
+          error('ลบบันทึกการเรียนไม่สำเร็จ');
+        } finally {
+          setDeletingLogId(null);
+        }
+      },
+    });
   };
 
   const deleteFile = async (logId: number, file: StudyFile) => {
-    const confirmed = window.confirm(`ต้องการลบไฟล์ "${file.original_name}" ใช่หรือไม่?`);
-    if (!confirmed) return;
-
-    setDeletingFileId(file.id);
-    try {
-      await api.delete(`/files/${file.id}`);
-      setLogs(prev =>
-        prev.map(log =>
-          log.id === logId ? { ...log, files: log.files.filter(item => item.id !== file.id) } : log
-        )
-      );
-      success('ลบไฟล์เรียบร้อยแล้ว');
-    } catch {
-      error('ลบไฟล์ไม่สำเร็จ');
-    } finally {
-      setDeletingFileId(null);
-    }
+    openConfirmDialog({
+      title: 'ลบไฟล์',
+      description: `ต้องการลบไฟล์ "${file.original_name}" ใช่หรือไม่?`,
+      confirmLabel: 'ลบไฟล์',
+      onConfirm: async () => {
+        setDeletingFileId(file.id);
+        try {
+          await api.delete(`/files/${file.id}`);
+          setLogs(prev =>
+            prev.map(log =>
+              log.id === logId ? { ...log, files: log.files.filter(item => item.id !== file.id) } : log
+            )
+          );
+          success('ลบไฟล์เรียบร้อยแล้ว');
+        } catch {
+          error('ลบไฟล์ไม่สำเร็จ');
+        } finally {
+          setDeletingFileId(null);
+        }
+      },
+    });
   };
 
-  const deleteSummary = async (logId: number, source: 'text' | 'audio', summaryId: number) => {
-    const confirmed = window.confirm('ต้องการลบสรุปรายการนี้ใช่หรือไม่?');
-    if (!confirmed) return;
-
-    const stateId = `${source}-${summaryId}`;
-    setDeletingSummaryId(stateId);
+  const generateSummary = async (logId: number) => {
+    setGeneratingSummaryId(logId);
     try {
-      if (source === 'audio') {
-        await api.delete(`/ai/summaries/audio/${summaryId}`);
-      } else {
-        await api.delete(`/summaries/${summaryId}`);
-      }
-      setLogs(prev =>
-        prev.map(log => {
-          if (log.id !== logId) return log;
-          if (source === 'audio') {
-            return {
-              ...log,
-              audio_summaries: (log.audio_summaries ?? []).filter(item => item.id !== summaryId),
-            };
+      const targetLog = logs.find(log => log.id === logId) ?? selectedLog;
+      const documentFile = targetLog?.files?.find(isDocumentAttachment) ?? null;
+      let response;
+
+      if (documentFile) {
+        try {
+          const documentSummary = await summarizeStoredDocumentFile(documentFile);
+          const content = documentSummary.summary?.trim();
+          if (!content) {
+            throw new Error('Groq ไม่ได้ส่งผลสรุปกลับมา');
           }
-          return {
-            ...log,
-            summaries: log.summaries.filter(item => item.id !== summaryId),
-          };
-        })
+
+          response = await api.post<Summary>(`/study-logs/${logId}/summaries`, {
+            content,
+            ai_model: documentSummary.model ?? null,
+            metadata: {
+              source: 'document',
+              file_id: documentFile.id,
+              file_name: documentFile.original_name,
+              text_length: documentSummary.text?.length ?? null,
+            },
+          });
+        } catch (fileError) {
+          if (isSupabaseStudyFilePath(documentFile.file_path)) {
+            throw fileError;
+          }
+          console.warn('browser document summary failed; trying backend file summary', fileError);
+          response = await api.post<Summary>(`/study-logs/${logId}/summaries`, {
+            file_id: documentFile.id,
+          });
+        }
+      } else {
+        response = await api.post<Summary>(`/study-logs/${logId}/summaries`);
+      }
+
+      const payload = (response.data as any)?.data ?? response.data;
+      setLogs(prev =>
+        prev.map(log =>
+          log.id === logId ? { ...log, summaries: [payload, ...(log.summaries ?? [])] } : log
+        )
       );
-      success('ลบสรุปเรียบร้อยแล้ว');
-    } catch {
-      error('ลบสรุปไม่สำเร็จ');
+      setSelectedLog(prev =>
+        prev?.id === logId ? { ...prev, summaries: [payload, ...(prev.summaries ?? [])] } : prev
+      );
+      success(documentFile ? 'สร้างสรุปจากไฟล์ด้วย Groq เรียบร้อยแล้ว' : 'สร้างสรุปด้วย Groq เรียบร้อยแล้ว');
+    } catch (err: any) {
+      const message = err?.response?.data?.message || err?.message || 'สร้างสรุปไม่สำเร็จ กรุณาตรวจสอบ Groq API key แล้วลองใหม่';
+      error(message);
     } finally {
-      setDeletingSummaryId(null);
+      setGeneratingSummaryId(null);
     }
   };
 
@@ -242,32 +439,6 @@ export const StudyLogPage = () => {
     () => logs.find(log => log.id === selectedLog?.id) ?? selectedLog,
     [logs, selectedLog]
   );
-
-  const combinedSummaries = useMemo(() => {
-    if (!currentLog) return [];
-    const textSummaries = (currentLog.summaries ?? []).map(item => ({
-      id: `summary-${item.id}`,
-      recordId: item.id,
-      source: 'text' as const,
-      content: item.content,
-      created_at: item.created_at,
-      transcript: null,
-    }));
-    const audioSummaries = (currentLog.audio_summaries ?? []).map(item => ({
-      id: `audio-${item.id}`,
-      recordId: item.id,
-      source: 'audio' as const,
-      content: item.summary,
-      created_at: item.created_at,
-      transcript: item.transcript ?? null,
-    }));
-    const items = [...audioSummaries, ...textSummaries].filter(item => item.content?.trim());
-    return items.sort((a, b) => {
-      const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
-      const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
-      return bTime - aTime;
-    });
-  }, [currentLog]);
 
   if (loading) {
     return <p className="text-muted">กำลังโหลดข้อมูล...</p>;
@@ -278,129 +449,194 @@ export const StudyLogPage = () => {
   }
 
   return (
-    <div className="space-y-6 text-[color:var(--text)]">
-      <section className="rounded-3xl bg-gradient-to-r from-primary to-primaryDark p-6 text-white shadow-glow">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <p className="text-xs uppercase tracking-[0.35em] text-white/70">Subject Timeline</p>
-            <h2 className="mt-2 text-3xl font-semibold">{subject.name}</h2>
-            <p className="mt-2 text-sm text-white/85">{subject.description ?? 'เพิ่มรายละเอียดรายวิชาภายหลังได้'}</p>
+    <div className="mx-auto w-full max-w-[1160px] rounded-[2rem] border border-pink-100 bg-white/95 p-5 text-[color:var(--text)] shadow-[0_18px_55px_rgba(236,72,153,0.10)]">
+      <section className="relative overflow-hidden rounded-[1.35rem] bg-gradient-to-r from-pink-500 via-pink-400 to-pink-500 px-6 py-5 text-white shadow-[0_20px_45px_rgba(236,72,153,0.24)]">
+        <div className="absolute right-6 top-4 hidden text-white/20 sm:block">
+          <BookOpen size={86} strokeWidth={1.2} />
+        </div>
+        <div className="relative flex items-center gap-4">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-white/20 ring-1 ring-white/35 backdrop-blur">
+            <BookOpen size={24} />
           </div>
-        
+          <div className="min-w-0">
+            <p className="text-[10px] font-bold uppercase tracking-[0.36em] text-white/75">Subject Timeline</p>
+            <h2 className="mt-1 truncate text-2xl font-black leading-tight md:text-3xl">{subject.name}</h2>
+            <p className="mt-1 text-xs font-semibold text-white/90">{subject.description ?? 'ติดตามและบันทึกความก้าวหน้าของคุณได้ที่นี่'}</p>
+          </div>
         </div>
       </section>
 
-      <div className="grid gap-6 lg:grid-cols-[320px,1fr]">
-        <aside className="rounded-3xl border border-muted surface p-5 shadow-soft">
-          <h3 className="text-lg font-semibold text-[color:var(--text)]">บันทึกการเรียน</h3>
-          <p className="mt-1 text-sm text-muted">เพิ่มหัวข้อ รายละเอียด และเวลาเรียนในแต่ละวัน</p>
+      <div className="mt-5 grid gap-5 lg:grid-cols-[330px,1fr]">
+        <aside className="rounded-[1.5rem] border border-pink-100 bg-white p-5 shadow-[0_16px_34px_rgba(15,23,42,0.06)]">
+          <h3 className="text-base font-black text-slate-900">บันทึกการเรียน</h3>
           <form onSubmit={handleSubmit(onSubmit)} className="mt-4 space-y-3">
-            <div>
-              <label className="mb-1 block text-xs uppercase tracking-widest text-muted">หัวข้อ</label>
-              <input
-                className="w-full rounded-2xl border border-muted surface-2 px-3 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/30"
-                {...register('title', { required: true })}
-              />
-            </div>
-          <div>
-            <label className="mb-1 block text-xs uppercase tracking-widest text-muted">Reflection / สิ่งที่เรียนรู้</label>
-            <p className="mb-2 text-xs text-muted">เขียนสิ่งที่เข้าใจ สิ่งที่ยังสงสัย และแผนปรับปรุงในครั้งถัดไป</p>
+            <input
+              placeholder="หัวข้อที่เรียน"
+              className="h-11 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 text-sm text-slate-800 outline-none transition focus:border-pink-300 focus:bg-white focus:ring-4 focus:ring-pink-100"
+              {...register('title', { required: true })}
+            />
             <textarea
-              placeholder="สรุปบทเรียนสั้น ๆ หรือสะท้อนสิ่งที่ต้องพัฒนา"
-              className="h-28 w-full rounded-2xl border border-muted surface-2 px-3 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/30"
+              placeholder="สรุปบทเรียน / สิ่งที่เข้าใจ"
+              className="h-24 w-full resize-none rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-800 outline-none transition focus:border-pink-300 focus:bg-white focus:ring-4 focus:ring-pink-100"
               {...register('note')}
             />
-          </div>
-          <div className="grid grid-cols-2 gap-2 text-sm">
-            <div>
-              <label className="mb-1 block text-xs uppercase tracking-widest text-muted">วันที่เรียน</label>
-              <input
-                type="date"
-                className="w-full rounded-2xl border border-muted surface-2 px-3 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/30"
-                {...register('log_date', { required: true })}
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs uppercase tracking-widest text-muted">ระยะเวลา (นาที)</label>
-              <input
-                type="number"
-                className="w-full rounded-2xl border border-muted surface-2 px-3 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/30"
-                {...register('duration_minutes')}
-              />
-            </div>
-          </div>
-          <div>
-            <label className="mb-1 block text-xs uppercase tracking-widest text-muted">อารมณ์</label>
             <input
-              className="w-full rounded-2xl border border-muted surface-2 px-3 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/30"
-              {...register('mood')}
+              placeholder="สิ่งที่ต้องการเรียนรู้เพิ่มเติม (ถ้ามี)"
+              className="h-11 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 text-sm text-slate-800 outline-none transition focus:border-pink-300 focus:bg-white focus:ring-4 focus:ring-pink-100"
             />
-          </div>
-          <button type="submit" className="btn-primary w-full" disabled={isSubmitting}>
-            {isSubmitting ? 'กำลังบันทึก...' : 'บันทึกการเรียน'}
-          </button>
-        </form>
+            <div className="grid grid-cols-2 gap-3 text-sm">
+              <div>
+                <label className="mb-1.5 block text-xs font-bold text-slate-600">วันที่เรียน</label>
+                <div className="relative">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    placeholder="dd/mm/yyyy"
+                    value={logDateDisplay}
+                    onChange={event => {
+                      const nextDisplay = event.target.value;
+                      setLogDateDisplay(nextDisplay);
+                      const normalized = normalizeDateInputValue(nextDisplay);
+                      if (normalized) {
+                        setValue('log_date', normalized, { shouldDirty: true, shouldValidate: true });
+                      }
+                    }}
+                    className="h-11 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 pr-10 text-sm text-slate-800 outline-none transition focus:border-pink-300 focus:bg-white focus:ring-4 focus:ring-pink-100"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const picker = datePickerRef.current;
+                      if (!picker) return;
+                      if (typeof (picker as any).showPicker === 'function') (picker as any).showPicker();
+                      else picker.click();
+                    }}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-pink-500"
+                    aria-label="เลือกวันที่เรียน"
+                    title="เลือกวันที่เรียน"
+                  >
+                    <Calendar size={16} />
+                  </button>
+                  <input
+                    type="date"
+                    className="absolute inset-0 pointer-events-none opacity-0"
+                    tabIndex={-1}
+                    aria-hidden="true"
+                    {...logDateField}
+                    ref={element => {
+                      logDateField.ref(element);
+                      datePickerRef.current = element;
+                    }}
+                    onChange={event => {
+                      const normalized = normalizeDateInputValue(event.target.value);
+                      if (!normalized) return;
+                      setValue('log_date', normalized, { shouldDirty: true, shouldValidate: true });
+                      setLogDateDisplay(formatDateDisplayValue(normalized));
+                    }}
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="mb-1.5 block text-xs font-bold text-slate-600">เวลา (นาที)</label>
+                <input
+                  type="number"
+                  className="h-11 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 text-sm text-slate-800 outline-none transition focus:border-pink-300 focus:bg-white focus:ring-4 focus:ring-pink-100"
+                  {...register('duration_minutes')}
+                />
+              </div>
+            </div>
+            <div>
+              <label className="mb-2 block text-xs font-bold text-slate-600">อารมณ์</label>
+              <select
+                className="h-11 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-pink-300 focus:bg-white focus:ring-4 focus:ring-pink-100"
+                {...register('mood')}
+              >
+                <option value="">เลือกอารมณ์</option>
+                {moodOptions.map(mood => (
+                  <option key={mood} value={mood}>{mood}</option>
+                ))}
+              </select>
+            </div>
+            <button
+              type="submit"
+              className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-pink-500 px-4 text-sm font-black text-white shadow-[0_16px_30px_rgba(236,72,153,0.28)] transition hover:bg-pink-600 disabled:opacity-60"
+              disabled={isSubmitting}
+            >
+              <Send size={16} />
+              {isSubmitting ? 'กำลังบันทึก...' : 'บันทึกการเรียน'}
+            </button>
+          </form>
         </aside>
 
         <section className="space-y-4">
-          <div className="rounded-3xl border border-muted surface p-5 shadow-soft">
-            <div className="mb-4 flex items-center justify-between">
-              <h3 className="text-lg font-semibold text-[color:var(--text)]">บันทึกล่าสุด</h3>
-              <span className="text-xs font-semibold uppercase tracking-[0.35em] text-primary/70">Timeline</span>
-            </div>
-            <div className="max-h-72 space-y-3 overflow-y-auto pr-2">
-              {logs.map(log => (
-                <article
-                  key={log.id}
-                  className={`w-full rounded-2xl border px-4 py-3 text-left transition ${
-                    currentLog?.id === log.id
-                      ? 'border-primary/60 surface-2 shadow-glow'
-                      : 'border-muted surface'
-                  }`}
+          <div className="rounded-[1.5rem] border border-pink-100 bg-white p-5 shadow-[0_16px_34px_rgba(15,23,42,0.06)]">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-base font-black text-slate-900">บันทึกล่าสุด</h3>
+              {logs.length > 3 ? (
+                <button
+                  type="button"
+                  onClick={() => setShowAllLogs(prev => !prev)}
+                  className="rounded-full px-2 py-1 text-[11px] font-black text-pink-500 transition hover:bg-pink-50"
                 >
-                  <button type="button" onClick={() => setSelectedLog(log)} className="w-full text-left">
-                    <p className="text-xs font-medium uppercase tracking-widest text-muted">
-                      {format(new Date(log.log_date), 'd MMM yyyy')}
-                    </p>
-                    <p className="mt-1 font-semibold text-[color:var(--text)]">{log.title}</p>
-                    {log.duration_minutes && (
-                      <p className="text-xs text-muted">{log.duration_minutes} นาที | {log.mood ?? 'ไม่ระบุอารมณ์'}</p>
-                    )}
-                  </button>
-                  <div className="mt-3 flex justify-end">
-                    <button
-                      type="button"
-                      onClick={() => void deleteLog(log.id)}
-                      disabled={deletingLogId === log.id}
-                      className="rounded-full border border-rose-400/30 bg-rose-400/10 px-3 py-1 text-xs font-semibold text-rose-300 transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {deletingLogId === log.id ? 'กำลังลบ...' : 'ลบ'}
+                  {showAllLogs ? 'ย่อรายการ' : 'ดูทั้งหมด'} &gt;
+                </button>
+              ) : null}
+            </div>
+            <div className={`${showAllLogs ? 'max-h-[560px]' : 'max-h-[255px]'} space-y-0 overflow-y-auto pr-2 transition-[max-height] duration-300`}>
+              {logs.map((log, index) => (
+                <article key={log.id} className="relative flex gap-4 pb-4">
+                  <div className="flex w-4 shrink-0 flex-col items-center">
+                    <span className={`mt-2 h-2.5 w-2.5 rounded-full ${currentLog?.id === log.id ? 'bg-pink-500' : 'bg-pink-300'}`} />
+                    {index < logs.length - 1 ? <span className="mt-1 h-full w-px bg-pink-200" /> : null}
+                  </div>
+                  <div
+                    className={`flex-1 rounded-xl px-3 py-2 transition ${
+                      currentLog?.id === log.id ? 'bg-pink-50 ring-1 ring-pink-100' : 'hover:bg-slate-50'
+                    }`}
+                  >
+                    <button type="button" onClick={() => setSelectedLog(log)} className="w-full text-left">
+                      <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
+                        {format(new Date(log.log_date), 'd MMM yyyy')}
+                      </p>
+                      <p className="mt-0.5 line-clamp-1 text-sm font-bold text-slate-900">{log.title}</p>
+                      {log.duration_minutes ? (
+                        <p className="mt-0.5 text-[11px] text-slate-500">{log.duration_minutes} นาที {log.mood ? `• ${log.mood}` : ''}</p>
+                      ) : null}
                     </button>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => void deleteLog(log.id)}
+                    disabled={deletingLogId === log.id}
+                    className="mt-5 h-7 shrink-0 rounded-full border border-pink-200 bg-pink-50 px-3 text-[11px] font-bold text-pink-500 transition hover:bg-pink-100 disabled:opacity-60"
+                  >
+                    {deletingLogId === log.id ? '...' : 'ลบ'}
+                  </button>
                 </article>
               ))}
             </div>
-            {logs.length === 0 && (
-              <p className="rounded-2xl border border-dashed border-primary/30 surface-2 p-4 text-center text-sm text-muted">
+            {logs.length === 0 ? (
+              <p className="rounded-xl border border-dashed border-pink-200 bg-pink-50/60 p-4 text-center text-sm text-slate-500">
                 ยังไม่มีบันทึก เริ่มต้นด้วยการเพิ่มหัวข้อใหม่ทางด้านซ้าย
               </p>
-            )}
+            ) : null}
           </div>
 
           {currentLog && (
-            <article className="rounded-3xl border border-muted surface p-6 shadow-soft">
+            <article className="rounded-[1.5rem] border border-pink-100 bg-white p-5 shadow-[0_16px_34px_rgba(15,23,42,0.06)]">
               <header>
-                <h3 className="text-xl font-semibold text-[color:var(--text)]">{currentLog.title}</h3>
-                <p className="text-sm text-muted">{format(new Date(currentLog.log_date), 'EEEE d MMM yyyy')}</p>
+                <h3 className="text-lg font-black text-slate-900">{currentLog.title}</h3>
+                <p className="text-xs font-semibold text-slate-500">{format(new Date(currentLog.log_date), 'EEEE d MMM yyyy')}</p>
               </header>
-              <p className="mt-3 whitespace-pre-line rounded-2xl surface-2 p-4 text-muted">
+              <p className="mt-3 whitespace-pre-line rounded-xl bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-600">
                 {currentLog.note || 'ไม่มีโน้ต'}
               </p>
 
-              <div className="mt-4">
-                <h4 className="mb-2 text-sm font-semibold uppercase tracking-widest text-primary/70">ไฟล์แนบ</h4>
-                <div className="space-y-2">
-                  <label className="flex cursor-pointer items-center justify-between rounded-2xl border border-dashed border-primary/30 surface-2 px-3 py-3 text-sm text-muted transition hover:border-primary">
+              <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(280px,0.9fr),minmax(0,1.1fr)]">
+                <div className="rounded-xl border border-pink-100 bg-white p-4">
+                  <h4 className="mb-2 text-sm font-black text-pink-500">ไฟล์แนบ</h4>
+                  <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-pink-200 bg-pink-50/60 px-4 py-3 text-sm font-semibold text-slate-500 transition hover:border-pink-300 hover:bg-pink-50">
+                    <FileText size={15} />
                     <span>อัปโหลดไฟล์ (.pdf, .docx, .mp3, รูปภาพ)</span>
                     <input
                       type="file"
@@ -415,16 +651,16 @@ export const StudyLogPage = () => {
                     />
                   </label>
                   {currentLog.files.length > 0 ? (
-                    <ul className="space-y-2 text-sm text-muted">
+                    <ul className="mt-2 space-y-2 text-sm text-slate-600">
                       {currentLog.files.map(file => (
-                        <li key={file.id} className="flex items-center justify-between rounded-2xl border border-muted surface-2 px-3 py-2">
-                          <span>{file.original_name}</span>
-                          <div className="flex items-center gap-2">
+                        <li key={file.id} className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+                          <span className="min-w-0 truncate">{file.original_name}</span>
+                          <div className="flex shrink-0 items-center gap-2">
                             <a
                               href={file.file_url || resolveStudyFileUrl(file.file_path, storageBase)}
                               target="_blank"
                               rel="noreferrer"
-                              className="text-primary"
+                              className="text-xs font-bold text-pink-500"
                             >
                               เปิดไฟล์
                             </a>
@@ -432,72 +668,67 @@ export const StudyLogPage = () => {
                               type="button"
                               onClick={() => void deleteFile(currentLog.id, file)}
                               disabled={deletingFileId === file.id}
-                              className="rounded-full border border-rose-400/30 bg-rose-400/10 px-3 py-1 text-xs font-semibold text-rose-300 transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+                              className="rounded-full border border-pink-200 bg-pink-50 px-3 py-1 text-[11px] font-bold text-pink-500 transition hover:bg-pink-100 disabled:opacity-60"
                             >
-                              {deletingFileId === file.id ? 'กำลังลบ...' : 'ลบ'}
+                              {deletingFileId === file.id ? '...' : 'ลบ'}
                             </button>
                           </div>
                         </li>
                       ))}
                     </ul>
                   ) : (
-                    <p className="text-xs text-muted">ยังไม่มีไฟล์แนบ</p>
+                    <p className="mt-2 text-xs text-slate-500">ยังไม่มีไฟล์แนบ</p>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-pink-100 bg-pink-50/50 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h4 className="text-sm font-black text-pink-500">สรุปจากไฟล์แนบ</h4>
+                  
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void generateSummary(currentLog.id)}
+                      disabled={generatingSummaryId === currentLog.id}
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-pink-500 px-4 text-xs font-black text-white shadow-[0_12px_24px_rgba(236,72,153,0.22)] transition hover:bg-pink-600 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {generatingSummaryId === currentLog.id ? <LoaderCircle size={15} className="animate-spin" /> : <Sparkles size={15} />}
+                      {generatingSummaryId === currentLog.id ? 'กำลังสรุป...' : 'สรุปด้วย Groq'}
+                    </button>
+                  </div>
+                  {currentLog.summaries?.length > 0 ? (
+                    <div className="mt-3 space-y-2">
+                      {currentLog.summaries.map(summary => (
+                        <div key={summary.id} className="rounded-xl border border-pink-100 bg-white px-4 py-3 text-sm leading-6 text-slate-700">
+                          <p className="whitespace-pre-line">{summary.content}</p>
+                          <p className="mt-2 text-[11px] font-semibold text-slate-400">
+                            {summary.ai_model ? `Model: ${summary.ai_model}` : 'AI summary'}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="mt-3 rounded-xl border border-dashed border-pink-100 bg-white/70 px-4 py-3 text-xs text-slate-500">
+                      ยังไม่มีสรุปสำหรับบันทึกนี้
+                    </p>
                   )}
                 </div>
               </div>
 
-              <div className="mt-4">
-                <div className="mb-2 flex items-center justify-between">
-                  <h4 className="text-sm font-semibold uppercase tracking-widest text-primary/70">สรุปจาก AI</h4>
-                  <button
-                    className="rounded-full border border-primary/40 px-4 py-2 text-xs font-semibold text-primary transition hover:shadow-glow"
-                    onClick={() => requestSummary(currentLog.id)}
-                  >
-                    สร้างสรุป
-                  </button>
-                </div>
-                {combinedSummaries.length > 0 ? (
-                  <div className="space-y-3">
-                    {combinedSummaries.map(summary => (
-                      <div key={summary.id} className="rounded-2xl border border-muted surface-2 px-4 py-3 text-sm leading-6 text-muted shadow-sm">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <p className="text-xs font-medium uppercase tracking-widest text-muted">
-                            {summary.source === 'audio' ? 'สรุปจากเสียง' : 'สรุปจาก AI'}
-                          </p>
-                          <div className="flex items-center gap-2">
-                            {summary.created_at ? (
-                              <span className="text-xs text-muted">
-                                {format(new Date(summary.created_at), 'd MMM yyyy HH:mm')}
-                              </span>
-                            ) : null}
-                            <button
-                              type="button"
-                              onClick={() => void deleteSummary(currentLog.id, summary.source, summary.recordId)}
-                              disabled={deletingSummaryId === summary.id}
-                              className="rounded-full border border-rose-400/30 bg-rose-400/10 px-3 py-1 text-xs font-semibold text-rose-300 transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-                            >
-                              {deletingSummaryId === summary.id ? 'กำลังลบ...' : 'ลบ'}
-                            </button>
-                          </div>
-                        </div>
-                        <p className="mt-2 whitespace-pre-line">{summary.content}</p>
-                        {summary.source === 'audio' && summary.transcript ? (
-                          <details className="mt-2 text-xs text-muted">
-                            <summary className="cursor-pointer">ดูคำถอดเสียง</summary>
-                            <p className="mt-2 whitespace-pre-line">{summary.transcript}</p>
-                          </details>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="text-xs text-muted">ยังไม่มีสรุปจาก AI</p>
-                )}
-              </div>
             </article>
           )}
         </section>
       </div>
+      <ConfirmDialog
+        isOpen={Boolean(confirmState)}
+        title={confirmState?.title ?? ''}
+        description={confirmState?.description ?? ''}
+        confirmLabel={confirmState?.confirmLabel ?? 'ยืนยัน'}
+        onConfirm={handleConfirmDialogConfirm}
+        onCancel={handleConfirmDialogCancel}
+        busy={confirmBusy}
+      />
     </div>
   );
 };

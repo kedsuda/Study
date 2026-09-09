@@ -9,6 +9,7 @@ if (function_exists('session_status') && session_status() !== PHP_SESSION_ACTIVE
     }
 }
 session_start();
+date_default_timezone_set('Asia/Bangkok');
 header('Content-Type: application/json; charset=utf-8');
 
 if (!isset($_SESSION['user_id']) || !isset($_SESSION['role']) || $_SESSION['role'] !== 'admin') {
@@ -89,6 +90,30 @@ function admin_bind_params($stmt, $types, $params)
     call_user_func_array('mysqli_stmt_bind_param', $refs);
 }
 
+function admin_db_query($conn, $sql)
+{
+    try {
+        return mysqli_query($conn, $sql);
+    } catch (Throwable $error) {
+        return false;
+    }
+}
+
+function admin_table_exists($conn, $table)
+{
+    if (!$conn || $table === '') {
+        return false;
+    }
+    $escaped = mysqli_real_escape_string($conn, $table);
+    $result = admin_db_query($conn, "SHOW TABLES LIKE '{$escaped}'");
+    if (!$result) {
+        return false;
+    }
+    $exists = mysqli_num_rows($result) > 0;
+    mysqli_free_result($result);
+    return $exists;
+}
+
 function admin_column_exists($conn, $table, $column)
 {
     if (!$conn || $table === '' || $column === '') {
@@ -130,6 +155,99 @@ function admin_get_table_columns($conn, $table)
     return $columns;
 }
 
+function admin_scalar($conn, $sql)
+{
+    $result = admin_db_query($conn, $sql);
+    if (!$result) {
+        return null;
+    }
+    $row = mysqli_fetch_row($result);
+    mysqli_free_result($result);
+    return $row !== null && isset($row[0]) ? $row[0] : null;
+}
+
+function admin_latest_activity_timestamp($conn)
+{
+    $sources = [
+        ['users', ['created_at', 'updated_at']],
+        ['subjects', ['created_at', 'updated_at']],
+        ['schedules', ['created_at', 'updated_at']],
+        ['study_logs', ['created_at', 'updated_at', 'log_date']],
+        ['quizzes', ['created_at', 'updated_at']],
+        ['quiz_attempts', ['created_at', 'updated_at']],
+        ['learning_goal_targets', ['created_at', 'updated_at']],
+        ['summaries', ['created_at', 'updated_at']],
+        ['files', ['created_at', 'updated_at']],
+        ['study_calendar_events', ['created_at', 'updated_at']],
+    ];
+    $timestamps = [];
+
+    foreach ($sources as [$table, $columns]) {
+        if (!admin_table_exists($conn, $table)) {
+            continue;
+        }
+        $available = array_values(array_filter($columns, function ($column) use ($conn, $table) {
+            return admin_column_exists($conn, $table, $column);
+        }));
+        if (count($available) === 0) {
+            continue;
+        }
+        foreach ($available as $column) {
+            $value = admin_scalar($conn, "SELECT MAX(NULLIF(`{$column}`, '')) FROM `{$table}`");
+            if ($value !== null && trim((string) $value) !== '') {
+                $timestamps[] = (string) $value;
+            }
+        }
+    }
+
+    $latest = 0;
+    foreach ($timestamps as $value) {
+        $timestamp = strtotime($value);
+        if ($timestamp !== false && $timestamp > $latest) {
+            $latest = $timestamp;
+        }
+    }
+    return $latest;
+}
+
+function admin_summary($conn)
+{
+    if (!$conn) {
+        return [
+            'active_study_users' => 0,
+            'quizzes' => 0,
+            'latest_activity' => null,
+        ];
+    }
+
+    $activeStudyUsers = 0;
+    if (admin_table_exists($conn, 'study_logs') && admin_column_exists($conn, 'study_logs', 'user_id')) {
+        $studyLogWhere = '`user_id` IS NOT NULL';
+        if (admin_column_exists($conn, 'study_logs', 'note')) {
+            $studyLogWhere .= " AND COALESCE(`note`, '') <> 'อัปโหลดไฟล์เพื่อสร้างแบบฝึกหัด'";
+        }
+        $activeStudyUsers = (int) (admin_scalar($conn, "SELECT COUNT(DISTINCT `user_id`) FROM `study_logs` WHERE {$studyLogWhere}") ?? 0);
+    } elseif (
+        admin_table_exists($conn, 'study_logs')
+        && admin_column_exists($conn, 'study_logs', 'subject_id')
+        && admin_table_exists($conn, 'subjects')
+        && admin_column_exists($conn, 'subjects', 'user_id')
+    ) {
+        $activeStudyUsers = (int) (admin_scalar($conn, 'SELECT COUNT(DISTINCT subjects.user_id) FROM study_logs INNER JOIN subjects ON subjects.id = study_logs.subject_id') ?? 0);
+    }
+
+    $quizCount = admin_table_exists($conn, 'quizzes')
+        ? (int) (admin_scalar($conn, 'SELECT COUNT(*) FROM `quizzes`') ?? 0)
+        : 0;
+    $latestTimestamp = admin_latest_activity_timestamp($conn);
+
+    return [
+        'active_study_users' => $activeStudyUsers,
+        'quizzes' => $quizCount,
+        'latest_activity' => $latestTimestamp > 0 ? date('d/m/Y H:i', $latestTimestamp) : null,
+    ];
+}
+
 function admin_ensure_settings_table($conn)
 {
     if (!$conn) {
@@ -148,9 +266,11 @@ function admin_settings_defaults()
 {
     return [
         'system_name' => 'Smart Learning Tracker',
-        'admin_welcome_message' => 'ยินดีต้อนรับผู้ดูแลระบบ',
+        'admin_welcome_message' => 'ยินดีต้อนรับผู้ดูแลระบบนะคะ',
         'contact_email' => '',
         'maintenance_mode' => '0',
+        'maintenance_start_at' => '',
+        'maintenance_end_at' => '',
     ];
 }
 
@@ -210,6 +330,17 @@ $schema = [
 
 $action = isset($_POST['action']) ? (string) $_POST['action'] : '';
 $table = isset($_POST['table']) ? (string) $_POST['table'] : '';
+
+if ($action === 'summary_get') {
+    $conn = admin_db_connect();
+    if (!$conn) {
+        http_response_code(500);
+        echo json_encode(['ok' => false, 'error' => 'เชื่อมต่อฐานข้อมูลไม่สำเร็จ']);
+        exit();
+    }
+    echo json_encode(['ok' => true, 'summary' => admin_summary($conn)], JSON_UNESCAPED_UNICODE);
+    exit();
+}
 
 if ($action === 'settings_get' || $action === 'settings_save') {
     $conn = admin_db_connect();
@@ -304,7 +435,7 @@ if ($action === '' || $table === '' || !isset($schema[$table])) {
 
 if (in_array($action, ['create', 'update', 'delete'], true)) {
     http_response_code(403);
-    echo json_encode(['ok' => false, 'error' => 'โหมดผู้ดูแลระบบเป็นแบบดูอย่างเดียว']);
+    echo json_encode(['ok' => false, 'error' => 'โหมดผู้ดูแลระบบเป็นแบบดู']);
     exit();
 }
 

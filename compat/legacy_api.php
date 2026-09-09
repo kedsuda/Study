@@ -516,6 +516,9 @@ function subject_with_counts($subject, $userId = null)
     if ($userId !== null && table_has_column('study_logs', 'user_id')) {
         $conditions[] = 'user_id = ' . (int) $userId;
     }
+    if (table_has_column('study_logs', 'note')) {
+        $conditions[] = "COALESCE(note, '') <> 'อัปโหลดไฟล์เพื่อสร้างแบบฝึกหัด'";
+    }
     $countRow = db_fetch_one('SELECT COUNT(*) AS total FROM study_logs WHERE ' . implode(' AND ', $conditions));
     $subject['study_log_count'] = $countRow ? (int) $countRow['total'] : 0;
     if (isset($subject['tags']) && $subject['tags']) {
@@ -532,6 +535,9 @@ function load_study_logs($subjectId, $withDetails, $userId = null)
     $conditions = array('subject_id = ' . (int) $subjectId);
     if ($userId !== null && table_has_column('study_logs', 'user_id')) {
         $conditions[] = 'user_id = ' . (int) $userId;
+    }
+    if (table_has_column('study_logs', 'note')) {
+        $conditions[] = "COALESCE(note, '') <> 'อัปโหลดไฟล์เพื่อสร้างแบบฝึกหัด'";
     }
     $logs = db_fetch_all('SELECT * FROM study_logs WHERE ' . implode(' AND ', $conditions) . ' ORDER BY id DESC');
     if (!$withDetails) {
@@ -2575,6 +2581,8 @@ function handle_subject_quizzes_from_file($subjectId)
     $upload = quiz_save_uploaded_file($file, 'uploads');
     $logTitle = isset($file['name']) ? trim(pathinfo($file['name'], PATHINFO_FILENAME)) : '';
     $logTitle = $logTitle !== '' ? 'แบบฝึกหัดจากไฟล์: ' . $logTitle : 'แบบฝึกหัดจากไฟล์เอกสาร';
+    // Retain the relation for legacy databases where files.study_log_id is NOT NULL.
+    // The marked legacy row is excluded from the study-summary menu in admin.php.
     $studyLogId = quiz_create_study_log($subjectId, $logTitle, $user['id']);
     $fileId = quiz_create_file_record($studyLogId, $file, $upload['relative_path'], $upload['extension']);
 
@@ -3085,6 +3093,71 @@ function handle_calendar_events_store()
             'created_at' => $row && isset($row['created_at']) ? $row['created_at'] : null,
             'updated_at' => $row && isset($row['updated_at']) ? $row['updated_at'] : null,
         ), 201);
+    }
+
+    json_response(array('message' => 'Calendar table is missing'), 422);
+}
+
+function handle_calendar_events_update($eventId)
+{
+    $user = require_auth_user();
+    $eventId = (int) $eventId;
+    if ($eventId <= 0) {
+        json_response(array('message' => 'Event not found'), 404);
+    }
+
+    $body = read_json_body();
+    if (table_has_column('study_calendar_events', 'id')) {
+        $row = db_fetch_one('SELECT * FROM study_calendar_events WHERE id = ' . $eventId . ' AND user_id = ' . (int) $user['id']);
+        if (!$row) {
+            json_response(array('message' => 'Event not found'), 404);
+        }
+        if (isset($row['study_log_id']) && $row['study_log_id']) {
+            json_response(array('message' => 'ไม่สามารถแก้ไขตารางที่มาจากบันทึกการเรียนได้'), 422);
+        }
+
+        $startTime = array_key_exists('start_time', $body)
+            ? normalize_datetime_for_db($body['start_time'])
+            : normalize_datetime_for_db(isset($row['start_time']) ? $row['start_time'] : null);
+        $endTime = array_key_exists('end_time', $body)
+            ? ($body['end_time'] ? normalize_datetime_for_db($body['end_time']) : null)
+            : (isset($row['end_time']) && $row['end_time'] ? normalize_datetime_for_db($row['end_time']) : null);
+        if (!$startTime) {
+            json_response(array('message' => 'กรุณาระบุเวลาเริ่ม'), 422);
+        }
+        if ($endTime && strtotime($endTime) <= strtotime($startTime)) {
+            json_response(array('message' => 'เวลาเลิกต้องมากกว่าเวลาเริ่ม'), 422);
+        }
+
+        $subjectId = array_key_exists('subject_id', $body) ? (int) $body['subject_id'] : (int) (isset($row['subject_id']) ? $row['subject_id'] : 0);
+        if ($subjectId) {
+            fetch_subject_for_user($subjectId, $user);
+        }
+
+        $columns = table_columns('study_calendar_events');
+        $metadata = parse_event_metadata(isset($row['metadata']) ? $row['metadata'] : null);
+        $eventType = isset($body['event_type']) ? $body['event_type'] : (isset($body['type']) ? $body['type'] : (isset($metadata['type']) ? $metadata['type'] : 'class'));
+        $metadata['type'] = $eventType;
+        $metadata['all_day'] = array_key_exists('all_day', $body) ? normalize_bool($body['all_day']) : normalize_bool(isset($metadata['all_day']) ? $metadata['all_day'] : false);
+        $metadata['source'] = 'manual';
+
+        $data = array();
+        if (in_array('subject_id', $columns, true)) $data['subject_id'] = $subjectId ?: null;
+        if (in_array('title', $columns, true) && array_key_exists('title', $body)) $data['title'] = trim((string) $body['title']);
+        if (in_array('description', $columns, true) && array_key_exists('description', $body)) $data['description'] = $body['description'];
+        if (in_array('start_time', $columns, true)) $data['start_time'] = $startTime;
+        if (in_array('end_time', $columns, true)) $data['end_time'] = $endTime;
+        if (in_array('status', $columns, true) && array_key_exists('status', $body)) $data['status'] = $body['status'];
+        if (in_array('event_type', $columns, true)) $data['event_type'] = $eventType;
+        if (in_array('room', $columns, true) && array_key_exists('room', $body)) $data['room'] = $body['room'];
+        if (in_array('metadata', $columns, true)) $data['metadata'] = json_encode($metadata);
+        if (in_array('updated_at', $columns, true)) $data['updated_at'] = date('Y-m-d H:i:s');
+
+        if (!db_update('study_calendar_events', $data, 'id = ' . $eventId)) {
+            json_response(array('message' => 'บันทึกตารางไม่สำเร็จ'), 500);
+        }
+        $updated = db_fetch_one('SELECT * FROM study_calendar_events WHERE id = ' . $eventId);
+        json_response(build_calendar_event_payload($updated, load_subject_map((int) $user['id']), 'manual'));
     }
 
     json_response(array('message' => 'Calendar table is missing'), 422);
@@ -4501,6 +4574,10 @@ if ($path === '/api/calendar-events' && $method === 'GET') {
 
 if ($path === '/api/calendar-events' && $method === 'POST') {
     handle_calendar_events_store();
+}
+
+if (preg_match('#^/api/calendar-events/(\d+)$#', $path, $matches) && in_array($method, array('PUT', 'PATCH'), true)) {
+    handle_calendar_events_update((int) $matches[1]);
 }
 
 if (preg_match('#^/api/calendar-events/(\d+)$#', $path, $matches) && in_array($method, array('DELETE', 'POST'), true)) {

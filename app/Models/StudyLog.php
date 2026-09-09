@@ -49,6 +49,17 @@ protected static function booted(): void
         }
     });
 
+    // Legacy quiz uploads created a placeholder study log solely to attach a
+    // file. It is a quiz asset, not a learning-summary entry.
+    if (self::hasColumnSafe($table, 'note')) {
+        static::addGlobalScope('quiz_source', function (Builder $query) use ($table) {
+            $query->where(function (Builder $query) use ($table) {
+                $query->whereNull($table.'.note')
+                    ->orWhere($table.'.note', '<>', 'อัปโหลดไฟล์เพื่อสร้างแบบฝึกหัด');
+            });
+        });
+    }
+
     static::creating(function (self $log) {
         if (Auth::check() && empty($log->user_id)) {
             $log->user_id = Auth::id();

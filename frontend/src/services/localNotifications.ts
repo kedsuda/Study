@@ -93,6 +93,15 @@ export const markLocalNotificationAsRead = (userId: number | null | undefined, i
   emitLocalNotificationsChanged();
 };
 
+export const markLocalNotificationAsDelivered = (userId: number | null | undefined, id: number, deliveredAt: string) => {
+  const existing = readLocalNotifications(userId);
+  const next = existing.map(item => (
+    item.id === id && !item.delivered_at ? { ...item, delivered_at: deliveredAt } : item
+  ));
+  writeLocalNotifications(userId, next);
+  emitLocalNotificationsChanged();
+};
+
 export const deleteLocalNotification = (userId: number | null | undefined, id: number) => {
   const existing = readLocalNotifications(userId);
   const next = existing.filter(item => item.id !== id);

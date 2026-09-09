@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700&family=Sora:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -6,8 +6,9 @@
 
 :root {
   color-scheme: light;
-  --font-body: 'Manrope', 'Segoe UI', sans-serif;
-  --font-display: 'Sora', 'Segoe UI', sans-serif;
+  /* Thai Sarabun New is used when installed; Sarabun is the web-font fallback. */
+  --font-body: 'TH Sarabun New', 'Sarabun', 'Leelawadee UI', Tahoma, sans-serif;
+  --font-display: 'TH Sarabun New', 'Sarabun', 'Leelawadee UI', Tahoma, sans-serif;
   --bg: #f4f7fb;
   --text: #0f172a;
   /* Text color for "accent/gradient" surfaces in light theme. */
@@ -124,6 +125,141 @@ a:hover {
   z-index: 1;
 }
 
+/* Responsive navigation dock. The content keeps usable tap targets on small
+   screens and expands to fill the pill on wide screens like the reference UI. */
+.mobile-bottom-nav {
+  --mobile-bottom-nav-wrapper-height: 108px;
+  --mobile-bottom-nav-pill-height: 68px;
+  --mobile-bottom-nav-pill-top: 40px;
+  --mobile-bottom-nav-active-size: 54px;
+  --mobile-bottom-nav-inactive-size: 26px;
+  --mobile-bottom-nav-active-lift: 30px;
+  --mobile-bottom-nav-inactive-offset: 7px;
+}
+
+.mobile-bottom-nav__content {
+  height: var(--mobile-bottom-nav-wrapper-height);
+  width: max(100%, 990px);
+  min-width: max(100%, 990px);
+}
+
+.mobile-bottom-nav__pill {
+  height: var(--mobile-bottom-nav-pill-height);
+  border-radius: 30px;
+}
+
+.mobile-bottom-nav__notch {
+  top: var(--mobile-bottom-nav-pill-top);
+  height: 34px;
+  width: 108px;
+}
+
+/* Keep every destination readable. On narrow screens the dock scrolls
+   horizontally instead of squeezing all eleven actions into the viewport. */
+.mobile-bottom-nav__label {
+  display: block;
+  white-space: nowrap;
+}
+
+.mobile-bottom-nav__label.is-active {
+  display: block;
+  left: 50% !important;
+  right: auto !important;
+  width: max-content;
+  max-width: calc(100vw - 2rem);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transform: translateX(-50%);
+}
+
+.mobile-bottom-nav a {
+  min-width: 0;
+}
+
+@media (max-width: 639.98px) {
+  .mobile-bottom-nav {
+    --mobile-bottom-nav-wrapper-height: 106px;
+    --mobile-bottom-nav-pill-height: 68px;
+    --mobile-bottom-nav-pill-top: 38px;
+    --mobile-bottom-nav-active-size: 50px;
+    --mobile-bottom-nav-inactive-size: 28px;
+    --mobile-bottom-nav-active-lift: 27px;
+    --mobile-bottom-nav-inactive-offset: 8px;
+    overflow-x: auto !important;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x proximity;
+    touch-action: pan-x;
+  }
+
+  .mobile-bottom-nav__content {
+    width: max(100%, 836px);
+    min-width: max(100%, 836px);
+  }
+
+  .mobile-bottom-nav__notch {
+    height: 30px;
+    width: 96px;
+  }
+
+  .mobile-bottom-nav__label {
+    display: block !important;
+    bottom: 9px !important;
+    font-size: 10px !important;
+    font-weight: 700;
+    line-height: 1.1 !important;
+    letter-spacing: 0;
+  }
+
+  .mobile-bottom-nav a {
+    min-width: 76px;
+    scroll-snap-align: center;
+  }
+
+  .mobile-bottom-nav--compact {
+    overflow-x: hidden !important;
+    scroll-snap-type: none;
+    touch-action: auto;
+  }
+
+  .mobile-bottom-nav--compact .mobile-bottom-nav__content {
+    width: 100%;
+    min-width: 100%;
+  }
+
+  .mobile-bottom-nav--compact a {
+    min-width: 0;
+    scroll-snap-align: none;
+  }
+}
+
+@media (max-width: 379.98px) {
+  .mobile-bottom-nav {
+    --mobile-bottom-nav-wrapper-height: 102px;
+    --mobile-bottom-nav-pill-height: 66px;
+    --mobile-bottom-nav-pill-top: 36px;
+    --mobile-bottom-nav-active-size: 46px;
+    --mobile-bottom-nav-inactive-size: 26px;
+    --mobile-bottom-nav-active-lift: 24px;
+    --mobile-bottom-nav-inactive-offset: 8px;
+  }
+
+  .mobile-bottom-nav__notch {
+    height: 28px;
+    width: 88px;
+  }
+}
+
+@media (min-width: 640px) and (max-width: 1023.98px) {
+  .mobile-bottom-nav {
+    overflow-x: hidden !important;
+  }
+
+  .mobile-bottom-nav__content {
+    width: 100%;
+    min-width: 100%;
+  }
+}
+
 @media (max-width: 1023.98px) {
   :root:not(.theme-dark),
   .theme-light {
@@ -237,7 +373,7 @@ a:hover {
   }
 
   .mobile-bottom-nav__label {
-    font-family: -apple-system, BlinkMacSystemFont, 'Noto Sans Thai', 'Thonburi', 'Leelawadee UI', sans-serif;
+    font-family: var(--font-body);
     letter-spacing: 0;
     -webkit-font-smoothing: antialiased;
   }
@@ -1414,6 +1550,14 @@ a:hover {
 
 .voice-summary-page [class*='border-dashed'] {
   border-color: color-mix(in srgb, var(--accent) 32%, var(--border)) !important;
+}
+
+/* The document-summary screen sets a 260px minimum for every shared upload
+   zone. Voice Summary is also rendered inside that screen, where the rule
+   leaves an empty block above its controls. Let the voice upload zone size to
+   its actual content instead. */
+.voice-summary-page .doc-upload-zone {
+  min-height: 0 !important;
 }
 
 .theme-light .voice-summary-page .bg-slate-950,

@@ -1,12 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { api, assetBaseURL } from '../../services/api';
 import { useAppAlert } from '../../context/AppAlertContext';
+import { useDefaultSemesterSelection, useSemesterOptions } from '../../hooks/useSemesterOptions';
+import { filterBySemester, toNumberOrNull } from '../../utils/semester';
 import { resolveStudyFileUrl } from '../../utils/studyFiles';
 
 type SubjectOption = {
   id: number;
   name: string;
+  semester_id?: number | null;
+  semester?: number | null;
+  academic_year?: number | null;
 };
 
 type StudyFile = {
@@ -16,6 +22,8 @@ type StudyFile = {
   file_url?: string | null;
   file_type: string;
   file_size?: number | null;
+  status?: string | null;
+  archived_at?: string | null;
   created_at?: string | null;
 };
 
@@ -97,6 +105,11 @@ const getFileBadgeTone = (type: string) => {
   }
 };
 
+const normalizeFileStatus = (value?: string | null) => {
+  const status = (value || '').trim().toLowerCase();
+  return status === 'archived' ? 'archived' : 'active';
+};
+
 const FileTypeIcon = ({ type }: { type: string }) => {
   if (type === 'pdf') {
     return (
@@ -150,15 +163,21 @@ export const StudyStoragePage = () => {
   const { success, error } = useAppAlert();
   const [subjects, setSubjects] = useState<SubjectOption[]>([]);
   const [files, setFiles] = useState<StorageFile[]>([]);
+  const [selectedSemesterKey, setSelectedSemesterKey] = useState('all');
   const [activeSubjectId, setActiveSubjectId] = useState<'all' | number>('all');
   const [loading, setLoading] = useState(true);
   const [deletingFileId, setDeletingFileId] = useState<number | null>(null);
+  const [updatingFileStatusId, setUpdatingFileStatusId] = useState<number | null>(null);
   const [preview, setPreview] = useState<PreviewState | null>(null);
+  const [confirmState, setConfirmState] = useState<{ title: string; description: string; confirmLabel: string; onConfirm: () => Promise<void> | void } | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   const [textPreview, setTextPreview] = useState<string>('');
   const [previewLoading, setPreviewLoading] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [fileTypeFilter, setFileTypeFilter] = useState<'all' | 'audio' | 'word' | 'pdf' | 'image'>('all');
   const [sortBy, setSortBy] = useState<'latest' | 'oldest' | 'name_asc' | 'size_desc' | 'size_asc'>('latest');
+  const semesterOptions = useSemesterOptions();
+  useDefaultSemesterSelection(semesterOptions, selectedSemesterKey, setSelectedSemesterKey);
 
   useEffect(() => {
     const loadData = async () => {
@@ -169,6 +188,9 @@ export const StudyStoragePage = () => {
           .map((item: any) => ({
             id: Number(item.id),
             name: String(item.name ?? item.subject_name ?? '').trim(),
+            semester_id: toNumberOrNull(item.semester_id),
+            semester: toNumberOrNull(item.semester),
+            academic_year: toNumberOrNull(item.academic_year),
           }))
           .filter((item: SubjectOption) => Number.isFinite(item.id) && item.name !== '');
 
@@ -201,9 +223,24 @@ export const StudyStoragePage = () => {
     void loadData();
   }, []);
 
+  const filteredSubjects = useMemo(
+    () => filterBySemester(subjects, selectedSemesterKey),
+    [selectedSemesterKey, subjects]
+  );
+
+  useEffect(() => {
+    if (activeSubjectId !== 'all' && !filteredSubjects.some(subject => subject.id === activeSubjectId)) {
+      setActiveSubjectId('all');
+    }
+  }, [activeSubjectId, filteredSubjects]);
+
   const filteredFiles = useMemo(
-    () => (activeSubjectId === 'all' ? files : files.filter(file => file.subjectId === activeSubjectId)),
-    [activeSubjectId, files]
+    () => {
+      const semesterSubjectIds = new Set(filteredSubjects.map(subject => subject.id));
+      const semesterFiles = files.filter(file => semesterSubjectIds.has(file.subjectId));
+      return activeSubjectId === 'all' ? semesterFiles : semesterFiles.filter(file => file.subjectId === activeSubjectId);
+    },
+    [activeSubjectId, files, filteredSubjects]
   );
 
   const visibleFiles = useMemo(() => {
@@ -225,6 +262,25 @@ export const StudyStoragePage = () => {
     return next;
   }, [filteredFiles, fileTypeFilter, searchText, sortBy]);
 
+  const visibleSubjectGroups = useMemo(() => {
+    const groups = new Map<number, { subjectId: number; subjectName: string; files: StorageFile[]; totalSize: number }>();
+
+    visibleFiles.forEach(file => {
+      const current = groups.get(file.subjectId) ?? {
+        subjectId: file.subjectId,
+        subjectName: file.subjectName,
+        files: [],
+        totalSize: 0,
+      };
+
+      current.files.push(file);
+      current.totalSize += Number.isFinite(Number(file.file_size)) ? Number(file.file_size) : 0;
+      groups.set(file.subjectId, current);
+    });
+
+    return Array.from(groups.values());
+  }, [visibleFiles]);
+
   const totalUsage = useMemo(
     () => files.reduce((sum, file) => sum + (Number.isFinite(Number(file.file_size)) ? Number(file.file_size) : 0), 0),
     [files]
@@ -232,7 +288,7 @@ export const StudyStoragePage = () => {
 
   const subjectSummaries = useMemo(
     () =>
-      subjects.map(subject => {
+      filteredSubjects.map(subject => {
         const subjectFiles = files.filter(file => file.subjectId === subject.id);
         const subjectUsage = subjectFiles.reduce(
           (sum, file) => sum + (Number.isFinite(Number(file.file_size)) ? Number(file.file_size) : 0),
@@ -245,22 +301,73 @@ export const StudyStoragePage = () => {
           size: subjectUsage,
         };
       }),
-    [files, subjects]
+    [files, filteredSubjects]
   );
 
-  const handleDeleteFile = async (fileId: number, name: string) => {
-    const confirmed = window.confirm(`ต้องการลบไฟล์ "${name}" ใช่หรือไม่?`);
-    if (!confirmed) return;
+  const openConfirmDialog = (config: { title: string; description: string; confirmLabel: string; onConfirm: () => Promise<void> | void }) => {
+    setConfirmState(config);
+    setConfirmBusy(false);
+  };
 
-    setDeletingFileId(fileId);
+  const handleConfirmDialogCancel = () => {
+    setConfirmState(null);
+    setConfirmBusy(false);
+  };
+
+  const handleConfirmDialogConfirm = async () => {
+    if (!confirmState) return;
+    setConfirmBusy(true);
     try {
-      await api.delete(`/files/${fileId}`);
-      setFiles(prev => prev.filter(file => file.id !== fileId));
-      success('ลบไฟล์เรียบร้อยแล้ว');
-    } catch {
-      error('ลบไฟล์ไม่สำเร็จ');
+      await confirmState.onConfirm();
     } finally {
-      setDeletingFileId(null);
+      setConfirmBusy(false);
+      setConfirmState(null);
+    }
+  };
+
+  const handleDeleteFile = async (fileId: number, name: string) => {
+    openConfirmDialog({
+      title: 'ลบไฟล์',
+      description: `ต้องการลบไฟล์ "${name}" ใช่หรือไม่?`,
+      confirmLabel: 'ลบไฟล์',
+      onConfirm: async () => {
+        setDeletingFileId(fileId);
+        try {
+          await api.delete(`/files/${fileId}`);
+          setFiles(prev => prev.filter(file => file.id !== fileId));
+          success('ลบไฟล์เรียบร้อยแล้ว');
+        } catch {
+          error('ลบไฟล์ไม่สำเร็จ');
+        } finally {
+          setDeletingFileId(null);
+        }
+      },
+    });
+  };
+
+  const handleToggleArchiveFile = async (file: StorageFile) => {
+    const nextStatus = normalizeFileStatus(file.status) === 'archived' ? 'active' : 'archived';
+    setUpdatingFileStatusId(file.id);
+    try {
+      const response = await api.patch(`/files/${file.id}/status`, { status: nextStatus });
+      const payload = response.data?.data ?? response.data;
+      setFiles(prev =>
+        prev.map(item =>
+          item.id === file.id
+            ? {
+                ...item,
+                status: typeof payload?.status === 'string' ? payload.status : nextStatus,
+                archived_at: typeof payload?.archived_at === 'string' ? payload.archived_at : nextStatus === 'archived' ? new Date().toISOString() : null,
+              }
+            : item
+        )
+      );
+      window.dispatchEvent(new Event('slt:archive-refresh'));
+      success(nextStatus === 'archived' ? 'เก็บถาวรไฟล์เรียบร้อยแล้ว' : 'นำไฟล์กลับมาใช้งานเรียบร้อยแล้ว');
+    } catch {
+      error(nextStatus === 'archived' ? 'เก็บถาวรไฟล์ไม่สำเร็จ' : 'นำไฟล์กลับไม่สำเร็จ');
+    } finally {
+      setUpdatingFileStatusId(null);
     }
   };
 
@@ -420,17 +527,34 @@ export const StudyStoragePage = () => {
         </section>
 
         <section>
-          <div className="mb-4 flex items-center justify-between gap-3">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <h2 className="text-base font-bold text-[color:var(--text)]">แฟ้มรายวิชา</h2>
-            {activeSubjectId !== 'all' ? (
-              <button
-                type="button"
-                onClick={() => setActiveSubjectId('all')}
-                className="rounded-md bg-indigo-50 px-2 py-1 text-[10px] font-bold text-indigo-600"
+            <div className="flex items-center gap-2">
+              <label htmlFor="storage-semester-filter" className="sr-only">กรองภาคเรียน</label>
+              <select
+                id="storage-semester-filter"
+                value={selectedSemesterKey}
+                onChange={event => {
+                  setSelectedSemesterKey(event.target.value);
+                  setActiveSubjectId('all');
+                }}
+                className="max-w-[210px] rounded-lg border px-2.5 py-1.5 text-xs font-semibold text-[color:var(--text)] outline-none transition focus:border-[color:var(--accent)]"
+                style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}
               >
-                ดูทั้งหมด
-              </button>
-            ) : null}
+                {semesterOptions.map(option => (
+                  <option key={option.key} value={option.key}>{option.label}</option>
+                ))}
+              </select>
+              {activeSubjectId !== 'all' ? (
+                <button
+                  type="button"
+                  onClick={() => setActiveSubjectId('all')}
+                  className="rounded-md bg-indigo-50 px-2 py-1 text-[10px] font-bold text-indigo-600"
+                >
+                  ดูทั้งหมด
+                </button>
+              ) : null}
+            </div>
           </div>
 
           <div className="grid grid-cols-2 gap-3">
@@ -462,11 +586,18 @@ export const StudyStoragePage = () => {
         </section>
 
         <section>
-          <h2 className="mb-4 text-base font-bold text-[color:var(--text)]">
-            {activeSubjectId === 'all'
-              ? 'ไฟล์ในคลังทั้งหมด'
-              : `ไฟล์ในวิชา${subjectSummaries.find(subject => subject.id === activeSubjectId)?.name ?? ''}`}
-          </h2>
+          <div className="mb-4 flex flex-col gap-1">
+            <h2 className="text-base font-bold text-[color:var(--text)]">
+              {activeSubjectId === 'all'
+                ? 'ไฟล์สรุปแยกตามรายวิชา'
+                : `ไฟล์สรุปในวิชา ${subjectSummaries.find(subject => subject.id === activeSubjectId)?.name ?? ''}`}
+            </h2>
+            <p className="text-xs text-[color:var(--muted)]">
+              {activeSubjectId === 'all'
+                ? 'แต่ละไฟล์จะแสดงอยู่ใต้ชื่อวิชาที่เป็นเจ้าของไฟล์'
+                : ''}
+            </p>
+          </div>
 
           <div className="mb-4 rounded-2xl border p-3 shadow-sm" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
             <div className="flex items-center gap-2">
@@ -489,6 +620,8 @@ export const StudyStoragePage = () => {
                   setSearchText('');
                   setFileTypeFilter('all');
                   setSortBy('latest');
+                  setSelectedSemesterKey('all');
+                  setActiveSubjectId('all');
                 }}
                 className="rounded-xl px-3 py-2 text-xs font-bold text-[color:var(--accent-ink)] transition hover:brightness-95"
                 style={{ background: 'rgba(var(--accent-rgb),0.10)' }}
@@ -546,48 +679,105 @@ export const StudyStoragePage = () => {
               กำลังโหลดไฟล์...
             </div>
           ) : visibleFiles.length > 0 ? (
-            <div className="space-y-3">
-              {visibleFiles.map(file => (
-                <div
-                  key={file.id}
-                  className="flex items-center justify-between gap-3 rounded-2xl border p-3 shadow-sm"
-                  style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}
-                >
-                  <button
-                    type="button"
-                    onClick={() => void handlePreviewFile(file)}
-                    className="flex min-w-0 flex-1 items-center gap-3 text-left"
-                  >
-                    <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${getFileBadgeTone(file.file_type)}`}>
-                      <FileTypeIcon type={file.file_type} />
-                    </div>
-                    <div className="min-w-0">
-                      <h3 className="truncate text-xs font-bold text-[color:var(--text)]">{file.original_name}</h3>
-                      <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[10px] text-[color:var(--muted)]">
-                        <span>{formatThaiDateTime(file.created_at)}</span>
-                        <span className="h-1 w-1 rounded-full bg-slate-300" />
-                        <span className="font-medium text-[color:var(--muted)]">{formatFileSize(file.file_size)}</span>
-                        <span className="h-1 w-1 rounded-full bg-slate-300" />
-                        <span>{file.subjectName}</span>
+            <div className="space-y-4">
+              {(activeSubjectId === 'all'
+                ? visibleSubjectGroups
+                : [{
+                    subjectId: Number(activeSubjectId),
+                    subjectName: subjectSummaries.find(subject => subject.id === activeSubjectId)?.name ?? 'ไม่ทราบวิชา',
+                    files: visibleFiles,
+                    totalSize: visibleFiles.reduce(
+                      (sum, file) => sum + (Number.isFinite(Number(file.file_size)) ? Number(file.file_size) : 0),
+                      0
+                    ),
+                  }]
+              ).map((group, groupIndex) => (
+                <div key={group.subjectId} className="rounded-2xl border p-3 shadow-sm" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
+                  <div className="mb-3 flex items-center justify-between gap-3 border-b pb-3" style={{ borderColor: 'var(--border)' }}>
+                    <div className="flex min-w-0 items-center gap-3">
+                      <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${getFolderTone(groupIndex)}`}>
+                        <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                          <path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" />
+                        </svg>
+                      </div>
+                      <div className="min-w-0">
+                        <h3 className="truncate text-sm font-bold text-[color:var(--text)]">{group.subjectName}</h3>
+                        <p className="text-[10px] text-[color:var(--muted)]">
+                          {group.files.length} ไฟล์ • {formatFileSize(group.totalSize)}
+                        </p>
                       </div>
                     </div>
-                  </button>
+                  </div>
 
-                  <button
-                    type="button"
-                    onClick={() => void handleDeleteFile(file.id, file.original_name)}
-                    disabled={deletingFileId === file.id}
-                    className="shrink-0 rounded-lg p-2 text-slate-300 transition hover:bg-red-50 hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-60"
-                    title="ลบไฟล์"
-                  >
-                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                      <path d="M3 6h18" />
-                      <path d="M8 6V4h8v2" />
-                      <path d="M19 6l-1 14H6L5 6" />
-                      <path d="M10 11v6" />
-                      <path d="M14 11v6" />
-                    </svg>
-                  </button>
+                  <div className="space-y-2">
+                    {group.files.map(file => (
+                      <div
+                        key={file.id}
+                        className="flex items-center justify-between gap-3 rounded-xl border p-3"
+                        style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => void handlePreviewFile(file)}
+                          className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                        >
+                          <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${getFileBadgeTone(file.file_type)}`}>
+                            <FileTypeIcon type={file.file_type} />
+                          </div>
+                          <div className="min-w-0">
+                            <h3 className="truncate text-xs font-bold text-[color:var(--text)]">{file.original_name}</h3>
+                            <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[10px] text-[color:var(--muted)]">
+                              <span>{formatThaiDateTime(file.created_at)}</span>
+                              <span className="h-1 w-1 rounded-full bg-slate-300" />
+                              <span className="font-medium text-[color:var(--muted)]">{formatFileSize(file.file_size)}</span>
+                              {activeSubjectId !== 'all' ? (
+                                <>
+                                  <span className="h-1 w-1 rounded-full bg-slate-300" />
+                                  <span>{file.subjectName}</span>
+                                </>
+                              ) : null}
+                              {normalizeFileStatus(file.status) === 'archived' ? (
+                                <>
+                                  <span className="h-1 w-1 rounded-full bg-slate-300" />
+                                  <span className="font-bold text-amber-600">เก็บถาวร</span>
+                                </>
+                              ) : null}
+                            </div>
+                          </div>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => void handleToggleArchiveFile(file)}
+                          disabled={updatingFileStatusId === file.id}
+                          className="shrink-0 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] font-bold text-amber-700 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
+                          title={normalizeFileStatus(file.status) === 'archived' ? 'นำออกจากเก็บถาวร' : 'เก็บถาวรไฟล์'}
+                        >
+                          {updatingFileStatusId === file.id
+                            ? 'กำลังบันทึก'
+                            : normalizeFileStatus(file.status) === 'archived'
+                              ? 'นำกลับ'
+                              : 'เก็บ'}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteFile(file.id, file.original_name)}
+                          disabled={deletingFileId === file.id}
+                          className="shrink-0 rounded-lg p-2 text-slate-300 transition hover:bg-red-50 hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-60"
+                          title="ลบไฟล์"
+                        >
+                          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                            <path d="M3 6h18" />
+                            <path d="M8 6V4h8v2" />
+                            <path d="M19 6l-1 14H6L5 6" />
+                            <path d="M10 11v6" />
+                            <path d="M14 11v6" />
+                          </svg>
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               ))}
             </div>
@@ -601,6 +791,15 @@ export const StudyStoragePage = () => {
           )}
         </section>
       </div>
+      <ConfirmDialog
+        isOpen={Boolean(confirmState)}
+        title={confirmState?.title ?? ''}
+        description={confirmState?.description ?? ''}
+        confirmLabel={confirmState?.confirmLabel ?? 'ยืนยัน'}
+        onConfirm={handleConfirmDialogConfirm}
+        onCancel={handleConfirmDialogCancel}
+        busy={confirmBusy}
+      />
     </div>
   );
 };

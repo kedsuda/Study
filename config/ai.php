@@ -11,7 +11,9 @@ return [
     ],
     'groq' => [
         'api_key' => env('GROQ_API_KEY'),
-        'model' => env('GROQ_MODEL', 'llama-3.1-8b-instant'),
+        // Llama 3.1 8B Instant was retired by Groq on 2026-08-16.
+        'model' => env('GROQ_MODEL', 'openai/gpt-oss-20b'),
+        'vision_model' => env('GROQ_VISION_MODEL', 'qwen/qwen3.6-27b'),
         'base_uri' => env('GROQ_BASE_URI', 'https://api.groq.com/openai/v1'),
     ],
     'gemini' => [

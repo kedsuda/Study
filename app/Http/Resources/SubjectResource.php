@@ -16,6 +16,7 @@ class SubjectResource extends JsonResource
     {
         [$startDate, $startTime, $endTime] = $this->resolveSchedule();
         [$semesterId, $semester, $academicYear] = $this->resolveSemester();
+        $room = $this->resolveRoom();
 
         return [
             'id' => $this->id,
@@ -26,8 +27,8 @@ class SubjectResource extends JsonResource
             'name' => $this->name,
             'description' => $this->description,
             'color' => $this->color,
-            'room' => $this->room,
-            'classroom' => $this->room,
+            'room' => $room,
+            'classroom' => $room,
             'target_hours' => $this->target_hours,
             'start_date' => $startDate,
             'start_time' => $startTime,
@@ -37,6 +38,35 @@ class SubjectResource extends JsonResource
             'study_log_count' => $this->whenCounted('studyLogs'),
             'study_logs' => StudyLogResource::collection($this->whenLoaded('studyLogs')),
         ];
+    }
+
+    private function resolveRoom(): ?string
+    {
+        $room = is_string($this->room ?? null) ? trim((string) $this->room) : '';
+        if ($room !== '') {
+            return $room;
+        }
+
+        if (! $this->hasCalendarTable()) {
+            return null;
+        }
+
+        $event = $this->loadScheduleEvent();
+        if (! $event) {
+            return null;
+        }
+
+        $eventRoom = is_string($event->room ?? null) ? trim((string) $event->room) : '';
+        if ($eventRoom !== '') {
+            return $eventRoom;
+        }
+
+        $metadataRoom = data_get($event->metadata, 'room');
+        if (is_string($metadataRoom) && trim($metadataRoom) !== '') {
+            return trim($metadataRoom);
+        }
+
+        return null;
     }
 
     private function resolveSemester(): array
@@ -90,9 +120,13 @@ class SubjectResource extends JsonResource
             ->where('subject_id', $this->id);
 
         try {
-            $query->where('metadata->source', 'subject');
+            $query->whereIn('metadata->source', ['subject', 'assistant_chat']);
         } catch (Throwable $error) {
-            $query->where('metadata', 'like', '%"source":"subject"%');
+            $query->where(function ($sourceQuery) {
+                $sourceQuery
+                    ->where('metadata', 'like', '%"source":"subject"%')
+                    ->orWhere('metadata', 'like', '%"source":"assistant_chat"%');
+            });
         }
 
         return $query->orderByDesc('start_time')->first();

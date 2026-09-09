@@ -8,6 +8,7 @@ use App\Http\Controllers\API\DashboardController;
 use App\Http\Controllers\API\FileController;
 use App\Http\Controllers\API\GmailController;
 use App\Http\Controllers\API\GoalController;
+use App\Http\Controllers\API\LearningStatsController;
 use App\Http\Controllers\API\QuizController;
 use App\Http\Controllers\API\SemesterController;
 use App\Http\Controllers\API\StudyCalendarEventController;
@@ -18,23 +19,6 @@ use App\Http\Controllers\API\SummaryController;
 use App\Http\Controllers\API\PortfolioController;
 use App\Http\Controllers\NotificationController as NotificationController;
 use Illuminate\Support\Facades\Route;
-use Illuminate\Support\Facades\DB;
-use App\Http\Controllers\API\GoogleAuthController;
-
-Route::get('/debug/db', function () {
-    try {
-        DB::connection()->getPdo();
-        return response()->json([
-            'status' => 'ok',
-            'database' => DB::connection()->getDatabaseName(),
-        ]);
-    } catch (Throwable $e) {
-        return response()->json([
-            'status' => 'error',
-            'message' => $e->getMessage(),
-        ], 500);
-    }
-});
 
 
 Route::post('/auth/google', [AuthController::class, 'googleSignIn']);
@@ -51,6 +35,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/auth/me', [AuthController::class, 'me']);
     Route::post('/auth/logout', [AuthController::class, 'logout']);
     Route::put('/auth/profile', [AuthController::class, 'updateProfile']);
+    // รองรับโฮสต์ที่ไม่อนุญาต HTTP PUT จากหน้าเว็บ
+    Route::post('/auth/profile', [AuthController::class, 'updateProfile']);
 
     require __DIR__ . '/admin.php';
 
@@ -62,26 +48,22 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/semesters', [SemesterController::class, 'store']);
 
     // --------------------------
-    // Subjects (แก้ให้ลบได้ + กัน route ชน)
+    // Subjects
     // --------------------------
 
-// ✅ route แบบ fixed ต้องมาก่อน กัน /subjects/delete ไปชน /subjects/{subject}
-Route::post('/subjects/delete', [SubjectController::class, 'destroyById']);
-
     // CRUD หลัก
-// ✅ route แบบ fixed ต้องมาก่อน กัน /subjects/delete ไปชน /subjects/{subject}
 Route::get('/subjects', [SubjectController::class, 'index']);
 Route::post('/subjects', [SubjectController::class, 'store']);
 
-    // ✅ ทุก route ที่มี {subject} ให้รับเฉพาะตัวเลข ป้องกัน "delete" โดนจับเป็น subject
+    // ทุก route ที่มี {subject} ให้รับเฉพาะตัวเลข
 Route::get('/subjects/{subject}', [SubjectController::class, 'show'])->whereNumber('subject');
 Route::match(['put', 'patch'], '/subjects/{subject}', [SubjectController::class, 'update'])->whereNumber('subject');
+Route::delete('/subjects/{subject}', [SubjectController::class, 'destroy'])->whereNumber('subject');
 
-
-    // ✅ ลบ (รองรับหลายแบบตามที่คุณมีใน controller)
-Route::delete('/subjects/{subject}', [SubjectController::class, 'destroy'])->whereNumber('subject');      // REST
-Route::post('/subjects/{subject}', [SubjectController::class, 'destroy'])->whereNumber('subject');        // ตัวหลัก (เผื่อโฮสต์บล็อก DELETE)
-Route::post('/subjects/{subject}/delete', [SubjectController::class, 'destroy'])->whereNumber('subject'); // legacy
+// รองรับโฮสต์ที่ส่ง PUT/PATCH ไม่ได้: หน้าบ้านจะส่ง POST พร้อมข้อมูลวิชาแทน
+Route::post('/subjects/{subject}', [SubjectController::class, 'update'])->whereNumber('subject');
+Route::post('/subjects/{subject}/delete', [SubjectController::class, 'destroy'])->whereNumber('subject');
+Route::post('/subjects/delete', [SubjectController::class, 'destroyById']);
 
     // --------------------------
     // Study Logs
@@ -94,10 +76,12 @@ Route::post('/subjects/{subject}/delete', [SubjectController::class, 'destroy'])
 
     Route::get('/subjects/{subject}/summary-archives', [SubjectArchiveController::class, 'index'])->whereNumber('subject');
     Route::post('/subjects/{subject}/summary-archives', [SubjectArchiveController::class, 'store'])->whereNumber('subject');
+    Route::match(['put', 'patch'], '/subjects/{subject}/summary-archives/{archive}', [SubjectArchiveController::class, 'update'])->whereNumber('subject')->whereNumber('archive');
     Route::delete('/subjects/{subject}/summary-archives/{archive}', [SubjectArchiveController::class, 'destroy'])->whereNumber('subject')->whereNumber('archive');
     Route::get('/summary-archives/count', [SubjectArchiveController::class, 'count']);
 
     Route::post('/study-logs/{studyLog}/files', [FileController::class, 'store']);
+    Route::match(['put', 'patch'], '/files/{file}/status', [FileController::class, 'updateStatus']);
     Route::delete('/files/{file}', [FileController::class, 'destroy']);
 
     Route::get('/study-logs/{studyLog}/summaries', [SummaryController::class, 'index']);
@@ -122,6 +106,7 @@ Route::post('/subjects/{subject}/delete', [SubjectController::class, 'destroy'])
     Route::get('/subjects/{subject}/quizzes', [QuizController::class, 'index'])->whereNumber('subject');
     Route::post('/subjects/{subject}/quizzes', [QuizController::class, 'store'])->whereNumber('subject');
     Route::post('/subjects/{subject}/quizzes/from-file', [QuizController::class, 'storeFromFile'])->whereNumber('subject');
+    Route::get('/quizzes/summary', [QuizController::class, 'summary']);
     Route::get('/quizzes/{quiz}', [QuizController::class, 'show']);
     Route::delete('/quizzes/{quiz}', [QuizController::class, 'destroy']);
     Route::post('/quizzes/{quiz}/attempts', [QuizController::class, 'submitAttempt']);
@@ -129,6 +114,7 @@ Route::post('/subjects/{subject}/delete', [SubjectController::class, 'destroy'])
     Route::get('/goals/summary', [GoalController::class, 'summary']);
     Route::post('/goals/targets', [GoalController::class, 'upsertTarget']);
     Route::post('/goals/targets/reset', [GoalController::class, 'resetTarget']);
+    Route::get('/learning-stats/summary', [LearningStatsController::class, 'summary']);
     Route::get('/portfolio', [PortfolioController::class, 'show']);
     Route::put('/portfolio', [PortfolioController::class, 'upsert']);
     Route::get('/portfolio/images', [PortfolioController::class, 'images']);
@@ -141,6 +127,7 @@ Route::post('/subjects/{subject}/delete', [SubjectController::class, 'destroy'])
 
     Route::post('/ai/transcribe/audio', [AIController::class, 'transcribeAudio']);
     Route::post('/ai/summarize/audio', [AIController::class, 'summarizeAudio']);
+    Route::post('/ai/summaries/audio', [AIController::class, 'storeAudioSummary']);
     Route::get('/ai/summaries/audio', [AIController::class, 'audioSummaries']);
     Route::delete('/ai/summaries/audio/{audioSummary}', [AIController::class, 'destroyAudioSummary']);
     Route::post('/ai/analyze/document', [AIController::class, 'extractDocument']);
@@ -153,6 +140,7 @@ Route::post('/subjects/{subject}/delete', [SubjectController::class, 'destroy'])
     Route::get('/assistant/chat/history', [AssistantChatController::class, 'index']);
     Route::post('/assistant/chat/message', [AssistantChatController::class, 'store']);
     Route::delete('/assistant/chat/history', [AssistantChatController::class, 'destroyHistory']);
+    Route::post('/assistant/chat/history/delete', [AssistantChatController::class, 'destroyHistory']);
     Route::delete('/assistant/chat/history/{message}', [AssistantChatController::class, 'destroyMessage']);
 
     Route::get('/gmail/authorize', [GmailController::class, 'authorizeGmail']);
@@ -166,8 +154,10 @@ Route::post('/subjects/{subject}/delete', [SubjectController::class, 'destroy'])
     Route::get('/notifications/settings', [NotificationController::class, 'settings']);
     Route::put('/notifications/settings', [NotificationController::class, 'updateSettings']);
     Route::patch('/notifications/{notification}/read', [NotificationController::class, 'markAsRead']);
+    Route::patch('/notifications/{notification}/delivered', [NotificationController::class, 'markAsDelivered']);
     Route::patch('/notifications/{notification}/time', [NotificationController::class, 'updateTime']);
     Route::post('/notifications/{notification}/read', [NotificationController::class, 'markAsRead']);
+    Route::post('/notifications/{notification}/delivered', [NotificationController::class, 'markAsDelivered']);
     Route::post('/notifications/{notification}/time', [NotificationController::class, 'updateTime']);
     Route::delete('/notifications/{notification}', [NotificationController::class, 'destroy']);
     Route::post('/notifications/{notification}', [NotificationController::class, 'destroy']);

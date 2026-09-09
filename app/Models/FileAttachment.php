@@ -18,6 +18,12 @@ class FileAttachment extends Model
         'file_type',
         'mime_type',
         'file_size',
+        'status',
+        'archived_at',
+    ];
+
+    protected $casts = [
+        'archived_at' => 'datetime',
     ];
 
     public function studyLog()

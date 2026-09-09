@@ -20,10 +20,10 @@ return new class extends Migration {
 
         // allow AI-driven records without fixed career_paths mapping
         if (Schema::hasColumn('career_recommendations', 'career_path_id')) {
-            if ($this->foreignKeyExists('career_recommendations_career_path_id_foreign')) {
-                DB::statement('ALTER TABLE `career_recommendations` DROP FOREIGN KEY `career_recommendations_career_path_id_foreign`');
+            foreach ($this->foreignKeysForColumn('career_recommendations', 'career_path_id') as $foreignKey) {
+                DB::statement("ALTER TABLE `career_recommendations` DROP FOREIGN KEY `{$foreignKey}`");
             }
-            DB::statement('ALTER TABLE `career_recommendations` MODIFY `career_path_id` BIGINT UNSIGNED NULL');
+            DB::statement('ALTER TABLE `career_recommendations` MODIFY `career_path_id` '.$this->columnType('career_recommendations', 'career_path_id', 'BIGINT UNSIGNED').' NULL');
             $this->addCareerPathForeignKeyIfPossible();
         }
 
@@ -41,10 +41,10 @@ return new class extends Migration {
         }
 
         if (Schema::hasColumn('career_recommendations', 'career_path_id')) {
-            if ($this->foreignKeyExists('career_recommendations_career_path_id_foreign')) {
-                DB::statement('ALTER TABLE `career_recommendations` DROP FOREIGN KEY `career_recommendations_career_path_id_foreign`');
+            foreach ($this->foreignKeysForColumn('career_recommendations', 'career_path_id') as $foreignKey) {
+                DB::statement("ALTER TABLE `career_recommendations` DROP FOREIGN KEY `{$foreignKey}`");
             }
-            DB::statement('ALTER TABLE `career_recommendations` MODIFY `career_path_id` BIGINT UNSIGNED NOT NULL');
+            DB::statement('ALTER TABLE `career_recommendations` MODIFY `career_path_id` '.$this->columnType('career_recommendations', 'career_path_id', 'BIGINT UNSIGNED').' NOT NULL');
             $this->addCareerPathForeignKeyIfPossible();
         }
 
@@ -65,6 +65,40 @@ return new class extends Migration {
             ->where('CONSTRAINT_NAME', $constraintName)
             ->where('CONSTRAINT_TYPE', 'FOREIGN KEY')
             ->exists();
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function foreignKeysForColumn(string $table, string $column): array
+    {
+        $database = DB::getDatabaseName();
+
+        return collect(DB::table('information_schema.KEY_COLUMN_USAGE')
+            ->where('TABLE_SCHEMA', $database)
+            ->where('TABLE_NAME', $table)
+            ->where('COLUMN_NAME', $column)
+            ->whereNotNull('REFERENCED_TABLE_NAME')
+            ->pluck('CONSTRAINT_NAME'))
+            ->filter(fn ($name) => is_string($name) && trim($name) !== '')
+            ->unique()
+            ->values()
+            ->all();
+    }
+
+    private function columnType(string $table, string $column, string $fallback): string
+    {
+        $database = DB::getDatabaseName();
+        $row = DB::table('information_schema.COLUMNS')
+            ->where('TABLE_SCHEMA', $database)
+            ->where('TABLE_NAME', $table)
+            ->where('COLUMN_NAME', $column)
+            ->select('COLUMN_TYPE')
+            ->first();
+
+        return is_string($row?->COLUMN_TYPE ?? null) && trim($row->COLUMN_TYPE) !== ''
+            ? (string) $row->COLUMN_TYPE
+            : $fallback;
     }
 
     private function addCareerPathForeignKeyIfPossible(): void

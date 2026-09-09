@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Groq AI Chatbot</title>
+  <title>เครื่องมือเพิ่มตารางเรียน</title>
   <style>
     :root {
       --bg: #f3f6fb;
@@ -31,8 +31,8 @@
     }
 
     .chat-shell {
-      width: min(920px, 100%);
-      height: min(86vh, 780px);
+      width: min(1080px, 100%);
+      height: min(90vh, 860px);
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 18px;
@@ -168,19 +168,19 @@
   <div class="chat-shell">
     <div class="chat-header">
       <div>
-        <h1 class="chat-title">AI Chatbot (Groq)</h1>
-        <p class="chat-sub">ใช้คีย์จาก <code>GROQ_API_KEY</code> ใน environment/.env</p>
+        <h1 class="chat-title">เครื่องมือเพิ่มตารางเรียน</h1>
+        <p class="chat-sub">เพิ่มได้หลายวิชา ตรวจภาคเรียนของรายวิชา และใช้รูปแบบวัน/เดือน/ปี เวลา ห้องเรียน และภาคเรียน</p>
       </div>
       <select id="model" class="model-select">
-        <option value="llama-3.1-8b-instant">llama-3.1-8b-instant</option>
-        <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile</option>
+        <option value="openai/gpt-oss-20b">GPT-OSS 20B</option>
+        <option value="openai/gpt-oss-120b">GPT-OSS 120B</option>
       </select>
     </div>
 
     <div id="messages" class="messages"></div>
 
     <form id="chatForm" class="composer">
-      <textarea id="input" class="input" placeholder="พิมพ์ข้อความ... (กด Enter เพื่อส่ง, Shift+Enter ขึ้นบรรทัดใหม่)" required></textarea>
+      <textarea id="input" class="input" placeholder="เช่น เพิ่มวิชา คณิต วันจันทร์ วันที่ 12/08/2569 09:00-12:00 ห้อง 102 ภาคเรียนที่ 1 ปีการศึกษา 2569" required></textarea>
       <button id="sendBtn" class="send" type="submit">ส่ง</button>
     </form>
   </div>
@@ -202,7 +202,7 @@
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
-    addMessage('system', 'พร้อมใช้งาน: พิมพ์คำถามแล้วกดส่ง');
+    addMessage('system', 'พร้อมใช้งาน: เพิ่มวิชาได้หลายรายการโดยแยกคนละบรรทัด และถามได้ว่าวิชาไหนอยู่เทอมอะไร');
 
     inputEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {

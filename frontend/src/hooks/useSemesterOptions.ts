@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type Dispatch, type SetStateAction } from 'react';
 import { apiFallbackClients } from '../services/api';
 import { buildSemesterOptions, SemesterOption, toNumberOrNull } from '../utils/semester';
 
@@ -16,7 +16,7 @@ const unwrapCollection = (payload: any) => {
 };
 
 export const useSemesterOptions = () => {
-  const [semesterOptions, setSemesterOptions] = useState<SemesterOption[]>([{ key: 'all', label: 'ทุกเทอม' }]);
+  const [semesterOptions, setSemesterOptions] = useState<SemesterOption[]>([]);
 
   useEffect(() => {
     const loadSemesters = async () => {
@@ -46,11 +46,25 @@ export const useSemesterOptions = () => {
         }
       }
 
-      setSemesterOptions([{ key: 'all', label: 'ทุกเทอม' }]);
+      setSemesterOptions([]);
     };
 
     void loadSemesters();
   }, []);
 
   return semesterOptions;
+};
+
+// Keep controlled semester dropdowns on a real option once the list loads.
+// This also handles a previously selected semester that was removed.
+export const useDefaultSemesterSelection = (
+  semesterOptions: SemesterOption[],
+  selectedSemesterKey: string,
+  setSelectedSemesterKey: Dispatch<SetStateAction<string>>,
+) => {
+  useEffect(() => {
+    if (semesterOptions.length === 0) return;
+    if (semesterOptions.some(option => option.key === selectedSemesterKey)) return;
+    setSelectedSemesterKey(semesterOptions[0].key);
+  }, [selectedSemesterKey, semesterOptions, setSelectedSemesterKey]);
 };

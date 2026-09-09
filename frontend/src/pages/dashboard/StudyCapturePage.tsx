@@ -1,11 +1,11 @@
-import { BookOpen, Calendar, CheckCircle2, LoaderCircle, Mic, Paperclip, Square, X } from 'lucide-react';
+import { BookOpen, Calendar, CheckCircle2, LoaderCircle, Mic, Paperclip, Sparkles, Square, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import Swal from 'sweetalert2';
 import saveIcon from '../../img/savel.png';
-import { api } from '../../services/api';
+import { api, assetBaseURL } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
-import { uploadStudyFileToSupabase } from '../../utils/studyFiles';
+import { downloadStudyFileBlob, isSupabaseStudyFilePath, resolveStudyFileUrl, uploadStudyFileToSupabase } from '../../utils/studyFiles';
 
 type SubjectOption = {
   id: number;
@@ -19,6 +19,26 @@ type StudyLogEntry = {
   log_date: string;
   duration_minutes?: number | null;
   mood?: string | null;
+  files?: StudyFile[];
+  summaries?: SummaryEntry[];
+};
+
+type StudyFile = {
+  id: number;
+  original_name: string;
+  file_path: string;
+  file_url?: string | null;
+  file_type: string;
+  mime_type?: string | null;
+  file_size?: number | null;
+};
+
+type SummaryEntry = {
+  id: number;
+  content: string;
+  ai_model?: string | null;
+  created_at?: string;
+  metadata?: Record<string, unknown> | null;
 };
 
 type SpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
@@ -40,6 +60,68 @@ const formatThaiDate = (value: string) => {
   return date.toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: 'numeric' });
 };
 
+const normalizeDateInputValue = (value: string) => {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+
+  const match = trimmed.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!match) return '';
+
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  const year = Number(match[3]);
+  if (!Number.isFinite(day) || !Number.isFinite(month) || !Number.isFinite(year)) return '';
+
+  const date = new Date(year, month - 1, day);
+  if (Number.isNaN(date.getTime())) return '';
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) return '';
+
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+};
+
+const formatDateDisplayValue = (value: string) => {
+  const normalized = normalizeDateInputValue(value);
+  if (!normalized) return value;
+  const [year, month, day] = normalized.split('-');
+  return `${day}/${month}/${year}`;
+};
+
+const storageBase = assetBaseURL || (api.defaults.baseURL ?? '').replace(/\/api\/?$/, '');
+const documentExtensions = new Set(['pdf', 'doc', 'docx', 'txt']);
+
+const getFileExtension = (filename?: string | null) => {
+  const value = filename?.trim() ?? '';
+  const parts = value.split('.');
+  return parts.length > 1 ? (parts.pop() ?? '').toLowerCase() : '';
+};
+
+const isDocumentAttachment = (file: StudyFile) => {
+  const extension = getFileExtension(file.original_name);
+  return documentExtensions.has(extension) || file.file_type === 'pdf' || file.file_type === 'word';
+};
+
+const summarizeStoredDocumentFile = async (file: StudyFile) => {
+  let blob = await downloadStudyFileBlob(file.file_path);
+  if (!blob) {
+    const fileUrl = file.file_url || resolveStudyFileUrl(file.file_path, storageBase);
+    const response = await fetch(fileUrl);
+    if (!response.ok) {
+      throw new Error(`โหลดไฟล์แนบไม่สำเร็จ (${response.status})`);
+    }
+    blob = await response.blob();
+  }
+
+  const formData = new FormData();
+  const uploadFile = new File([blob], file.original_name, {
+    type: file.mime_type || blob.type || 'application/octet-stream',
+  });
+  formData.append('file', uploadFile, file.original_name);
+
+  const summaryResponse = await api.post('/ai/summarize/document', formData);
+  return summaryResponse.data as { summary?: string; text?: string; model?: string };
+};
+
 export const StudyCapturePage = () => {
   const navigate = useNavigate();
   const { user } = useAuth();
@@ -51,7 +133,9 @@ export const StudyCapturePage = () => {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [voiceInputSupported, setVoiceInputSupported] = useState(false);
   const [activeVoiceField, setActiveVoiceField] = useState<'title' | 'note' | null>(null);
+  const [generatingSummaryId, setGeneratingSummaryId] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const datePickerRef = useRef<HTMLInputElement | null>(null);
   const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const speechRecognitionCtorRef = useRef<SpeechRecognitionConstructor | null>(null);
   const speechTranscriptBaseRef = useRef('');
@@ -64,6 +148,7 @@ export const StudyCapturePage = () => {
     durationMinutes: '60',
     mood: ''
   });
+  const [logDateDisplay, setLogDateDisplay] = useState(() => formatDateDisplayValue(new Date().toISOString().slice(0, 10)));
 
   const moodOptions = ['สนุก', 'เข้าใจมากขึ้น', 'ต้องทบทวน', 'ค่อนข้างยาก', 'มั่นใจขึ้น'];
   const today = useMemo(() => new Date().toISOString().slice(0, 10), []);
@@ -222,6 +307,10 @@ export const StudyCapturePage = () => {
       setFeedback('กรุณาเลือกวิชาและกรอกหัวข้อที่เรียนก่อน');
       return;
     }
+    if (!normalizeDateInputValue(form.logDate)) {
+      setFeedback('กรุณากรอกวันที่เป็น วัน/เดือน/ปี');
+      return;
+    }
 
     setSaving(true);
     setFeedback(null);
@@ -241,22 +330,31 @@ export const StudyCapturePage = () => {
       if (Number.isFinite(logId) && selectedFiles.length > 0) {
         const uploadResults = await Promise.allSettled(
           selectedFiles.map(async file => {
-            const uploaded = await uploadStudyFileToSupabase({
-              file,
-              userId: user?.id,
-              subject: {
-                id: selectedSubject?.id,
-                name: selectedSubject?.name,
-              },
-            });
+            try {
+              const uploaded = await uploadStudyFileToSupabase({
+                file,
+                userId: user?.id,
+                subject: {
+                  id: selectedSubject?.id,
+                  name: selectedSubject?.name,
+                },
+              });
 
-            await api.post(`/study-logs/${logId}/files`, {
-              original_name: file.name,
-              storage_path: uploaded.storagePath,
-              file_type: uploaded.fileType,
-              mime_type: file.type || null,
-              file_size: file.size,
-            });
+              await api.post(`/study-logs/${logId}/files`, {
+                original_name: file.name,
+                storage_path: uploaded.storagePath,
+                file_type: uploaded.fileType,
+                mime_type: file.type || null,
+                file_size: file.size,
+              });
+              return;
+            } catch (storageError) {
+              console.warn('supabase upload failed, falling back to local storage', storageError);
+            }
+
+            const uploadForm = new FormData();
+            uploadForm.append('file', file, file.name);
+            await api.post(`/study-logs/${logId}/files`, uploadForm);
           })
         );
 
@@ -295,6 +393,7 @@ export const StudyCapturePage = () => {
         durationMinutes: '60',
         mood: ''
       }));
+      setLogDateDisplay(formatDateDisplayValue(today));
       setSelectedFiles([]);
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
@@ -334,6 +433,59 @@ export const StudyCapturePage = () => {
         file => !(file.name === target.name && file.size === target.size && file.lastModified === target.lastModified)
       )
     );
+  };
+
+  const handleGenerateSummary = async (logId: number) => {
+    setGeneratingSummaryId(logId);
+    setFeedback(null);
+    try {
+      const targetLog = todayLogs.find(log => log.id === logId);
+      const documentFile = targetLog?.files?.find(isDocumentAttachment) ?? null;
+      let response;
+
+      if (documentFile) {
+        try {
+          const documentSummary = await summarizeStoredDocumentFile(documentFile);
+          const content = documentSummary.summary?.trim();
+          if (!content) {
+            throw new Error('Groq ไม่ได้ส่งผลสรุปกลับมา');
+          }
+
+          response = await api.post<SummaryEntry>(`/study-logs/${logId}/summaries`, {
+            content,
+            ai_model: documentSummary.model ?? null,
+            metadata: {
+              source: 'document',
+              file_id: documentFile.id,
+              file_name: documentFile.original_name,
+              text_length: documentSummary.text?.length ?? null,
+            },
+          });
+        } catch (fileError) {
+          if (isSupabaseStudyFilePath(documentFile.file_path)) {
+            throw fileError;
+          }
+          console.warn('browser document summary failed; trying backend file summary', fileError);
+          response = await api.post<SummaryEntry>(`/study-logs/${logId}/summaries`, {
+            file_id: documentFile.id,
+          });
+        }
+      } else {
+        response = await api.post<SummaryEntry>(`/study-logs/${logId}/summaries`);
+      }
+
+      const payload = (response.data as any)?.data ?? response.data;
+      setTodayLogs(prev =>
+        prev.map(log =>
+          log.id === logId ? { ...log, summaries: [payload, ...(log.summaries ?? [])] } : log
+        )
+      );
+      setFeedback(documentFile ? 'สร้างสรุปจากไฟล์แนบด้วย Groq เรียบร้อยแล้ว' : 'สร้างสรุปด้วย Groq เรียบร้อยแล้ว');
+    } catch (err: any) {
+      setFeedback(err?.response?.data?.message || err?.message || 'สร้างสรุปไม่สำเร็จ กรุณาตรวจสอบ Groq API key แล้วลองใหม่');
+    } finally {
+      setGeneratingSummaryId(null);
+    }
   };
 
   return (
@@ -470,13 +622,52 @@ export const StudyCapturePage = () => {
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="mb-1.5 block text-xs font-bold text-[color:var(--text)]">วันที่</label>
-                <input
-                  type="date"
-                  value={form.logDate}
-                  onChange={event => setForm(prev => ({ ...prev, logDate: event.target.value }))}
-                  className="w-full rounded-xl border px-4 py-3 text-sm text-[color:var(--text)] outline-none transition focus:border-sky-500"
-                  style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
-                />
+                <div className="relative">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    placeholder="dd/mm/yyyy"
+                    value={logDateDisplay}
+                    onChange={event => {
+                      const nextDisplay = event.target.value;
+                      setLogDateDisplay(nextDisplay);
+                      const normalized = normalizeDateInputValue(nextDisplay);
+                      if (normalized) {
+                        setForm(prev => ({ ...prev, logDate: normalized }));
+                      }
+                    }}
+                    className="w-full rounded-xl border px-4 py-3 pr-11 text-sm text-[color:var(--text)] outline-none transition focus:border-sky-500"
+                    style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const picker = datePickerRef.current;
+                      if (!picker) return;
+                      if (typeof (picker as any).showPicker === 'function') (picker as any).showPicker();
+                      else picker.click();
+                    }}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-sky-600"
+                    aria-label="เลือกวันที่"
+                    title="เลือกวันที่"
+                  >
+                    <Calendar size={16} />
+                  </button>
+                  <input
+                    ref={datePickerRef}
+                    type="date"
+                    value={form.logDate}
+                    onChange={event => {
+                      const normalized = normalizeDateInputValue(event.target.value);
+                      if (!normalized) return;
+                      setForm(prev => ({ ...prev, logDate: normalized }));
+                      setLogDateDisplay(formatDateDisplayValue(normalized));
+                    }}
+                    className="absolute inset-0 pointer-events-none opacity-0"
+                    tabIndex={-1}
+                    aria-hidden="true"
+                  />
+                </div>
               </div>
               <div>
                 <label className="mb-1.5 block text-xs font-bold text-[color:var(--text)]">เวลาเรียน (นาที)</label>
@@ -630,11 +821,18 @@ export const StudyCapturePage = () => {
               <div className="rounded-xl px-4 py-4 text-sm text-[color:var(--muted)]" style={{ background: 'var(--surface-2)' }}>กำลังโหลดข้อมูล...</div>
             ) : todayLogs.length > 0 ? (
               todayLogs.map(log => (
-                <button
+                <article
                   key={`${log.subjectName}-${log.id}`}
-                  type="button"
                   onClick={() => navigate(`/subjects/${log.subjectId}`, { state: { selectedLogId: log.id } })}
-                  className="w-full rounded-[1.35rem] border px-4 py-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-[color:var(--accent)]/30 hover:shadow-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent)]/35"
+                  onKeyDown={event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      navigate(`/subjects/${log.subjectId}`, { state: { selectedLogId: log.id } });
+                    }
+                  }}
+                  role="button"
+                  tabIndex={0}
+                  className="w-full cursor-pointer rounded-[1.35rem] border px-4 py-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-[color:var(--accent)]/30 hover:shadow-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent)]/35"
                   style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}
                 >
                   <div className="flex items-start justify-between gap-3">
@@ -648,11 +846,35 @@ export const StudyCapturePage = () => {
                     <span className="shrink-0 text-xs font-semibold text-[color:var(--muted)]">{Number(log.duration_minutes ?? 0)} นาที</span>
                   </div>
                   <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-[color:var(--muted)]">{log.note || 'ไม่มีรายละเอียดเพิ่มเติม'}</p>
+                  {log.summaries?.[0]?.content ? (
+                    <div
+                      className="mt-3 rounded-2xl border px-3 py-2 text-sm leading-6"
+                      style={{ borderColor: 'rgba(var(--accent-rgb),0.18)', background: 'rgba(var(--accent-rgb),0.06)', color: 'var(--text)' }}
+                    >
+                      <p className="mb-1 text-[10px] font-bold uppercase tracking-[0.14em]" style={{ color: 'var(--accent-ink)' }}>AI Summary</p>
+                      <p className="whitespace-pre-wrap">{log.summaries[0].content}</p>
+                    </div>
+                  ) : null}
                   <div className="mt-3 flex items-center justify-between gap-2 text-xs text-[color:var(--muted)]">
                     <span>{formatThaiDate(log.log_date)}</span>
-                    <span className="rounded-full px-2 py-1" style={{ background: 'var(--surface-2)' }}>{log.mood || 'ไม่ระบุความรู้สึก'}</span>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={event => {
+                          event.stopPropagation();
+                          void handleGenerateSummary(log.id);
+                        }}
+                        disabled={generatingSummaryId === log.id}
+                        className="inline-flex items-center gap-1 rounded-full px-3 py-1 font-bold transition disabled:cursor-not-allowed disabled:opacity-60"
+                        style={{ background: 'rgba(var(--accent-rgb),0.10)', color: 'var(--accent-ink)' }}
+                      >
+                        {generatingSummaryId === log.id ? <LoaderCircle size={13} className="animate-spin" /> : <Sparkles size={13} />}
+                        {generatingSummaryId === log.id ? 'กำลังสรุป...' : 'สรุป'}
+                      </button>
+                      <span className="rounded-full px-2 py-1" style={{ background: 'var(--surface-2)' }}>{log.mood || 'ไม่ระบุความรู้สึก'}</span>
+                    </div>
                   </div>
-                </button>
+                </article>
               ))
             ) : (
               <div

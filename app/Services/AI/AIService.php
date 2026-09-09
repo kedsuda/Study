@@ -12,11 +12,14 @@ use App\Models\StudyLog;
 use App\Models\Subject;
 use App\Models\Summary;
 use App\Models\User;
+use App\Models\Semester;
 use Carbon\Carbon;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use RuntimeException;
 use ZipArchive;
@@ -26,6 +29,19 @@ class AIService
 {
     private const ASSISTANT_TIMEZONE = 'Asia/Bangkok';
 
+    /**
+     * Set only after the current chat request has actually written a class event.
+     * The client uses this instead of trying to infer success from AI-generated text.
+     */
+    private bool $assistantScheduleUpdated = false;
+
+    /**
+     * Set after the current chat request creates or removes a subject.  This is
+     * separate from the calendar flag because an unscheduled subject can also
+     * be changed through the assistant.
+     */
+    private bool $assistantSubjectsUpdated = false;
+
     public function __construct(private readonly AIClientFactory $factory)
     {
     }
@@ -33,33 +49,52 @@ class AIService
     public function generateSummary(StudyLog $studyLog): Summary
     {
         $contextPieces = [
-            'Study Subject: '.$studyLog->subject->name,
-            'Study Title: '.$studyLog->title,
-            'Date: '.$studyLog->log_date?->toDateString(),
-            'Notes: '.$studyLog->note,
+            'วิชา: '.$studyLog->subject->name,
+            'หัวข้อที่เรียน: '.$studyLog->title,
+            'วันที่เรียน: '.$studyLog->log_date?->toDateString(),
+            'โน้ตผู้เรียน: '.$studyLog->note,
         ];
         $content = '';
         $metadata = [];
         $model = $this->summaryModel();
 
-        if ($this->useGemini()) {
-            $prompt = "You summarise study notes into concise learning summaries with highlights and action items.\n\n"
-                .implode("\n\n", array_filter($contextPieces));
-            $content = $this->callGemini($prompt);
-            $metadata['provider'] = 'gemini';
-        } else {
-            $client = $this->textClient();
-            $response = $client->chat()->create([
-                'model' => $model,
-                'messages' => [
-                    ['role' => 'system', 'content' => 'You summarise study notes into concise learning summaries with highlights and action items.'],
-                    ['role' => 'user', 'content' => implode("\n\n", array_filter($contextPieces))],
-                ],
-            ]);
+        $sourceText = implode("\n\n", array_filter($contextPieces));
+        $systemPrompt = 'คุณเป็นผู้ช่วยสรุปบันทึกการเรียนสำหรับนักศึกษาไทย '
+            .'สรุปเป็นภาษาไทย กระชับ อ่านง่าย มีหัวข้อสำคัญ สิ่งที่เข้าใจ และสิ่งที่ควรทบทวนถ้ามี '
+            .'ห้ามแต่งข้อมูลที่ไม่มีในบันทึก';
 
-            $content = trim($response->choices[0]->message->content ?? '');
-            $metadata['prompt_tokens'] = $response->usage->promptTokens ?? null;
-            $metadata['completion_tokens'] = $response->usage->completionTokens ?? null;
+        try {
+            if ($this->useGemini()) {
+                $prompt = $systemPrompt."\n\n"
+                    .$sourceText;
+                $content = $this->callGemini($prompt);
+                $metadata['provider'] = 'gemini';
+            } else {
+                $client = $this->textClient();
+                $response = $client->chat()->create([
+                    'model' => $model,
+                    'messages' => [
+                        ['role' => 'system', 'content' => $systemPrompt],
+                        ['role' => 'user', 'content' => $sourceText],
+                    ],
+                    'temperature' => 0.2,
+                    'max_tokens' => 700,
+                ]);
+
+                $content = trim($response->choices[0]->message->content ?? '');
+                $metadata['provider'] = $this->useGroq() ? 'groq' : 'openai';
+                $metadata['prompt_tokens'] = $response->usage->promptTokens ?? null;
+                $metadata['completion_tokens'] = $response->usage->completionTokens ?? null;
+            }
+        } catch (\Throwable $e) {
+            $content = $this->fallbackSummaryFromText($sourceText);
+            $metadata['fallback_mode'] = 'local-study-log-summary';
+            $metadata['error_message'] = $this->clipText($e->getMessage(), 240);
+        }
+
+        if (trim($content) === '') {
+            $content = $this->fallbackSummaryFromText($sourceText);
+            $metadata['fallback_mode'] = $metadata['fallback_mode'] ?? 'local-empty-summary';
         }
 
         return $studyLog->summaries()->create([
@@ -79,15 +114,19 @@ class AIService
         $difficulty = $preferences['difficulty'] ?? 'medium';
         $types = $preferences['question_types'] ?? ['multiple_choice'];
         $contextPayload = $this->quizSourceContext($subject);
+        if (($contextPayload['source'] ?? '') === 'subject') {
+            throw new RuntimeException('ยังไม่มีบันทึกการเรียน สรุป หรือไฟล์จริงในรายวิชานี้ กรุณาเพิ่มบันทึกหรืออัปโหลดเอกสารก่อนสร้างแบบฝึกหัด');
+        }
         $typeHint = implode(', ', $types);
         $typeMixHint = in_array('multiple_choice', $types, true) && in_array('short_answer', $types, true)
             ? 'Include a mix of multiple_choice and short_answer questions (at least 1 of each).'
             : 'Use only the allowed question types.';
         $thaiOutputRules = "All generated content must be in Thai language only.\n"
             ."Return Thai for title, description, question_text, options, correct_answer, and explanation.\n"
+            ."Write every question and answer as complete text; never shorten learner-facing text with an ellipsis (...).\n"
             ."Do not use English unless it is a necessary proper noun.";
         $prompt = sprintf(
-            "Generate a %s difficulty quiz for the subject \"%s\" with %d questions.\nAllowed question types: %s.\n%s\n%s\nUse ONLY the information from the study summaries below.\n\nSummaries:\n%s\n\nRespond in JSON with title, description, and questions (question_text, question_type, options, correct_answer, explanation). For multiple_choice questions, provide 4 options.",
+            "Generate a %s difficulty quiz for the subject \"%s\" with %d questions.\nAllowed question types: %s.\n%s\n%s\nUse ONLY the actual learner evidence below: study logs, learner notes, uploaded file names/text, and generated summaries from this user's saved work.\nDo not invent facts outside that evidence. If evidence is thin, ask simple questions that can be answered from the exact evidence shown.\n\nActual learner evidence:\n%s\n\nRespond in JSON with title, description, and questions (question_text, question_type, options, correct_answer, explanation). For multiple_choice questions, provide 4 options.",
             $difficulty,
             $subject->name,
             $questionCount,
@@ -130,10 +169,29 @@ class AIService
             );
         }
 
-        return $this->buildQuizPayload($decoded, $subject, $questionCount, $difficulty, $types, [
+        $payload = $this->buildQuizPayload($decoded, $subject, $questionCount, $difficulty, $types, [
             'source' => $contextPayload['source'],
             'summary_ids' => $contextPayload['summary_ids'],
+            'study_log_ids' => $contextPayload['study_log_ids'],
+            'file_ids' => $contextPayload['file_ids'],
         ]);
+
+        if (empty($payload['questions'])) {
+            return $this->generateLocalQuizFromText($subject, $contextPayload['context'], [
+                'question_count' => $questionCount,
+                'difficulty' => $difficulty,
+                'question_types' => $types,
+                'title' => $subject->name !== '' ? 'แบบฝึกหัด '.$subject->name : 'แบบฝึกหัด',
+            ], [
+                'source' => $contextPayload['source'],
+                'summary_ids' => $contextPayload['summary_ids'],
+                'study_log_ids' => $contextPayload['study_log_ids'],
+                'file_ids' => $contextPayload['file_ids'],
+                'fallback_mode' => 'empty-ai-questions',
+            ]);
+        }
+
+        return $payload;
     }
 
     /**
@@ -154,6 +212,7 @@ class AIService
             : 'Use only the allowed question types.';
         $thaiOutputRules = "All generated content must be in Thai language only.\n"
             ."Return Thai for title, description, question_text, options, correct_answer, and explanation.\n"
+            ."Write every question and answer as complete text; never shorten learner-facing text with an ellipsis (...).\n"
             ."Do not use English unless it is a necessary proper noun.";
         $titleLine = $titleHint !== '' ? "Use the title \"{$titleHint}\" if possible.\n" : '';
         $prompt = sprintf(
@@ -208,11 +267,26 @@ class AIService
             $decoded['title'] = $titleHint;
         }
 
-        return $this->buildQuizPayload($decoded, $subject, $questionCount, $difficulty, $types, [
+        $payload = $this->buildQuizPayload($decoded, $subject, $questionCount, $difficulty, $types, [
             'source' => 'document',
             'fallback_mode' => $usedTextFallback ? 'document-best-effort' : null,
             'fallback_message' => $usedTextFallback ? 'สร้างแบบฝึกหัดจากข้อความจริงในเอกสารเรียบร้อยแล้ว' : null,
         ]);
+
+        if (empty($payload['questions'])) {
+            return $this->generateLocalQuizFromText($subject, $text, [
+                'question_count' => $questionCount,
+                'difficulty' => $difficulty,
+                'question_types' => $types,
+                'title' => $titleHint !== '' ? $titleHint : ($subject->name !== '' ? 'แบบฝึกหัด '.$subject->name : 'แบบฝึกหัดจากเอกสาร'),
+            ], [
+                'source' => 'document',
+                'fallback_mode' => 'empty-ai-questions',
+                'fallback_message' => 'สร้างแบบฝึกหัดจากข้อความจริงในเอกสารเรียบร้อยแล้ว',
+            ]);
+        }
+
+        return $payload;
     }
 
     /**
@@ -285,6 +359,52 @@ class AIService
     }
 
     /**
+     * @param  array<string,mixed>  $preferences
+     * @param  array<string,mixed>  $metadata
+     * @return array<string,mixed>
+     */
+    public function generateLocalQuizFromText(Subject $subject, string $text, array $preferences = [], array $metadata = []): array
+    {
+        $questionCount = (int) ($preferences['question_count'] ?? 5);
+        $questionCount = max(3, min(50, $questionCount));
+
+        $difficulty = (string) ($preferences['difficulty'] ?? 'medium');
+        if (! in_array($difficulty, ['easy', 'medium', 'hard'], true)) {
+            $difficulty = 'medium';
+        }
+
+        $types = $preferences['question_types'] ?? ['multiple_choice'];
+        $types = is_array($types) ? $types : ['multiple_choice'];
+        $types = array_values(array_filter(
+            array_map(static fn ($type) => (string) $type, $types),
+            static fn (string $type) => in_array($type, ['multiple_choice', 'true_false', 'short_answer'], true)
+        ));
+        if ($types === []) {
+            $types = ['multiple_choice'];
+        }
+
+        $title = trim((string) ($preferences['title'] ?? ''));
+        if ($title === '') {
+            $title = $subject->name !== '' ? 'แบบฝึกหัด '.$subject->name : 'แบบฝึกหัดจากเอกสาร';
+        }
+
+        $sourceText = trim($this->normalizeToUtf8($text));
+        if ($sourceText === '') {
+            $sourceText = trim(implode("\n", array_filter([
+                $subject->name ? 'วิชา: '.$subject->name : null,
+                $subject->description ? 'รายละเอียด: '.$subject->description : null,
+                'ทบทวนแนวคิดหลัก ประเด็นสำคัญ และคำศัพท์ที่เกี่ยวข้องกับวิชานี้',
+            ])));
+        }
+
+        $decoded = $this->fallbackQuizFromText($sourceText, $questionCount, $types, $title);
+
+        return $this->buildQuizPayload($decoded, $subject, $questionCount, $difficulty, $types, array_merge([
+            'source' => 'local_fallback',
+        ], $metadata));
+    }
+
+    /**
      * @return array{mindmap:string,model:string}
      */
     public function generateMindMapFromText(string $text): array
@@ -331,8 +451,10 @@ class AIService
             return [];
         }
 
+        // The controller sends aggregate scores for every completed exercise in
+        // each subject, keeping the evidence complete but compact.
         $lines = collect($subjects)->map(function (array $subject) {
-            $name = $subject['name'] ?? 'Subject';
+            $name = $this->clipText((string) ($subject['name'] ?? 'Subject'), 80);
             $latestQuizScore = $subject['latest_quiz_score'] ?? null;
             $avgQuizScore = $subject['avg_quiz_score'] ?? null;
             $quizAttemptCount = $subject['quiz_attempt_count'] ?? 0;
@@ -363,8 +485,8 @@ class AIService
         $latestQuizSection = '';
         if (! empty($context['latest_quiz']) && is_array($context['latest_quiz'])) {
             $latestQuizSection = "ผลข้อสอบล่าสุดของผู้ใช้:\n"
-                ."- วิชา: ".($context['latest_quiz']['subject_name'] ?? '-')."\n"
-                ."- ชื่อแบบฝึกหัด: ".($context['latest_quiz']['quiz_title'] ?? '-')."\n"
+                ."- วิชา: ".$this->clipText((string) ($context['latest_quiz']['subject_name'] ?? '-'), 80)."\n"
+                ."- ชื่อแบบฝึกหัด: ".$this->clipText((string) ($context['latest_quiz']['quiz_title'] ?? '-'), 120)."\n"
                 ."- คะแนน: ".($context['latest_quiz']['score'] ?? '-')."/".($context['latest_quiz']['total'] ?? '-')." (".($context['latest_quiz']['percentage'] ?? '-')."%)\n";
         }
 
@@ -374,7 +496,10 @@ class AIService
                 ->take(3)
                 ->map(function (array $subject) {
                     $name = $subject['subject_name'] ?? 'Subject';
-                    $hint = $subject['hint'] ?? '';
+                    // Keep this compact. The previous version could include a long
+                    // free-form hint and, together with question explanations below,
+                    // exceed Groq's tokens-per-minute allowance.
+                    $hint = $this->clipText((string) ($subject['hint'] ?? ''), 140);
                     return "- {$name}: {$hint}";
                 })
                 ->implode("\n");
@@ -387,65 +512,96 @@ class AIService
         if (! empty($context['latest_quiz_analysis']) && is_array($context['latest_quiz_analysis'])) {
             $weakPoints = $context['latest_quiz_analysis']['weak_points'] ?? [];
             $weakPointText = is_array($weakPoints) && $weakPoints !== []
-                ? implode(' | ', array_slice(array_map(fn ($v) => (string) $v, $weakPoints), 0, 6))
+                ? implode(' | ', array_slice(array_map(fn ($v) => $this->clipText((string) $v, 90), $weakPoints), 0, 3))
                 : 'ไม่พบจุดอ่อนที่สรุปได้ชัดเจน';
             $latestQuizAnalysisSection = "วิเคราะห์จากแบบฝึกหัดล่าสุด:\n"
                 ."- สถานะ: ".($context['latest_quiz_analysis']['performance'] ?? '-')."\n"
                 ."- ประเด็นที่ควรพัฒนา: {$weakPointText}\n";
         }
 
-        $prompt = "หลักฐานผลแบบฝึกหัดจริง แยกตามรายวิชา (เรียงจากผลงานดีที่สุด):\n{$lines}\n\n"
+        $prompt = "หลักฐานผลแบบฝึกหัดจริงทั้งหมดที่ผู้ใช้ทำเสร็จ แยกตามรายวิชา:\n{$lines}\n\n"
             .$latestQuizSection
             .$latestQuizAnalysisSection
             .$weakSubjectsSection
-            ."ช่วยแนะนำเส้นทางอาชีพที่เหมาะสมไม่เกิน 3 รายการ โดยใช้เฉพาะผลคะแนนจากการทำข้อสอบจริงเป็นหลัก: คะแนนเฉลี่ย คะแนนล่าสุด คะแนนสูงสุด อัตราผ่าน และจำนวนครั้งที่ทำ "
-            ."ห้ามใช้ข้อมูลสรุปบทเรียน ชั่วโมงเรียน หรือการคาดเดาทั่วไปมาแทนหลักฐานจากคะแนนข้อสอบ "
-            ."ให้ระบุทักษะที่ควรพัฒนาเพิ่มเติมแบบเฉพาะเจาะจง และเหตุผลสั้น ๆ\n\n"
+            ."ช่วยวิเคราะห์ว่าแนวความสามารถของผู้ใช้นี้เหมาะกับสายอาชีพใด และแนะนำเส้นทางอาชีพที่เหมาะสมไม่เกิน 3 รายการ "
+            ."ให้พิจารณาผลแบบฝึกหัดทั้งหมดร่วมกัน: คะแนนเฉลี่ย คะแนนล่าสุด คะแนนสูงสุด อัตราผ่าน และจำนวนครั้งที่ทำ เพื่อดูทั้งความสามารถและความสม่ำเสมอ "
+            ."ห้ามใช้ข้อมูลสรุปบทเรียน ชั่วโมงเรียน หรือการคาดเดาทั่วไปมาแทนหลักฐานจากผลแบบฝึกหัด "
+            ."ให้ระบุทักษะที่ควรพัฒนาเพิ่มเติมแบบเฉพาะเจาะจง และเหตุผลสั้น ๆ ไม่เกิน 1 ประโยค\n\n"
             ."ห้ามอ้างรายวิชา ความถนัด ประสบการณ์ หรืออาชีพจากข้อมูลที่ไม่มีในหลักฐานด้านบน "
             ."subjects ของทุกคำแนะนำต้องเป็นชื่อวิชาที่ปรากฏในหลักฐานเท่านั้น "
-            ."ถ้าหลักฐานไม่พอหรือคะแนนยังไม่ชี้ความถนัดอย่างน่าเชื่อถือ ให้คืน recommendations เป็น [] และห้ามเดา "
-            ."ถ้าคะแนนล่าสุดยังไม่สูง ให้สะท้อนเป็นทักษะที่ควรพัฒนา ไม่ใช่กล่าวว่าผู้ใช้ถนัดวิชานั้น\n\n"
+            ."ถ้ามีผลแบบฝึกหัดอย่างน้อย 1 ชุด ให้แนะนำเส้นทางแบบสำรวจอาชีพได้ โดยลด score ตามจำนวนแบบฝึกหัดและความสม่ำเสมอของคะแนน "
+            ."หากหลักฐานยังน้อยหรือคะแนนยังไม่สูง ให้ระบุว่าเป็นเส้นทางที่ควรลองพัฒนา ไม่ใช่กล่าวว่าผู้ใช้ถนัดแล้ว "
+            ."คืน recommendations เป็น [] เฉพาะกรณีไม่มีวิชา หรือไม่มีคะแนนแบบฝึกหัดจริงเลยเท่านั้น\n\n"
             ."ตอบกลับเป็น JSON เท่านั้นในรูปแบบ:\n{\n  \"recommendations\": [\n    {\n      \"career\": \"ชื่ออาชีพ\",\n      \"skills\": \"ทักษะที่ควรพัฒนา (คั่นด้วยจุลภาค)\",\n      \"subjects\": \"รายวิชาที่เกี่ยวข้อง (คั่นด้วยจุลภาค)\",\n      \"score\": 0-100,\n      \"reason\": \"เหตุผลสั้น ๆ\"\n    }\n  ]\n}\n\nกำหนด score เป็นตัวเลข 0-100 และให้ไม่เกิน 3 รายการ ถ้าข้อมูลไม่พอให้คืน recommendations เป็น []";
 
         $careerProvider = $this->careerProvider();
 
-        if ($careerProvider === 'groq') {
-            if (! $this->hasGroqKey()) {
-                throw new RuntimeException('ยังไม่ได้ตั้งค่า GROQ_API_KEY สำหรับวิเคราะห์อาชีพ');
+        try {
+            if ($careerProvider === 'groq') {
+                if (! $this->hasGroqKey()) {
+                    throw new RuntimeException('ยังไม่ได้ตั้งค่า GROQ_API_KEY สำหรับวิเคราะห์อาชีพ');
+                }
+
+                $content = $this->callGroqCareerRecommendations($prompt);
+            } elseif (in_array($careerProvider, ['gemini', 'google'], true)) {
+                if (! $this->hasGeminiKey()) {
+                    throw new RuntimeException('ยังไม่ได้ตั้งค่า GEMINI_API_KEY สำหรับวิเคราะห์อาชีพ');
+                }
+
+                $content = $this->callGeminiCareerRecommendations($prompt);
+            } elseif ($this->hasGroqKey()) {
+                // Prefer Groq for career analysis whenever GROQ_API_KEY exists.
+                $content = $this->callGroqCareerRecommendations($prompt);
+            } elseif ($this->hasGeminiKey()) {
+                $content = $this->callGeminiCareerRecommendations($prompt);
+            } else {
+                $client = $this->textClient();
+                $response = $client->chat()->create([
+                    'model' => $this->summaryModel(),
+                    'messages' => [
+                        [
+                            'role' => 'system',
+                            'content' => 'You are a career advisor. Provide concise, practical recommendations in Thai.',
+                        ],
+                        [
+                            'role' => 'user',
+                            'content' => $prompt,
+                        ],
+                    ],
+                    'response_format' => ['type' => 'json_object'],
+                ]);
+                $content = $response->choices[0]->message->content ?? '{}';
             }
 
-            $content = $this->callGroqCareerRecommendations($prompt);
-        } elseif (in_array($careerProvider, ['gemini', 'google'], true)) {
-            if (! $this->hasGeminiKey()) {
-                throw new RuntimeException('ยังไม่ได้ตั้งค่า GEMINI_API_KEY สำหรับวิเคราะห์อาชีพ');
-            }
+            try {
+                $decoded = $this->decodeJsonPayload($content, 'career');
+            } catch (\Throwable $jsonError) {
+                // gpt-oss can occasionally add prose around its answer when JSON mode
+                // falls back to normal chat. Ask once more with a deliberately small,
+                // fixed contract before treating the analysis as unavailable.
+                if (! $this->shouldUseGroqForCareerRequest($careerProvider)) {
+                    throw $jsonError;
+                }
 
-            $content = $this->callGeminiCareerRecommendations($prompt);
-        } elseif ($this->hasGroqKey()) {
-            // Prefer Groq for career analysis whenever GROQ_API_KEY exists.
-            $content = $this->callGroqCareerRecommendations($prompt);
-        } elseif ($this->hasGeminiKey()) {
-            $content = $this->callGeminiCareerRecommendations($prompt);
-        } else {
-            $client = $this->textClient();
-            $response = $client->chat()->create([
-                'model' => $this->summaryModel(),
-                'messages' => [
-                    [
-                        'role' => 'system',
-                        'content' => 'You are a career advisor. Provide concise, practical recommendations in Thai.',
-                    ],
-                    [
-                        'role' => 'user',
-                        'content' => $prompt,
-                    ],
-                ],
-                'response_format' => ['type' => 'json_object'],
-            ]);
-            $content = $response->choices[0]->message->content ?? '{}';
+                $content = $this->callGroqCareerRecommendations(
+                    $prompt."\n\nผลลัพธ์ก่อนหน้าอ่านเป็น JSON ไม่ได้ กรุณาตอบใหม่เป็น JSON object ที่ถูกต้องเท่านั้น "
+                    .'โดยมี key recommendations และค่าเป็น array ห้ามใช้ Markdown, code fence หรือข้อความอธิบายใด ๆ'
+                );
+                $decoded = $this->decodeJsonPayload($content, 'career');
+            }
+            if ($this->shouldUseGroqForCareerRequest($careerProvider) && empty($decoded['recommendations'])) {
+                $content = $this->callGroqCareerRecommendations(
+                    $prompt."\n\nมีผลแบบฝึกหัดจริงแล้ว ห้ามคืน recommendations เป็น [] "
+                    ."ให้วิเคราะห์จากหลักฐานทั้งหมดที่ให้มาและคืนคำแนะนำ 1-3 รายการเป็น JSON เท่านั้น"
+                );
+                $decoded = $this->decodeJsonPayload($content, 'career');
+            }
+        } catch (\Throwable $e) {
+            throw new RuntimeException(
+                'AI วิเคราะห์อาชีพจากผลแบบฝึกหัดไม่สำเร็จ: '.$this->clipText($e->getMessage(), 180),
+                previous: $e
+            );
         }
-
-        $decoded = $this->decodeJsonPayload($content, 'career');
         $items = $decoded['recommendations'] ?? [];
 
         if (! is_array($items)) {
@@ -458,7 +614,9 @@ class AIService
             ->map(fn ($name) => trim((string) $name))
             ->values();
 
-        $out = collect($items)->map(function (array $item) use ($allowedSubjects) {
+        $defaultSubject = $allowedSubjects->first();
+
+        $out = collect($items)->map(function (array $item) use ($allowedSubjects, $defaultSubject) {
             $career = trim((string) ($item['career'] ?? ''));
             $skills = $item['skills'] ?? '';
             $subjects = $item['subjects'] ?? '';
@@ -471,10 +629,23 @@ class AIService
                 $subjects = implode(', ', array_filter(array_map('trim', $subjects)));
             }
 
-            $matchedSubjects = collect(preg_split('/[,|]+/u', (string) $subjects) ?: [])
+            $subjectText = trim((string) $subjects);
+            $matchedSubjects = collect(preg_split('/[,|]+/u', $subjectText) ?: [])
                 ->map(fn ($name) => trim($name))
-                ->filter(fn ($name) => $name !== '' && $allowedSubjects->contains($name))
+                ->filter(fn ($name) => $name !== '')
+                ->map(fn ($name) => $this->matchAllowedCareerSubject($name, $allowedSubjects))
+                ->filter()
                 ->values();
+
+            if ($matchedSubjects->isEmpty() && $subjectText !== '') {
+                $matchedSubjects = $allowedSubjects
+                    ->filter(fn ($name) => $this->careerSubjectTextMatches($subjectText, (string) $name))
+                    ->values();
+            }
+
+            if ($matchedSubjects->isEmpty() && $defaultSubject) {
+                $matchedSubjects = collect([$defaultSubject]);
+            }
 
             if ($career === '' || $matchedSubjects->isEmpty() || $reason === '') {
                 return null;
@@ -492,13 +663,44 @@ class AIService
             ];
         })->filter()->take(3)->values()->all();
 
-        // No mockup / no deterministic fallback.
-        // If AI does not return valid recommendations from real quiz scores, return an empty result.
         if (empty($out)) {
+            if ($this->shouldUseGroqForCareerRequest($careerProvider)) {
+                throw new RuntimeException('AI ไม่ได้ส่งผลวิเคราะห์ที่ใช้ได้จากผลแบบฝึกหัด');
+            }
+
             return [];
         }
 
         return $out;
+    }
+
+    private function shouldUseGroqForCareerRequest(string $careerProvider): bool
+    {
+        return $careerProvider === 'groq' || ($careerProvider === '' && $this->hasGroqKey());
+    }
+
+    private function matchAllowedCareerSubject(string $subject, Collection $allowedSubjects): ?string
+    {
+        foreach ($allowedSubjects as $allowedSubject) {
+            $allowed = trim((string) $allowedSubject);
+            if ($allowed !== '' && $this->careerSubjectTextMatches($subject, $allowed)) {
+                return $allowed;
+            }
+        }
+
+        return null;
+    }
+
+    private function careerSubjectTextMatches(string $text, string $subject): bool
+    {
+        $left = Str::lower(trim($text));
+        $right = Str::lower(trim($subject));
+
+        if ($left === '' || $right === '') {
+            return false;
+        }
+
+        return $left === $right || Str::contains($left, $right) || Str::contains($right, $left);
     }
 
     private function careerProvider(): string
@@ -532,7 +734,7 @@ class AIService
     private function callGroqCareerRecommendations(string $prompt): string
     {
         $client = $this->factory->groq();
-        $response = $client->chat()->create([
+        $payload = [
             'model' => $this->groqModel(),
             'messages' => [
                 [
@@ -544,7 +746,73 @@ class AIService
                     'content' => $prompt."\n\nสำคัญ: ตอบเป็น JSON object เท่านั้น ห้ามมีข้อความอื่นก่อนหรือหลัง JSON",
                 ],
             ],
-        ]);
+            // JSON schema is more reliable than JSON mode for reasoning models: it
+            // prevents Markdown/prose and guarantees the fields the UI persists.
+            'response_format' => [
+                'type' => 'json_schema',
+                'json_schema' => [
+                    'name' => 'career_recommendations',
+                    'strict' => true,
+                    'schema' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'recommendations' => [
+                                'type' => 'array',
+                                'maxItems' => 3,
+                                'items' => [
+                                    'type' => 'object',
+                                    'properties' => [
+                                        'career' => ['type' => 'string'],
+                                        'skills' => ['type' => 'string'],
+                                        'subjects' => ['type' => 'string'],
+                                        'score' => ['type' => 'number'],
+                                        'reason' => ['type' => 'string'],
+                                    ],
+                                    'required' => ['career', 'skills', 'subjects', 'score', 'reason'],
+                                    'additionalProperties' => false,
+                                ],
+                            ],
+                        ],
+                        'required' => ['recommendations'],
+                        'additionalProperties' => false,
+                    ],
+                ],
+            ],
+            // GPT-OSS otherwise spends a sizeable portion of the request budget
+            // on reasoning even though this is a short extraction task.
+            'reasoning_effort' => 'low',
+            'temperature' => 0.2,
+            // A short, structured career recommendation needs very few output
+            // tokens. Reserving 900 tokens made a normal request exceed the 8k
+            // TPM allowance when the latest quiz contained detailed explanations.
+            'max_tokens' => 420,
+        ];
+
+        try {
+            $response = $client->chat()->create($payload);
+        } catch (\Throwable $e) {
+            // Strict structured output can occasionally fail its constrained
+            // decoding. Keep JSON mode on for the retry: removing response_format
+            // caused prose/Markdown to reach decodeJsonPayload and made the whole
+            // career analysis fail.
+            $jsonModeError = Str::contains(Str::lower($e->getMessage()), [
+                'response_format',
+                'json_object',
+                'json_schema',
+                'json mode',
+                'failed to generate json',
+                'failed to validate json',
+                'failed_generation',
+            ]);
+
+            if (! $jsonModeError) {
+                throw $e;
+            }
+
+            $payload['response_format'] = ['type' => 'json_object'];
+            $payload['messages'][0]['content'] = 'You are a career advisor. Provide concise, practical recommendations in Thai. Return one valid JSON object only. Do not use Markdown or code fences.';
+            $response = $client->chat()->create($payload);
+        }
 
         return $response->choices[0]->message->content ?? '{}';
     }
@@ -554,6 +822,8 @@ class AIService
      */
     public function chatWithAssistant(User $user, string $message, array $history = [], ?string $tool = null): string
     {
+        $this->assistantScheduleUpdated = false;
+        $this->assistantSubjectsUpdated = false;
         $cleanMessage = trim($message);
         if ($cleanMessage === '') {
             throw new RuntimeException('Message cannot be empty.');
@@ -566,16 +836,18 @@ class AIService
 
         $toolLabel = trim((string) $tool);
         $assistantContext = $this->buildAssistantContext($user);
-        $systemPrompt = "You are Smart Room, a Thai study assistant for university students.\n"
+        $systemPrompt = "You are Smart Room, a helpful general-purpose AI assistant for university students.\n"
             ."Respond in Thai unless the user explicitly asks for another language.\n"
             ."Adopt a polite female persona when replying in Thai and naturally end sentences with 'ค่ะ' where appropriate.\n"
             ."Answer the latest user message directly and stay on topic.\n"
             ."Be concise, practical, and friendly.\n"
-            ."Help with study planning, summaries, homework guidance, revision, and learning motivation.\n"
+            ."You can answer general questions across topics, including study, technology, daily life, writing, translation, planning, and explanations.\n"
+            ."For current events, prices, laws, medical, legal, or financial decisions, say when the information may need verification from up-to-date sources.\n"
+            ."Help with study planning, summaries, homework guidance, revision, and learning motivation when the user asks for it.\n"
             ."If the user asks to record or remember something, acknowledge it clearly.\n"
-            ."You may use the provided current date/time and study database context as factual context for the reply.\n"
+            ."You may use the provided current date/time and study database context as factual context for replies about this user's learning data.\n"
             ."Treat the provided current date/time as Thailand local time (UTC+7). Do not convert it to UTC unless the user explicitly asks.\n"
-            ."Do not invent data beyond the provided context.\n"
+            ."Do not invent this user's personal study data beyond the provided context, but answer general knowledge questions normally.\n"
             ."Current user: {$user->name} ({$user->email}).\n"
             ."{$assistantContext}";
 
@@ -613,7 +885,16 @@ class AIService
                     'model' => $this->assistantModel(),
                     'messages' => $messages,
                     'temperature' => 0.4,
-                    'max_tokens' => 700,
+                    'max_tokens' => 1200,
+                ]);
+
+                $reply = trim((string) ($response->choices[0]->message->content ?? ''));
+            } elseif ($this->hasOpenAIKey()) {
+                $response = $this->factory->openAI()->chat()->create([
+                    'model' => $this->openAISummaryModel(),
+                    'messages' => $messages,
+                    'temperature' => 0.4,
+                    'max_tokens' => 1200,
                 ]);
 
                 $reply = trim((string) ($response->choices[0]->message->content ?? ''));
@@ -638,7 +919,7 @@ class AIService
         } catch (\Throwable $e) {
             report($e);
 
-            if ($reply === '' && ! $this->useGroq() && $this->hasGeminiKey()) {
+            if ($reply === '' && $this->hasGeminiKey()) {
                 try {
                     $historyText = collect($history)
                         ->take(-12)
@@ -656,6 +937,21 @@ class AIService
                         ."\n\nLatest user message:\n{$cleanMessage}\n\nReply with only the assistant response text.";
 
                     $reply = trim($this->callGemini($prompt));
+                } catch (\Throwable $fallbackException) {
+                    report($fallbackException);
+                }
+            }
+
+            if ($reply === '' && $this->hasOpenAIKey()) {
+                try {
+                    $response = $this->factory->openAI()->chat()->create([
+                        'model' => $this->openAISummaryModel(),
+                        'messages' => $messages,
+                        'temperature' => 0.4,
+                        'max_tokens' => 1200,
+                    ]);
+
+                    $reply = trim((string) ($response->choices[0]->message->content ?? ''));
                 } catch (\Throwable $fallbackException) {
                     report($fallbackException);
                 }
@@ -715,12 +1011,18 @@ class AIService
 
     private function handleAssistantActionCommand(User $user, string $message): ?string
     {
-        if (preg_match('/เพิ่มวิชา(?:เรียน)?/u', $message)) {
+        if ($this->isAssistantDeleteSubjectCommand($message)) {
+            return $this->handleDeleteSubjectCommand($user, $message);
+        }
+
+        if ($this->isAssistantCreateScheduleCommand($message)) {
             return $this->handleCreateSubjectCommand($user, $message);
         }
 
-        if (preg_match('/ลบวิชา/u', $message)) {
-            return $this->handleDeleteSubjectCommand($user, $message);
+        // Do not let the general AI invent a successful timetable update for a
+        // schedule-like request that our deterministic parser cannot save.
+        if ($this->isAssistantScheduleRequest($message)) {
+            return $this->assistantCreateSubjectFormatText();
         }
 
         if (preg_match('/(?:ตาราง|schedule).*(?:วันนี้|today)/iu', $message)) {
@@ -735,7 +1037,11 @@ class AIService
             return $this->handleListSubjectsCommand($user);
         }
 
-        if (preg_match('/(?:คำสั่ง|ช่วยเหลือ|help)/iu', $message)) {
+        if (preg_match('/(?:วิชา.*เทอม|เทอม.*วิชา|ภาคเรียน.*วิชา|วิชา.*ภาคเรียน)/iu', $message)) {
+            return $this->handleListSubjectsWithSemesterCommand($user);
+        }
+
+        if (preg_match('/(?:คำสั่ง(?:ที่ใช้ได้|ทั้งหมด)?|ช่วยเหลือการใช้งาน|help|commands)/iu', $message)) {
             return $this->assistantCommandHelpText();
         }
 
@@ -744,125 +1050,336 @@ class AIService
 
     private function handleCreateSubjectCommand(User $user, string $message): string
     {
-        $parsed = $this->parseCreateSubjectCommand($message);
-        if (($parsed['ok'] ?? false) !== true) {
-            return 'ได้ค่ะ หากต้องการเพิ่มวิชาผ่านแชต กรุณาพิมพ์รูปแบบนี้: เพิ่มวิชา [ชื่อวิชา] วัน[วันเรียน] [เวลาเริ่ม]-[เวลาเลิก] ห้อง [ห้องเรียน] เช่น เพิ่มวิชา คณิต วันจันทร์ 09:00-12:00 ห้อง 102 ค่ะ';
+        // Do not persist the literal UI template as an unscheduled subject.
+        // A valid timetable command must have its bracketed fields replaced.
+        if (preg_match('/\[[^\]\r\n]+\]/u', $message)) {
+            return "กรุณากรอกข้อมูลในวงเล็บ [ ] ให้ครบก่อนค่ะ\n"
+                ."ตัวอย่าง: เพิ่มวิชา คณิต วันจันทร์ วันที่ 26/08/2569 09:00-12:00 ห้อง 102 ภาคเรียนที่ 1 ปีการศึกษา 2569";
         }
 
-        $subjectName = (string) $parsed['subject_name'];
-        $dayLabel = (string) $parsed['day_label'];
-        $dayIndex = (int) $parsed['day_index'];
-        $startTime = (string) $parsed['start_time'];
-        $endTime = (string) $parsed['end_time'];
-        $room = (string) ($parsed['room'] ?? '');
-
-        $tz = self::ASSISTANT_TIMEZONE;
-        $nextDate = $this->nextDateForDayIndex($dayIndex, $tz);
-        $startAt = Carbon::parse($nextDate->format('Y-m-d').' '.$startTime, $tz);
-        $endAt = Carbon::parse($nextDate->format('Y-m-d').' '.$endTime, $tz);
-
-        if ($endAt->lessThanOrEqualTo($startAt)) {
-            return 'เวลาเลิกต้องมากกว่าเวลาเริ่มค่ะ กรุณาระบุใหม่ เช่น 09:00-12:00 ค่ะ';
+        $items = $this->parseCreateSubjectCommands($message);
+        if ($items === []) {
+            return $this->assistantCreateSubjectFormatText();
         }
 
-        try {
-            DB::transaction(function () use ($user, $subjectName, $room, $nextDate, $startTime, $endTime, $dayLabel, $startAt, $endAt) {
-                $subjectPayload = [
-                    'user_id' => $user->id,
-                    'name' => $subjectName,
-                    'description' => '-',
-                    'color' => '#2563eb',
-                    'start_date' => $nextDate->format('Y-m-d'),
-                    'start_time' => $startTime,
-                    'end_time' => $endTime,
-                ];
-                if ($room !== '' && $this->hasColumnSafe('subjects', 'room')) {
-                    $subjectPayload['room'] = $room;
+        $created = [];
+        $failed = [];
+        $warnings = [];
+        $createdCalendarEvent = false;
+
+        foreach ($items as $parsed) {
+            $subjectName = (string) $parsed['subject_name'];
+            $dayLabel = isset($parsed['day_label']) ? (string) $parsed['day_label'] : '';
+            $dayIndex = isset($parsed['day_index']) ? (int) $parsed['day_index'] : null;
+            $startTime = isset($parsed['start_time']) ? (string) $parsed['start_time'] : null;
+            $endTime = isset($parsed['end_time']) ? (string) $parsed['end_time'] : null;
+            $room = (string) ($parsed['room'] ?? '');
+            $semesterNumber = $parsed['semester'] ?? null;
+            $academicYear = $parsed['academic_year'] ?? null;
+            $hasSchedule = $dayIndex !== null && $startTime !== null && $endTime !== null;
+
+            $tz = self::ASSISTANT_TIMEZONE;
+            $classDate = $parsed['date'] instanceof Carbon
+                ? $parsed['date']->copy()->timezone($tz)
+                : ($hasSchedule ? $this->nextDateForDayIndex($dayIndex, $tz) : null);
+            $startAt = $hasSchedule && $classDate
+                ? Carbon::parse($classDate->format('Y-m-d').' '.$startTime, $tz)
+                : null;
+            $endAt = $hasSchedule && $classDate
+                ? Carbon::parse($classDate->format('Y-m-d').' '.$endTime, $tz)
+                : null;
+
+            if ($hasSchedule && $startAt && $endAt && $endAt->lessThanOrEqualTo($startAt)) {
+                $failed[] = "{$subjectName}: เวลาเลิกต้องมากกว่าเวลาเริ่ม";
+                continue;
+            }
+
+            try {
+                $semesterId = $this->resolveAssistantSemesterId($semesterNumber, $academicYear);
+                $subject = $this->findAssistantDuplicateSubject($user->id, $subjectName, $semesterId);
+
+                // A "เพิ่มวิชา" command must never silently reuse an existing
+                // subject just because a timetable was included.  Reusing it
+                // here used to create duplicate schedule and calendar rows,
+                // while the chat reply misleadingly said that a new subject
+                // had been added.
+                if ($subject) {
+                    $failed[] = "{$subjectName}: วิชาซ้ำในภาคเรียนนี้ กรุณาใช้ชื่อวิชาอื่นหรือแก้ไขวิชาเดิม";
+                    continue;
                 }
 
-                $subject = Subject::withoutGlobalScopes()->create($subjectPayload);
+                if ($hasSchedule) {
+                    $conflict = $this->findAssistantScheduleConflict($user->id, $dayIndex, $startTime, $endTime, null, $classDate);
+                    if ($conflict) {
+                        $conflictTime = $this->formatAssistantSubjectTimeRange($conflict);
+                        $conflictText = $conflictTime !== '' ? " เวลา {$conflictTime}" : '';
+                        // A timetable may intentionally contain overlapping
+                        // classes (for example, alternative sections).  Keep
+                        // the conflict visible to the student, but do not turn
+                        // a valid "เพิ่มวิชา" command into a failed save.
+                        $warnings[] = "{$subjectName}: เวลาทับซ้อนกับวิชา {$conflict->name}{$conflictText}";
+                    }
+                }
 
-                $schedulePayload = [
-                    'user_id' => $user->id,
-                    'subject_id' => $subject->id,
-                    'day_of_week' => $dayLabel,
-                    'start_time' => $startAt,
-                    'end_time' => $endAt,
-                    'schedule_type' => 'class',
-                ];
-                if ($room !== '' && $this->hasColumnSafe('schedules', 'room')) {
-                    $schedulePayload['room'] = $room;
-                }
-                Schedule::withoutGlobalScopes()->create($schedulePayload);
+                $subject = DB::transaction(function () use ($user, $subjectName, $room, $classDate, $startTime, $endTime, $semesterId, $hasSchedule) {
+                    $subjectStartDate = $hasSchedule && $classDate
+                        ? $this->normalizeAssistantDateForColumn(
+                            $classDate->format('Y-m-d'),
+                            $this->getAssistantColumnType('subjects', 'start_date')
+                        )
+                        : null;
+                    $subjectPayload = [
+                        'user_id' => $user->id,
+                        'name' => $subjectName,
+                        'description' => '-',
+                        'color' => '#2563eb',
+                    ];
+                    if ($this->hasColumnSafe('subjects', 'start_date')) {
+                        $subjectPayload['start_date'] = $subjectStartDate;
+                    }
+                    if ($this->hasColumnSafe('subjects', 'start_time')) {
+                        $subjectPayload['start_time'] = $this->normalizeAssistantTimeForColumn(
+                            $startTime,
+                            $this->getAssistantColumnType('subjects', 'start_time'),
+                            $subjectStartDate
+                        );
+                    }
+                    if ($this->hasColumnSafe('subjects', 'end_time')) {
+                        $subjectPayload['end_time'] = $this->normalizeAssistantTimeForColumn(
+                            $endTime,
+                            $this->getAssistantColumnType('subjects', 'end_time'),
+                            $subjectStartDate
+                        );
+                    }
+                    if ($semesterId !== null && $this->hasColumnSafe('subjects', 'semester_id')) {
+                        $subjectPayload['semester_id'] = $semesterId;
+                    }
+                    if ($room !== '' && $this->hasColumnSafe('subjects', 'room')) {
+                        $subjectPayload['room'] = $room;
+                    }
 
-                $eventPayload = [
-                    'user_id' => $user->id,
-                    'subject_id' => $subject->id,
-                    'title' => $subjectName,
-                    'start_time' => $startAt,
-                    'end_time' => $endAt,
-                    'status' => 'planned',
-                    'metadata' => [
-                        'type' => 'class',
-                        'all_day' => false,
-                        'source' => 'assistant_chat',
-                        'room' => $room !== '' ? $room : null,
-                    ],
-                ];
-                if ($this->hasColumnSafe('study_calendar_events', 'event_type')) {
-                    $eventPayload['event_type'] = 'class';
+                    return Subject::withoutGlobalScopes()->create($subjectPayload);
+                });
+                $this->assistantSubjectsUpdated = true;
+            } catch (\Throwable $e) {
+                report($e);
+                $failed[] = "{$subjectName}: บันทึกไม่สำเร็จ";
+                continue;
+            }
+
+            if ($hasSchedule && $classDate && $startAt && $endAt) {
+                try {
+                    if (Schema::hasTable('schedules')) {
+                        $scheduleStartDate = $this->normalizeAssistantDateForColumn(
+                            $classDate->format('Y-m-d'),
+                            $this->getAssistantColumnType('schedules', 'start_time')
+                        ) ?: $classDate->format('Y-m-d');
+                        $schedulePayload = [
+                            'subject_id' => $subject->id,
+                            'day_of_week' => $this->normalizeAssistantDayForScheduleColumn($dayLabel, $dayIndex),
+                            'start_time' => $this->normalizeAssistantTimeForColumn(
+                                $startTime,
+                                $this->getAssistantColumnType('schedules', 'start_time'),
+                                $scheduleStartDate
+                            ) ?? $startAt,
+                            'end_time' => $this->normalizeAssistantTimeForColumn(
+                                $endTime,
+                                $this->getAssistantColumnType('schedules', 'end_time'),
+                                $scheduleStartDate
+                            ) ?? $endAt,
+                        ];
+                        if ($this->hasColumnSafe('schedules', 'user_id')) {
+                            $schedulePayload['user_id'] = $user->id;
+                        }
+                        if ($room !== '' && $this->hasColumnSafe('schedules', 'room')) {
+                            $schedulePayload['room'] = $room;
+                        }
+                        if ($room !== '' && $this->hasColumnSafe('schedules', 'location')) {
+                            $schedulePayload['location'] = $room;
+                        }
+                        if ($this->hasColumnSafe('schedules', 'schedule_type')) {
+                            $schedulePayload['schedule_type'] = 'class';
+                        }
+                        Schedule::withoutGlobalScopes()->create($schedulePayload);
+                    }
+
+                    $eventPayload = [
+                        'user_id' => $user->id,
+                        'subject_id' => $subject->id,
+                        'title' => $subjectName,
+                        'start_time' => $startAt,
+                        'end_time' => $endAt,
+                        'status' => 'planned',
+                        'metadata' => [
+                            'type' => 'class',
+                            'all_day' => false,
+                            'source' => 'assistant_chat',
+                            'room' => $room !== '' ? $room : null,
+                        ],
+                    ];
+                    if ($this->hasColumnSafe('study_calendar_events', 'event_type')) {
+                        $eventPayload['event_type'] = 'class';
+                    }
+                    if ($room !== '' && $this->hasColumnSafe('study_calendar_events', 'room')) {
+                        $eventPayload['room'] = $room;
+                    }
+                    StudyCalendarEvent::withoutGlobalScopes()->create($eventPayload);
+                    $createdCalendarEvent = true;
+                    $this->assistantScheduleUpdated = true;
+                } catch (\Throwable $e) {
+                    report($e);
+                    $warnings[] = "{$subjectName}: เพิ่มรายวิชาแล้ว แต่บันทึกตารางเรียน/ปฏิทินไม่สำเร็จ";
                 }
-                if ($room !== '' && $this->hasColumnSafe('study_calendar_events', 'room')) {
-                    $eventPayload['room'] = $room;
-                }
-                StudyCalendarEvent::withoutGlobalScopes()->create($eventPayload);
-            });
-        } catch (\Throwable $e) {
-            report($e);
-            return 'ยังไม่สามารถเพิ่มวิชาได้ในตอนนี้ กรุณาลองใหม่อีกครั้งค่ะ';
+            }
+
+            $roomText = $room !== '' ? " ห้อง {$room}" : '';
+            $semesterText = ($semesterNumber && $academicYear) ? " เทอม {$semesterNumber}/{$academicYear}" : '';
+            if ($hasSchedule && $classDate) {
+                $dateText = $classDate->locale('th')->translatedFormat('j F Y');
+                $created[] = "- {$subjectName}: {$dayLabel} {$dateText} {$this->formatAssistantTimeForMessage($startTime)}-{$this->formatAssistantTimeForMessage($endTime)}{$roomText}{$semesterText}";
+            } else {
+                $created[] = "- {$subjectName}{$roomText}{$semesterText}";
+            }
         }
 
-        $roomText = $room !== '' ? " ห้อง {$room}" : '';
-        return "เพิ่มวิชา {$subjectName} เรียบร้อยแล้วค่ะ\nตารางเรียน: {$dayLabel} {$startTime}-{$endTime}{$roomText}\nและบันทึกลงปฏิทินเรียนเรียบร้อยแล้วค่ะ";
+        if ($created === []) {
+            return "ยังไม่สามารถเพิ่มวิชาได้ค่ะ\n".implode("\n", $failed);
+        }
+
+        $reply = "เพิ่มวิชาเรียบร้อยแล้วค่ะ\n".implode("\n", $created);
+        if ($createdCalendarEvent) {
+            $reply .= "\nและบันทึกลงปฏิทินเรียนเรียบร้อยแล้วค่ะ";
+        }
+        if ($warnings !== []) {
+            $reply .= "\n\nหมายเหตุ:\n".implode("\n", array_map(fn (string $line) => "- {$line}", $warnings));
+        }
+        if ($failed !== []) {
+            $reply .= "\n\nรายการที่ยังไม่สำเร็จ:\n".implode("\n", array_map(fn (string $line) => "- {$line}", $failed));
+        }
+
+        return $reply;
     }
 
     private function handleDeleteSubjectCommand(User $user, string $message): string
     {
-        if (! preg_match('/ลบวิชา\s*[:\-]?\s*(.+)$/u', $message, $m)) {
-            return 'หากต้องการลบวิชา พิมพ์: ลบวิชา [ชื่อวิชา] ค่ะ';
-        }
-
-        $subjectName = trim((string) ($m[1] ?? ''));
+        $subjectName = $this->assistantDeleteSubjectName($message);
         if ($subjectName === '') {
-            return 'หากต้องการลบวิชา พิมพ์: ลบวิชา [ชื่อวิชา] ค่ะ';
+            return 'กรุณาระบุชื่อวิชาที่ต้องการลบ เช่น ลบวิชา คณิตศาสตร์';
         }
 
-        $subject = Subject::withoutGlobalScopes()
+        $query = Subject::withoutGlobalScopes()
+            ->with('semester')
             ->where('user_id', $user->id)
-            ->where('name', $subjectName)
-            ->first();
+            ->whereRaw('LOWER(TRIM(name)) = ?', [mb_strtolower($subjectName, 'UTF-8')]);
 
-        if (! $subject) {
-            return "ไม่พบวิชา {$subjectName} ค่ะ ลองตรวจสอบชื่อวิชาอีกครั้ง";
+        $semesterTarget = $this->assistantDeleteSubjectSemester($message);
+        if ($semesterTarget['semester'] !== null) {
+            $query->whereHas('semester', function ($semesterQuery) use ($semesterTarget) {
+                $semesterQuery->where('semester', $semesterTarget['semester']);
+                if ($semesterTarget['academic_year'] !== null) {
+                    $semesterQuery->where('academic_year', $semesterTarget['academic_year']);
+                }
+            });
         }
 
-        $subjectId = (int) $subject->id;
-        DB::transaction(function () use ($subjectId, $user) {
-            StudyCalendarEvent::withoutGlobalScopes()
-                ->where('user_id', $user->id)
-                ->where('subject_id', $subjectId)
-                ->delete();
-            Schedule::withoutGlobalScopes()
-                ->where('user_id', $user->id)
-                ->where('subject_id', $subjectId)
-                ->delete();
-            Subject::withoutGlobalScopes()
-                ->where('user_id', $user->id)
-                ->where('id', $subjectId)
-                ->delete();
-        });
+        $subjects = $query->get();
 
-        return "ลบวิชา {$subjectName} และลบออกจากตารางเรียนเรียบร้อยแล้วค่ะ";
+        if ($subjects->isEmpty()) {
+            return "ไม่พบรายวิชา \"{$subjectName}\" กรุณาตรวจสอบชื่อวิชาแล้วลองอีกครั้งค่ะ";
+        }
+
+        if ($subjects->count() > 1) {
+            $options = $subjects->map(function (Subject $subject) {
+                $semester = $this->formatAssistantSemesterLabel($subject);
+                return '- '.$subject->name.($semester !== '' ? " ({$semester})" : ' (ไม่ระบุเทอม)');
+            })->implode("\n");
+
+            return "พบวิชาชื่อ \"{$subjectName}\" มากกว่าหนึ่งรายการ กรุณาระบุภาคเรียนให้ชัดเจน:\n{$options}";
+        }
+
+        $subject = $subjects->first();
+        $linkedRecords = $this->assistantLinkedSubjectRecords($subject->id);
+        if ($linkedRecords !== []) {
+            return 'ไม่สามารถลบวิชา "'.$subject->name.'" ได้ เนื่องจากยังเชื่อมโยงกับ: '.implode(', ', $linkedRecords);
+        }
+
+        try {
+            $subject->delete();
+            $this->assistantSubjectsUpdated = true;
+
+            return 'ลบวิชา "'.$subject->name.'" เรียบร้อยแล้วค่ะ';
+        } catch (\Throwable $e) {
+            report($e);
+
+            return 'ลบวิชา "'.$subject->name.'" ไม่สำเร็จ กรุณาลองอีกครั้งค่ะ';
+        }
+    }
+
+    private function isAssistantDeleteSubjectCommand(string $message): bool
+    {
+        return (bool) preg_match('/(?:^|\s|ช่วย|กรุณา)(?:ลบ|เอาออก|ลบออก)\s*(?:ราย)?วิชา(?:เรียน)?/u', $message);
+    }
+
+    private function assistantDeleteSubjectName(string $message): string
+    {
+        $name = preg_replace('/^.*?(?:ลบ|เอาออก|ลบออก)\s*(?:ราย)?วิชา(?:เรียน)?\s*(?:ชื่อ|ชื่อว่า)?\s*/u', '', trim($message)) ?? '';
+        $name = preg_replace('/\s*(?:ภาคเรียน(?:ที่)?|เทอม)\s*\d+(?:\s*(?:\/|ปีการศึกษา\s*)?\s*\d{2,4})?\s*/u', ' ', $name) ?? $name;
+        $name = preg_replace('/\s*(?:ให้(?:หน่อย|ด้วย)|หน่อย|ด้วย|ที)?\s*(?:ครับ|ค่ะ|คะ)?\s*$/u', '', $name) ?? $name;
+
+        return trim($name, " \t\n\r\0\x0B-:|\"'");
+    }
+
+    /** @return array{semester:?int, academic_year:?int} */
+    private function assistantDeleteSubjectSemester(string $message): array
+    {
+        if (! preg_match('/(?:ภาคเรียน(?:ที่)?|เทอม)\s*([1-3])(?:\s*(?:\/|ปีการศึกษา\s*)?\s*(\d{2,4}))?/u', $message, $matches)) {
+            return ['semester' => null, 'academic_year' => null];
+        }
+
+        return [
+            'semester' => (int) $matches[1],
+            'academic_year' => isset($matches[2]) && $matches[2] !== '' ? (int) $matches[2] : null,
+        ];
+    }
+
+    private function hasTableSafe(string $table): bool
+    {
+        try {
+            return Schema::hasTable($table);
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /** @return array<int, string> */
+    private function assistantLinkedSubjectRecords(int $subjectId): array
+    {
+        $relations = [
+            ['table' => 'study_logs', 'column' => 'subject_id', 'label' => 'บันทึกการเรียน'],
+            ['table' => 'study_calendar_events', 'column' => 'subject_id', 'label' => 'ตารางเรียน'],
+            ['table' => 'learning_notifications', 'column' => 'subject_id', 'label' => 'การแจ้งเตือนการเรียน'],
+            ['table' => 'study_notifications', 'column' => 'subject_id', 'label' => 'การแจ้งเตือน'],
+            ['table' => 'mood_logs', 'column' => 'subject_id', 'label' => 'บันทึกอารมณ์'],
+            ['table' => 'career_recommendations', 'column' => 'subject_id', 'label' => 'คำแนะนำอาชีพ'],
+            ['table' => 'quizzes', 'column' => 'subject_id', 'label' => 'แบบฝึกหัด'],
+            ['table' => 'lessons', 'column' => 'subject_id', 'label' => 'บทเรียน'],
+            ['table' => 'schedules', 'column' => 'subject_id', 'label' => 'ตารางเรียน'],
+            ['table' => 'learning_goal_targets', 'column' => 'subject_id', 'label' => 'เป้าหมายการเรียน'],
+            ['table' => 'subjects_archives', 'column' => 'original_subject_id', 'label' => 'ประวัติรายวิชา'],
+        ];
+
+        $linked = [];
+        foreach ($relations as $relation) {
+            if (! $this->hasTableSafe($relation['table']) || ! $this->hasColumnSafe($relation['table'], $relation['column'])) {
+                continue;
+            }
+
+            if (DB::table($relation['table'])->where($relation['column'], $subjectId)->exists()) {
+                $linked[] = $relation['label'];
+            }
+        }
+
+        return array_values(array_unique($linked));
     }
 
     private function handleShowScheduleCommand(User $user, int $daysOffset): string
@@ -895,35 +1412,130 @@ class AIService
     private function handleListSubjectsCommand(User $user): string
     {
         $subjects = Subject::withoutGlobalScopes()
+            ->with('semester')
             ->where('user_id', $user->id)
             ->orderBy('name')
             ->limit(50)
-            ->get(['name']);
+            ->get();
 
         if ($subjects->isEmpty()) {
             return 'ตอนนี้ยังไม่มีวิชาในระบบค่ะ';
         }
 
-        $lines = $subjects->map(fn (Subject $subject) => "- {$subject->name}")->implode("\n");
+        $lines = $subjects->map(function (Subject $subject) {
+            $semesterText = $this->formatAssistantSemesterLabel($subject);
+            return "- {$subject->name}".($semesterText !== '' ? " ({$semesterText})" : ' (ไม่ระบุเทอม)');
+        })->implode("\n");
         return "รายการวิชาของคุณ:\n{$lines}";
+    }
+
+    private function handleListSubjectsWithSemesterCommand(User $user): string
+    {
+        return $this->handleListSubjectsCommand($user);
     }
 
     private function assistantCommandHelpText(): string
     {
-        return "คำสั่งที่ทำได้ผ่านแชตตอนนี้:\n"
-            ."- เพิ่มวิชา [ชื่อวิชา] วัน[วัน] [เวลาเริ่ม]-[เวลาเลิก] ห้อง [ห้อง]\n"
-            ."- ลบวิชา [ชื่อวิชา]\n"
+        return "เครื่องมือเพิ่มตารางเรียนทำได้ดังนี้:\n"
+            ."- เพิ่มวิชาเดียวหรือหลายวิชาพร้อมกัน\n"
+            ."- ระบุวันเรียน วันที่ เดือน ปี เวลา ห้อง และภาคเรียน\n"
+            ."- ตรวจได้ว่าวิชาไหนอยู่เทอม/ภาคเรียนอะไร\n"
+            ."- ดูตารางวันนี้หรือพรุ่งนี้ และดูรายการวิชาทั้งหมด\n\n"
+            ."รูปแบบที่แนะนำ:\n"
+            ."เพิ่มวิชา [ชื่อวิชา] วัน[วันเรียน] วันที่ [วัน/เดือน/ปี] [เวลาเริ่ม]-[เวลาเลิก] ห้อง [ห้อง] ภาคเรียนที่ [เลขเทอม] ปีการศึกษา [ปี]\n"
+            ."ตัวอย่าง: เพิ่มวิชา คณิต วันจันทร์ วันที่ 12/08/2569 09:00-12:00 ห้อง 102 ภาคเรียนที่ 1 ปีการศึกษา 2569\n\n"
+            ."เพิ่มหลายวิชาให้แยกคนละบรรทัด เช่น:\n"
+            ."เพิ่มวิชา คณิต วันจันทร์ วันที่ 12/08/2569 09:00-12:00 ห้อง 102 ภาคเรียนที่ 1 ปีการศึกษา 2569\n"
+            ."เพิ่มวิชา อังกฤษ วันพุธ วันที่ 14/08/2569 13:00-15:00 ห้อง 204 ภาคเรียนที่ 1 ปีการศึกษา 2569\n\n"
             ."- ดูตารางวันนี้\n"
             ."- ดูตารางพรุ่งนี้\n"
-            ."- รายการวิชา";
+            ."- วิชาไหนอยู่เทอมอะไร\n\n"
+            ."- ลบวิชา [ชื่อวิชา] (ลบได้เมื่อไม่มีข้อมูลอื่นเชื่อมโยงอยู่)";
+    }
+
+    private function assistantCreateSubjectFormatText(): string
+    {
+        return "ได้ค่ะ หากต้องการเพิ่มตารางเรียน กรุณาพิมพ์ตามรูปแบบนี้:\n"
+            ."เพิ่มวิชา [ชื่อวิชา] วัน[วันเรียน] วันที่ [วัน/เดือน/ปี] [เวลาเริ่ม]-[เวลาเลิก] ห้อง [ห้องเรียน] ภาคเรียนที่ [เลขเทอม] ปีการศึกษา [ปี]\n"
+            ."ตัวอย่าง: เพิ่มวิชา คณิต วันจันทร์ วันที่ 12/08/2569 09:00-12:00 ห้อง 102 ภาคเรียนที่ 1 ปีการศึกษา 2569\n"
+            ."ถ้าต้องการเพิ่มหลายวิชา ให้พิมพ์แยกคนละบรรทัดค่ะ";
     }
 
     /**
-     * @return array{ok:bool, subject_name?:string, day_label?:string, day_index?:int, start_time?:string, end_time?:string, room?:string}
+     * @return array<int, array{ok:bool, subject_name?:string, day_label?:string, day_index?:int|null, start_time?:string|null, end_time?:string|null, room?:string, date?:Carbon|null, semester?:int|null, academic_year?:int|null}>
+     */
+    private function parseCreateSubjectCommands(string $message): array
+    {
+        // Accept a pasted list as well as repeated commands. For example:
+        //
+        // เพิ่มวิชา:
+        // 1. คณิต วันจันทร์ วันที่ 12/08/2569 09:00-12:00
+        // 2. อังกฤษ วันพุธ วันที่ 14/08/2569 13:00-15:00
+        //
+        // The old parser only understood repeated "เพิ่มวิชา" markers, so the
+        // second and later list entries could be lost or treated as one long
+        // subject name.
+        $commandMarker = '(?:เพิ่ม|สร้าง|ใส่|บันทึก(?:ลง)?|ลง)\s*(?:ใน|เข้า)?\s*(?:วิชา(?:เรียน)?|ตาราง(?:เรียน)?|คาบเรียน)';
+        $commandItems = preg_split('/(?='.$commandMarker.')/iu', str_replace(["\r\n", "\r"], "\n", $message), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $lines = [];
+
+        foreach ($commandItems as $commandItem) {
+            foreach (preg_split('/\r\n|\r|\n|;/u', $commandItem) ?: [] as $line) {
+                $line = trim((string) $line);
+                if ($line === '') {
+                    continue;
+                }
+
+                // A command heading ("เพิ่มวิชา:" or "เพิ่มหลายวิชา:")
+                // describes the list; it is not a subject itself.
+                $heading = preg_replace('/^'.$commandMarker.'\s*[:：-]?\s*/iu', '', $line) ?? $line;
+                if (preg_match('/^(?:หลาย(?:วิชา)?|รายวิชา|ตาราง(?:เรียน)?|ต่อไปนี้)?\s*[:：]?$/iu', trim($heading))) {
+                    continue;
+                }
+
+                // Let people use normal numbered or bulleted lists.
+                $line = preg_replace('/^\s*(?:(?:\d+|[ก-๙])[.)]|[-*•])\s*/u', '', $line) ?? $line;
+                // Allow a natural Thai continuation such as "และ ชีวะ วันอาทิตย์ ...".
+                $line = preg_replace('/^และ\s*/u', '', $line) ?? $line;
+                if (trim($line) !== '') {
+                    $lines[] = $line;
+                }
+            }
+        }
+        $items = [];
+
+        foreach ($lines as $line) {
+            $line = trim((string) $line);
+            if ($line === '') {
+                continue;
+            }
+
+            if (! $this->isAssistantCreateScheduleCommand($line)) {
+                $line = 'เพิ่มวิชา '.$line;
+            }
+
+            $parsed = $this->parseCreateSubjectCommand($line);
+            if (($parsed['ok'] ?? false) === true) {
+                $items[] = $parsed;
+            }
+        }
+
+        if ($items === [] && ! str_contains($message, "\n")) {
+            $parsed = $this->parseCreateSubjectCommand($message);
+            if (($parsed['ok'] ?? false) === true) {
+                $items[] = $parsed;
+            }
+        }
+
+        return $items;
+    }
+
+    /**
+     * @return array{ok:bool, subject_name?:string, day_label?:string, day_index?:int|null, start_time?:string|null, end_time?:string|null, room?:string, date?:Carbon|null, semester?:int|null, academic_year?:int|null}
      */
     private function parseCreateSubjectCommand(string $message): array
     {
-        if (! preg_match('/เพิ่มวิชา(?:เรียน)?\s*[:\-]?\s*(.+)$/iu', $message, $m)) {
+        if (! preg_match('/(?:เพิ่ม|สร้าง|ใส่|บันทึก(?:ลง)?|ลง)\s*(?:ใน|เข้า)?\s*(?:วิชา(?:เรียน)?|ตาราง(?:เรียน)?|คาบเรียน)\s*[:\-]?\s*(.+)$/iu', $message, $m)) {
             return ['ok' => false];
         }
 
@@ -932,49 +1544,66 @@ class AIService
             return ['ok' => false];
         }
 
-        if (! preg_match('/(?:วัน)?(วันนี้|พรุ่งนี้|today|tomorrow|จันทร์|อังคาร|พุธ|พฤหัสบดี|ศุกร์|เสาร์|อาทิตย์|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)/iu', $payload, $dayMatch, PREG_OFFSET_CAPTURE)) {
-            return ['ok' => false];
+        // รองรับชื่อวันภาษาไทยทั้งแบบเต็มและแบบย่อ เช่น "วันจัน" หรือ "วันพฤหัส"
+        // ซึ่งเป็นรูปแบบที่ผู้ใช้พิมพ์ในแชตบ่อยกว่าชื่อเต็ม.
+        $hasDay = (bool) preg_match('/(?:^|\s|วัน)(วันนี้|พรุ่งนี้|today|tomorrow|จันทร์|จัน|อังคาร|อัง|พุธ|พฤหัสบดี|พฤหัส|พฤ|ศุกร์|ศุก|เสาร์|เสา|อาทิตย์|อาทิต|อา|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)/iu', $payload, $dayMatch, PREG_OFFSET_CAPTURE);
+        $timeMatch = $this->matchAssistantTimeRange($payload);
+        $hasTime = $timeMatch !== null;
+
+        $day = null;
+        $dayOffset = null;
+        $dayEndOffset = null;
+        $timeOffset = $hasTime ? (int) $timeMatch['offset'] : null;
+
+        if ($hasDay) {
+            $dayToken = Str::lower((string) $dayMatch[1][0]);
+            $dayOffset = (int) $dayMatch[0][1];
+            $dayEndOffset = $dayOffset + strlen((string) $dayMatch[0][0]);
+
+            $today = Carbon::now(self::ASSISTANT_TIMEZONE);
+            $day = match ($dayToken) {
+                'วันนี้', 'today' => ['label' => 'วันนี้', 'index' => $today->dayOfWeek],
+                'พรุ่งนี้', 'tomorrow' => ['label' => 'วันพรุ่งนี้', 'index' => $today->copy()->addDay()->dayOfWeek],
+                'จันทร์', 'จัน', 'monday', 'mon' => ['label' => 'วันจันทร์', 'index' => 1],
+                'อังคาร', 'อัง', 'tuesday', 'tue' => ['label' => 'วันอังคาร', 'index' => 2],
+                'พุธ', 'wednesday', 'wed' => ['label' => 'วันพุธ', 'index' => 3],
+                'พฤหัสบดี', 'พฤหัส', 'พฤ', 'thursday', 'thu' => ['label' => 'วันพฤหัสบดี', 'index' => 4],
+                'ศุกร์', 'ศุก', 'friday', 'fri' => ['label' => 'วันศุกร์', 'index' => 5],
+                'เสาร์', 'เสา', 'saturday', 'sat' => ['label' => 'วันเสาร์', 'index' => 6],
+                'อาทิตย์', 'อาทิต', 'อา', 'sunday', 'sun' => ['label' => 'วันอาทิตย์', 'index' => 0],
+                default => null,
+            };
         }
 
-        $dayToken = Str::lower((string) $dayMatch[1][0]);
-        $dayOffset = (int) $dayMatch[0][1];
-        // preg_match offset is byte-based; use substr/mb_strcut instead of mb_substr.
-        $subjectName = trim(substr($payload, 0, $dayOffset));
+        $cutOffsets = array_filter([$dayOffset, $timeOffset], fn (?int $offset) => $offset !== null);
+        $subjectEndOffset = $cutOffsets !== [] ? min($cutOffsets) : strlen($payload);
+        $subjectName = trim(substr($payload, 0, $subjectEndOffset));
+        if ($subjectName === '' && $dayEndOffset !== null && $timeOffset !== null && $timeOffset > $dayEndOffset) {
+            $afterDayLength = max(0, $timeOffset - $dayEndOffset);
+            $subjectName = trim(substr($payload, $dayEndOffset, $afterDayLength));
+        }
         $subjectName = trim($subjectName, " \t\n\r\0\x0B-:|");
-        if (preg_match('/(?:ชื่อวิชา|subject)\s*[:：]?\s*(.+?)\s*(?:วัน|เวลา|ห้อง|$)/iu', $payload, $subjectMatch)) {
+        if (preg_match('/(?:ชื่อวิชา|วิชา|subject)\s*[:：]?\s*(.+?)\s*(?:วัน|เวลา|ห้อง|$)/iu', $payload, $subjectMatch)) {
             $subjectName = trim((string) ($subjectMatch[1] ?? ''));
         }
-        $subjectName = preg_replace('/^(?:เรียน|วิชา|ชื่อวิชา|น้อง)\s*/u', '', $subjectName) ?? $subjectName;
-        $subjectName = trim($subjectName, " \t\n\r\0\x0B-:|");
+        $subjectName = $this->cleanAssistantSubjectName($subjectName);
         if ($subjectName === '') {
             return ['ok' => false];
         }
 
-        $today = Carbon::now(self::ASSISTANT_TIMEZONE);
-        $day = match ($dayToken) {
-            'วันนี้', 'today' => ['label' => 'วันนี้', 'index' => $today->dayOfWeek],
-            'พรุ่งนี้', 'tomorrow' => ['label' => 'วันพรุ่งนี้', 'index' => $today->copy()->addDay()->dayOfWeek],
-            'จันทร์', 'monday', 'mon' => ['label' => 'วันจันทร์', 'index' => 1],
-            'อังคาร', 'tuesday', 'tue' => ['label' => 'วันอังคาร', 'index' => 2],
-            'พุธ', 'wednesday', 'wed' => ['label' => 'วันพุธ', 'index' => 3],
-            'พฤหัสบดี', 'thursday', 'thu' => ['label' => 'วันพฤหัสบดี', 'index' => 4],
-            'ศุกร์', 'friday', 'fri' => ['label' => 'วันศุกร์', 'index' => 5],
-            'เสาร์', 'saturday', 'sat' => ['label' => 'วันเสาร์', 'index' => 6],
-            'อาทิตย์', 'sunday', 'sun' => ['label' => 'วันอาทิตย์', 'index' => 0],
-            default => null,
-        };
-        if ($day === null) {
-            return ['ok' => false];
+        $startTime = null;
+        $endTime = null;
+        if ($hasDay !== $hasTime) {
+            $hasDay = false;
+            $hasTime = false;
+            $day = null;
         }
-
-        if (! preg_match('/(\d{1,2}(?:[:.]\d{2})?\s*(?:โมง|น|น\.)?)\s*(?:\-|ถึง|to)\s*(\d{1,2}(?:[:.]\d{2})?\s*(?:โมง|น|น\.)?)/u', $payload, $timeMatch)) {
-            return ['ok' => false];
-        }
-
-        $startTime = $this->normalizeTimeToken((string) ($timeMatch[1] ?? ''));
-        $endTime = $this->normalizeTimeToken((string) ($timeMatch[2] ?? ''));
-        if ($startTime === null || $endTime === null) {
-            return ['ok' => false];
+        if ($hasDay && $hasTime) {
+            $startTime = $this->normalizeTimeToken((string) ($timeMatch['start'] ?? ''));
+            $endTime = $this->normalizeTimeToken((string) ($timeMatch['end'] ?? ''));
+            if ($day === null || $startTime === null || $endTime === null) {
+                return ['ok' => false];
+            }
         }
 
         $room = '';
@@ -982,15 +1611,179 @@ class AIService
             $room = trim((string) ($roomMatch[1] ?? ''));
         }
 
+        $classDate = $this->parseAssistantClassDate($payload);
+        $semesterParts = $this->parseAssistantSemesterParts($payload);
+
         return [
             'ok' => true,
             'subject_name' => $subjectName,
-            'day_label' => $day['label'],
-            'day_index' => $day['index'],
+            'day_label' => $day['label'] ?? null,
+            'day_index' => $day['index'] ?? null,
             'start_time' => $startTime,
             'end_time' => $endTime,
             'room' => $room,
+            'date' => $classDate,
+            'semester' => $semesterParts['semester'],
+            'academic_year' => $semesterParts['academic_year'],
         ];
+    }
+
+    /**
+     * @return array{start:string,end:string,offset:int}|null
+     */
+    private function matchAssistantTimeRange(string $payload): ?array
+    {
+        $timeToken = '\d{1,2}(?:[:.]\d{2})?\s*(?:โมง|น|น\.)?';
+        $separator = '(?:\-|–|—|ถึง|to)';
+
+        if (preg_match('/(?:เวลา(?:เรียน)?|time)\s*[:：]?\s*('.$timeToken.')\s*'.$separator.'\s*('.$timeToken.')/iu', $payload, $m, PREG_OFFSET_CAPTURE)) {
+            return [
+                'start' => (string) ($m[1][0] ?? ''),
+                'end' => (string) ($m[2][0] ?? ''),
+                'offset' => (int) ($m[0][1] ?? 0),
+            ];
+        }
+
+        if (preg_match('/(?<![\/\d])('.$timeToken.')\s*'.$separator.'\s*('.$timeToken.')(?!\s*[\/\-]\s*\d{2,4})/iu', $payload, $m, PREG_OFFSET_CAPTURE)) {
+            return [
+                'start' => (string) ($m[1][0] ?? ''),
+                'end' => (string) ($m[2][0] ?? ''),
+                'offset' => (int) ($m[0][1] ?? 0),
+            ];
+        }
+
+        return null;
+    }
+
+    private function parseAssistantClassDate(string $payload): ?Carbon
+    {
+        $thaiMonths = [
+            'มกราคม' => 1, 'ม.ค.' => 1, 'มค' => 1,
+            'กุมภาพันธ์' => 2, 'ก.พ.' => 2, 'กพ' => 2,
+            'มีนาคม' => 3, 'มี.ค.' => 3, 'มีค' => 3,
+            'เมษายน' => 4, 'เม.ย.' => 4, 'เมย' => 4,
+            'พฤษภาคม' => 5, 'พ.ค.' => 5, 'พค' => 5,
+            'มิถุนายน' => 6, 'มิ.ย.' => 6, 'มิย' => 6,
+            'กรกฎาคม' => 7, 'ก.ค.' => 7, 'กค' => 7,
+            'สิงหาคม' => 8, 'ส.ค.' => 8, 'สค' => 8,
+            'กันยายน' => 9, 'ก.ย.' => 9, 'กย' => 9,
+            'ตุลาคม' => 10, 'ต.ค.' => 10, 'ตค' => 10,
+            'พฤศจิกายน' => 11, 'พ.ย.' => 11, 'พย' => 11,
+            'ธันวาคม' => 12, 'ธ.ค.' => 12, 'ธค' => 12,
+        ];
+
+        if (preg_match('/(?:วันที่|date)?\s*(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/iu', $payload, $m)) {
+            $day = (int) $m[1];
+            $month = (int) $m[2];
+            $year = $this->normalizeAssistantYear((int) $m[3]);
+            return checkdate($month, $day, $year) ? Carbon::create($year, $month, $day, 0, 0, 0, self::ASSISTANT_TIMEZONE) : null;
+        }
+
+        if (preg_match('/(?:วันที่)?\s*(\d{1,2})\s*([ก-๙.]+)\s*(\d{4})/u', $payload, $m)) {
+            $day = (int) $m[1];
+            $monthToken = trim((string) $m[2]);
+            $month = $thaiMonths[$monthToken] ?? null;
+            $year = $this->normalizeAssistantYear((int) $m[3]);
+            return $month && checkdate($month, $day, $year) ? Carbon::create($year, $month, $day, 0, 0, 0, self::ASSISTANT_TIMEZONE) : null;
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array{semester:int|null, academic_year:int|null}
+     */
+    private function parseAssistantSemesterParts(string $payload): array
+    {
+        $semester = null;
+        $academicYear = null;
+
+        if (preg_match('/(?:ภาคเรียน(?:ที่)?|เทอม)\s*[:：]?\s*(\d)/u', $payload, $m)) {
+            $value = (int) $m[1];
+            $semester = $value >= 1 && $value <= 3 ? $value : null;
+        }
+
+        if (preg_match('/(?:ปีการศึกษา|ปี|academic\s*year)\s*[:：]?\s*(?:พ\.?\s*ศ\.?\s*)?(\d{4})/iu', $payload, $m)) {
+            $academicYear = $this->normalizeAssistantAcademicYear((int) $m[1]);
+        } elseif (preg_match('/(?:เทอม|ภาคเรียน(?:ที่)?)\s*[:：]?\s*\d\s*\/\s*(\d{4})/u', $payload, $m)) {
+            $academicYear = $this->normalizeAssistantAcademicYear((int) $m[1]);
+        }
+
+        return [
+            'semester' => $semester,
+            'academic_year' => $academicYear,
+        ];
+    }
+
+    private function normalizeAssistantYear(int $year): int
+    {
+        return $year > 2400 ? $year - 543 : $year;
+    }
+
+    private function normalizeAssistantAcademicYear(int $year): int
+    {
+        return $year < 2400 ? $year + 543 : $year;
+    }
+
+    private function resolveAssistantSemesterId(?int $semesterNumber, ?int $academicYear): ?int
+    {
+        if ($semesterNumber === null || $academicYear === null || ! Schema::hasTable('semester')) {
+            return null;
+        }
+
+        $semester = Semester::query()
+            ->where('semester', $semesterNumber)
+            ->where('academic_year', $academicYear)
+            ->first();
+
+        if (! $semester) {
+            try {
+                $semester = Semester::query()->create([
+                    'semester' => $semesterNumber,
+                    'academic_year' => $academicYear,
+                ]);
+            } catch (\Throwable) {
+                $nextId = (int) (DB::table('semester')->max('semester_id') ?? 0) + 1;
+                DB::table('semester')->insert([
+                    'semester_id' => $nextId,
+                    'semester' => $semesterNumber,
+                    'academic_year' => $academicYear,
+                ]);
+                $semester = Semester::query()->find($nextId);
+            }
+        }
+
+        return $semester?->semester_id ? (int) $semester->semester_id : null;
+    }
+
+    private function formatAssistantSemesterLabel(Subject $subject): string
+    {
+        $semester = $subject->semester;
+        if (! $semester) {
+            return '';
+        }
+
+        return "เทอม {$semester->semester}/{$semester->academic_year}";
+    }
+
+    private function cleanAssistantSubjectName(string $subjectName): string
+    {
+        $clean = preg_replace('/^(?:เรียน|วิชา|ชื่อวิชา|น้อง)\s*/u', '', $subjectName) ?? $subjectName;
+        $clean = preg_replace(
+            '/\d{1,2}(?:[:.]\d{2})?\s*(?:โมง|น|น\.)?\s*(?:\-|ถึง|to)\s*\d{1,2}(?:[:.]\d{2})?\s*(?:โมง|น|น\.)?/iu',
+            ' ',
+            $clean
+        ) ?? $clean;
+        $clean = preg_replace('/(?:วันที่|date)\s*\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/iu', ' ', $clean) ?? $clean;
+        $clean = preg_replace('/(?:วันที่)?\s*\d{1,2}\s*[ก-๙.]+\s*\d{4}/u', ' ', $clean) ?? $clean;
+        $clean = preg_replace('/(?:ภาคเรียน(?:ที่)?|เทอม)\s*[:：]?\s*\d(?:\s*\/\s*\d{2,4})?/iu', ' ', $clean) ?? $clean;
+        $clean = preg_replace('/(?:ปีการศึกษา|academic\s*year|พ\.ศ\.)\s*[:：]?\s*(?:พ\.?\s*ศ\.?\s*)?\d{2,4}/iu', ' ', $clean) ?? $clean;
+        $clean = preg_replace('/(?:^|\s)วัน(?:นี้|พรุ่งนี้|จันทร์|จัน|อังคาร|อัง|พุธ|พฤหัสบดี|พฤหัส|พฤ|ศุกร์|ศุก|เสาร์|เสา|อาทิตย์|อาทิต|อา)\s*/u', ' ', $clean) ?? $clean;
+        $clean = preg_replace('/(?:^|\s)(?:เวลา(?:เรียน)?|time)\s*[:：]?\s*/iu', ' ', $clean) ?? $clean;
+        $clean = preg_replace('/(?:ห้อง(?:เรียน)?|room)\s*[:：]?\s*[A-Za-z0-9ก-๙\-\/]+/iu', ' ', $clean) ?? $clean;
+        $clean = preg_replace('/\s{2,}/u', ' ', $clean) ?? $clean;
+
+        return trim($clean, " \t\n\r\0\x0B-:|");
     }
 
     private function normalizeTimeToken(string $value): ?string
@@ -1024,6 +1817,174 @@ class AIService
         return $now->copy()->addDays($diff);
     }
 
+    private function findAssistantScheduleConflict(int $userId, int $dayIndex, string $startTime, string $endTime, ?int $exceptSubjectId = null, ?Carbon $classDate = null): ?Subject
+    {
+        if (
+            ! $this->hasColumnSafe('subjects', 'start_date') ||
+            ! $this->hasColumnSafe('subjects', 'start_time') ||
+            ! $this->hasColumnSafe('subjects', 'end_time')
+        ) {
+            return null;
+        }
+
+        $newStart = $this->assistantTimeToMinutes($startTime);
+        $newEnd = $this->assistantTimeToMinutes($endTime);
+        if ($newStart === null || $newEnd === null || $newEnd <= $newStart) {
+            return null;
+        }
+
+        $subjects = Subject::withoutGlobalScopes()
+            ->where('user_id', $userId)
+            ->whereNotNull('start_date')
+            ->whereNotNull('start_time')
+            ->whereNotNull('end_time')
+            ->when($exceptSubjectId !== null, fn ($query) => $query->where('id', '<>', $exceptSubjectId))
+            ->get();
+
+        foreach ($subjects as $subject) {
+            try {
+                $existingDate = Carbon::parse((string) $subject->start_date, self::ASSISTANT_TIMEZONE);
+            } catch (\Throwable) {
+                continue;
+            }
+
+            if (! $this->assistantScheduleDateMatches($existingDate, $dayIndex, $classDate)) {
+                continue;
+            }
+
+            $existingStart = $this->assistantTimeToMinutes($subject->start_time);
+            $existingEnd = $this->assistantTimeToMinutes($subject->end_time);
+            if ($existingStart === null || $existingEnd === null) {
+                continue;
+            }
+
+            if ($newStart < $existingEnd && $existingStart < $newEnd) {
+                return $subject;
+            }
+        }
+
+        return null;
+    }
+
+    private function assistantScheduleDateMatches(Carbon $existingDate, int $dayIndex, ?Carbon $classDate): bool
+    {
+        if ($classDate !== null) {
+            return $existingDate->isSameDay($classDate);
+        }
+
+        return $existingDate->dayOfWeek === $dayIndex;
+    }
+    private function findAssistantDuplicateSubject(int $userId, string $subjectName, ?int $semesterId): ?Subject
+    {
+        $name = trim($subjectName);
+        if ($name === '') {
+            return null;
+        }
+
+        $query = Subject::withoutGlobalScopes()
+            ->where('user_id', $userId)
+            ->whereRaw('LOWER(TRIM(name)) = ?', [mb_strtolower($name, 'UTF-8')]);
+
+        if ($this->hasColumnSafe('subjects', 'semester_id')) {
+            if ($semesterId !== null) {
+                $query->where('semester_id', $semesterId);
+            } else {
+                $query->whereNull('semester_id');
+            }
+        }
+
+        return $query->first();
+    }
+
+    private function isAssistantCreateScheduleCommand(string $message): bool
+    {
+        return (bool) preg_match('/(?:เพิ่ม|สร้าง|ใส่|บันทึก(?:ลง)?|ลง)\s*(?:ใน|เข้า)?\s*(?:วิชา(?:เรียน)?|ตาราง(?:เรียน)?|คาบเรียน)/iu', $message);
+    }
+
+    /**
+     * Lets the chat endpoint tell the client when an assistant request changed
+     * subjects or the timetable, without relying on localized reply wording.
+     */
+    public function isAssistantScheduleCreateRequest(string $message): bool
+    {
+        return $this->isAssistantCreateScheduleCommand($message);
+    }
+
+    /**
+     * Returns whether the active chat request really persisted a timetable
+     * event.  This deliberately does not inspect the reply text.
+     */
+    public function assistantScheduleWasUpdated(): bool
+    {
+        return $this->assistantScheduleUpdated;
+    }
+
+    /** Returns whether the current chat request created or deleted a subject. */
+    public function assistantSubjectsWereUpdated(): bool
+    {
+        return $this->assistantSubjectsUpdated;
+    }
+
+    private function isAssistantScheduleRequest(string $message): bool
+    {
+        return (bool) preg_match(
+            '/(?:ตาราง(?:เรียน)?|คาบเรียน|เวลาเรียน|กำหนดเวลาเรียน|เพิ่มวิชา|เปลี่ยน(?:วิชา|เวลาเรียน)|แก้ไข(?:วิชา|ตาราง))/iu',
+            $message
+        );
+    }
+
+    private function assistantTimeToMinutes(mixed $value): ?int
+    {
+        if ($value instanceof Carbon) {
+            return ((int) $value->format('H')) * 60 + (int) $value->format('i');
+        }
+
+        $raw = is_string($value) ? trim($value) : (string) $value;
+        if ($raw === '') {
+            return null;
+        }
+
+        if (str_contains($raw, 'T')) {
+            $raw = explode('T', $raw)[1] ?? $raw;
+        } elseif (str_contains($raw, ' ')) {
+            $raw = explode(' ', $raw)[1] ?? $raw;
+        }
+
+        $raw = str_replace('.', ':', preg_replace('/Z$|[+-]\d{2}:?\d{2}$/', '', $raw) ?? $raw);
+        if (! preg_match('/^(\d{1,2}):(\d{2})(?::\d{2})?$/', $raw, $matches)) {
+            return null;
+        }
+
+        $hour = (int) $matches[1];
+        $minute = (int) $matches[2];
+        if ($hour < 0 || $hour > 23 || $minute < 0 || $minute > 59) {
+            return null;
+        }
+
+        return ($hour * 60) + $minute;
+    }
+
+    private function formatAssistantSubjectTimeRange(Subject $subject): string
+    {
+        $start = $this->formatAssistantTimeForMessage($subject->start_time);
+        $end = $this->formatAssistantTimeForMessage($subject->end_time);
+        if (! $start && ! $end) {
+            return '';
+        }
+
+        return trim(($start ?? '') . '-' . ($end ?? ''), '-');
+    }
+
+    private function formatAssistantTimeForMessage(mixed $value): ?string
+    {
+        $minutes = $this->assistantTimeToMinutes($value);
+        if ($minutes === null) {
+            return null;
+        }
+
+        return sprintf('%02d:%02d', intdiv($minutes, 60), $minutes % 60);
+    }
+
     private function hasColumnSafe(string $table, string $column): bool
     {
         try {
@@ -1031,6 +1992,85 @@ class AIService
         } catch (\Throwable) {
             return false;
         }
+    }
+
+    private function getAssistantColumnType(string $table, string $column): ?string
+    {
+        try {
+            $row = DB::selectOne(
+                'SELECT DATA_TYPE FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ? LIMIT 1',
+                [$table, $column]
+            );
+
+            return isset($row->DATA_TYPE) ? strtolower((string) $row->DATA_TYPE) : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function normalizeAssistantDateForColumn(mixed $value, ?string $columnType): ?string
+    {
+        $raw = is_string($value) ? trim($value) : '';
+        if ($raw === '') {
+            return null;
+        }
+
+        try {
+            $parsed = Carbon::parse($raw, self::ASSISTANT_TIMEZONE);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        if ($this->isAssistantDateTimeColumn($columnType)) {
+            return $parsed->startOfDay()->format('Y-m-d H:i:s');
+        }
+
+        return $parsed->format('Y-m-d');
+    }
+
+    private function normalizeAssistantTimeForColumn(mixed $value, ?string $columnType, ?string $normalizedDate): ?string
+    {
+        $minutes = $this->assistantTimeToMinutes($value);
+        if ($minutes === null) {
+            return null;
+        }
+
+        $time = sprintf('%02d:%02d:00', intdiv($minutes, 60), $minutes % 60);
+        if (! $this->isAssistantDateTimeColumn($columnType)) {
+            return $time;
+        }
+
+        try {
+            $datePart = $normalizedDate
+                ? Carbon::parse($normalizedDate, self::ASSISTANT_TIMEZONE)->format('Y-m-d')
+                : Carbon::now(self::ASSISTANT_TIMEZONE)->format('Y-m-d');
+        } catch (\Throwable) {
+            $datePart = Carbon::now(self::ASSISTANT_TIMEZONE)->format('Y-m-d');
+        }
+
+        return $datePart.' '.$time;
+    }
+
+    private function isAssistantDateTimeColumn(?string $columnType): bool
+    {
+        return in_array($columnType, ['datetime', 'timestamp'], true);
+    }
+
+    private function normalizeAssistantDayForScheduleColumn(string $dayLabel, int $dayIndex): string
+    {
+        if ($this->getAssistantColumnType('schedules', 'day_of_week') !== 'enum') {
+            return $dayLabel;
+        }
+
+        return match ($dayIndex) {
+            1 => 'Monday',
+            2 => 'Tuesday',
+            3 => 'Wednesday',
+            4 => 'Thursday',
+            5 => 'Friday',
+            6 => 'Saturday',
+            default => 'Sunday',
+        };
     }
 
     private function buildAssistantOfflineReply(string $message): string
@@ -1041,19 +2081,7 @@ class AIService
             return 'รับทราบค่ะ ตอนนี้ยังไม่มีข้อความคำถาม หากต้องการให้ช่วยวางแผนหรือสรุปบทเรียน พิมพ์หัวข้อที่ต้องการได้เลยค่ะ';
         }
 
-        if (str_contains($text, 'สรุป') || str_contains($text, 'summary')) {
-            return 'ได้ค่ะ ส่งหัวข้อหรือเนื้อหาที่ต้องการสรุปมาได้เลย แล้วฉันจะช่วยจัดสรุปแบบสั้น กระชับ และอ่านทบทวนง่ายให้ทันทีค่ะ';
-        }
-
-        if (str_contains($text, 'แบบฝึกหัด') || str_contains($text, 'quiz') || str_contains($text, 'ข้อสอบ')) {
-            return 'ได้ค่ะ ไปที่เมนูแบบฝึกหัด เลือกวิชา ระดับความยาก และจำนวนข้อ จากนั้นกดสร้างได้เลย หากต้องการฉันช่วยออกแนวข้อสอบก่อนสร้าง พิมพ์หัวข้อที่อยากฝึกมาได้ค่ะ';
-        }
-
-        if (str_contains($text, 'ตาราง') || str_contains($text, 'แผน') || str_contains($text, 'อ่านหนังสือ')) {
-            return 'ได้ค่ะ แนะนำเริ่มจากแบ่งเวลา 25-30 นาทีต่อรอบ แล้วพัก 5 นาที ทำ 4 รอบต่อวิชา และทบทวนสรุปสั้นท้ายวัน 10 นาที หากบอกเวลาว่างของคุณ ฉันจะจัดตารางรายวันให้ละเอียดได้ค่ะ';
-        }
-
-        return 'รับทราบค่ะ ตอนนี้ระบบ AI ภายนอกมีปัญหาชั่วคราว แต่ฉันยังช่วยวางแผนการเรียน สรุปหัวข้อ และจัดแนวฝึกให้ได้ พิมพ์สิ่งที่อยากให้ช่วยต่อได้เลยค่ะ';
+        return 'ตอนนี้ระบบ AI ภายนอกมีปัญหาชั่วคราว จึงยังตอบคำถามทั่วไปแบบเปิดไม่ได้ค่ะ แต่ฉันบันทึกข้อความของคุณไว้แล้ว กรุณาลองส่งใหม่อีกครั้งเมื่อระบบพร้อมใช้งานค่ะ';
     }
 
     private function buildAssistantContext(User $user): string
@@ -1418,6 +2446,10 @@ class AIService
             return false;
         }
 
+        if ($question->question_type === 'true_false') {
+            return $this->normalizeTrueFalseAnswer($selectedText) === $this->normalizeTrueFalseAnswer($correctText);
+        }
+
         if (Str::lower($selectedText) === Str::lower($correctText)) {
             return true;
         }
@@ -1537,7 +2569,7 @@ class AIService
         throw new RuntimeException('ไม่สามารถถอดเสียงจากไฟล์นี้ได้: '.implode(' | ', $errors));
     }
 
-    public function summarizeAudio(UploadedFile $file): array
+    public function summarizeAudio(UploadedFile $file, string $summaryPeriod = 'daily'): array
     {
         $transcript = $this->transcribeAudio($file);
         $text = trim((string) ($transcript['text'] ?? ''));
@@ -1546,12 +2578,22 @@ class AIService
             throw new RuntimeException('ไม่สามารถถอดเสียงจากไฟล์นี้ได้อย่างน่าเชื่อถือ');
         }
 
+        $periodInstruction = match ($summaryPeriod) {
+            'weekly' => 'จัดสรุปในมุมมองรายสัปดาห์ โดยเชื่อมโยงหัวข้อที่เกี่ยวข้องเป็นภาพรวมเดียวกัน',
+            'monthly' => 'จัดสรุปในมุมมองรายเดือน โดยเน้นภาพรวม หัวข้อหลัก และความคืบหน้าระยะยาว',
+            default => 'จัดสรุปในมุมมองรายวัน โดยเน้นเนื้อหาและสิ่งที่ได้เรียนจากเสียงครั้งนี้',
+        };
+
         $summary = $this->summarizeText(
             $text,
-            'สรุปใจความจากเสียงแบบไฟล์ต่อไฟล์ตาม transcript ที่ให้มา โดยกระชับ เป็น bullet และคงคำสำคัญจากต้นฉบับ'
+            'อ่านข้อความถอดเสียงต่อไปนี้แล้วสรุปเป็นภาษาไทยเท่านั้น ห้ามแต่งข้อมูลนอก transcript '
+            .$periodInstruction.'. '
+            .'ใช้รูปแบบนี้เท่านั้น: "สรุปภาพรวม:" 1-2 ประโยค, "ใจความสำคัญล่าสุด:" เป็น bullet 3-6 ข้อโดยเน้นประเด็นท้าย ๆ หรือสิ่งที่เพิ่งพูดล่าสุด, '
+            .'"ประเด็นสำคัญทั้งหมด:" เป็น bullet 3-6 ข้อ, และ "สิ่งที่ควรทำต่อ:" เป็น bullet 1-3 ข้อถ้ามีข้อมูลเพียงพอ '
+            .'ถ้า transcript เป็นภาษาอังกฤษให้แปลใจความเป็นไทยก่อนสรุป แต่คงคำศัพท์เฉพาะที่จำเป็น'
         );
         if (trim($summary) === '') {
-            $summary = $this->fallbackSummaryFromText($text);
+            $summary = $this->fallbackAudioSummaryFromTranscript($text);
         }
         $summary = $this->normalizeAudioDisplayText($summary);
 
@@ -1591,6 +2633,10 @@ class AIService
                 'text' => $localText,
                 'model' => $this->summaryModel(),
             ];
+        }
+
+        if (! $this->hasFileDocumentAIKey()) {
+            throw new RuntimeException($this->unreadableDocumentMessage($extension));
         }
 
         if (! $this->hasAnyAIKey()) {
@@ -1664,28 +2710,103 @@ class AIService
         ];
     }
 
+    /**
+     * Read image-only PDF pages rendered by the browser using Groq Vision OCR.
+     *
+     * @param  array<int, UploadedFile>  $images
+     * @return array{text: string, model: string}
+     */
+    public function extractDocumentImageText(array $images): array
+    {
+        if (! $this->hasGroqKey()) {
+            throw new RuntimeException('ไม่พบ Groq API key สำหรับอ่านข้อความจาก PDF สแกน');
+        }
+
+        $content = [[
+            'type' => 'text',
+            'text' => 'ทำ OCR จากภาพเอกสารตามลำดับหน้า รองรับภาษาไทยและอังกฤษ '
+                .'ถอดข้อความให้ครบและตรงต้นฉบับ รักษาหัวข้อและขึ้นบรรทัดใหม่ตามเนื้อหา '
+                .'ตอบเฉพาะข้อความที่อ่านได้ ห้ามสรุป ห้ามอธิบายเพิ่มเติม',
+        ]];
+
+        foreach (array_slice($images, 0, 3) as $image) {
+            if (! $image instanceof UploadedFile || ! $image->isValid()) {
+                continue;
+            }
+
+            $mimeType = strtolower((string) ($image->getMimeType() ?: $image->getClientMimeType()));
+            if (! in_array($mimeType, ['image/jpeg', 'image/png', 'image/webp'], true)) {
+                continue;
+            }
+
+            $content[] = [
+                'type' => 'image_url',
+                'image_url' => [
+                    'url' => 'data:'.$mimeType.';base64,'.base64_encode((string) $image->get()),
+                ],
+            ];
+        }
+
+        if (count($content) === 1) {
+            throw new RuntimeException('ไม่พบภาพหน้าของ PDF สำหรับอ่านข้อความ');
+        }
+
+        $apiKey = (string) (config('ai.groq.api_key') ?: env('GROQ_API_KEY'));
+        $baseUri = rtrim((string) (config('ai.groq.base_uri') ?: 'https://api.groq.com/openai/v1'), '/');
+        $model = (string) (config('ai.groq.vision_model') ?: 'qwen/qwen3.6-27b');
+        $response = Http::withToken($apiKey)
+            ->acceptJson()
+            ->connectTimeout(15)
+            ->timeout(180)
+            ->retry(1, 800, throw: false)
+            ->post($baseUri.'/chat/completions', [
+                'model' => $model,
+                'messages' => [[
+                    'role' => 'user',
+                    'content' => $content,
+                ]],
+                'reasoning_effort' => 'none',
+                'temperature' => 0,
+                'max_completion_tokens' => 8192,
+            ]);
+
+        if (! $response->successful()) {
+            $message = trim((string) ($response->json('error.message') ?? $response->body()));
+            throw new RuntimeException('Groq Vision อ่าน PDF ไม่สำเร็จ'.($message !== '' ? ': '.$message : ''));
+        }
+
+        $text = $this->normalizeToUtf8((string) $response->json('choices.0.message.content', ''));
+        if (! $this->isUsableLocalText($text, 'txt')) {
+            throw new RuntimeException('ไม่พบข้อความที่อ่านได้ใน PDF สแกน');
+        }
+
+        return [
+            'text' => $text,
+            'model' => $model,
+        ];
+    }
+
     public function summarizeDocument(UploadedFile $file): array
     {
         $extension = strtolower($file->getClientOriginalExtension() ?? '');
         $localText = $this->extractLocalText($file);
         if ($this->isUsableLocalText($localText, $extension)) {
-            $summary = $this->summarizeText(
-                $localText,
-                'อ่านข้อความต่อไปนี้ ซึ่งอาจเป็นภาษาไทยหรือภาษาอังกฤษ แล้วสรุปผลลัพธ์เป็นภาษาไทยเท่านั้นแบบกระชับ ระบุ bullet หัวข้อสำคัญ และ action items สั้นๆ หากต้นฉบับเป็นภาษาอังกฤษให้แปลใจความเป็นไทยก่อนสรุป'
-            );
+            return $this->summarizeDocumentText($localText);
+        }
 
-            return [
-                'summary' => $summary,
-                'text' => $localText,
-                'model' => $this->summaryModel(),
-            ];
+        if (! $this->hasFileDocumentAIKey()) {
+            throw new RuntimeException($this->unreadableDocumentMessage($extension));
         }
 
         if (! $this->hasAnyAIKey()) {
             throw new RuntimeException('ไม่พบ API key สำหรับสรุปเอกสาร กรุณาอัปโหลดไฟล์ DOCX หรือ TXT');
         }
 
-        $prompt = 'อ่านไฟล์ที่แนบมา ซึ่งอาจเป็นภาษาไทยหรือภาษาอังกฤษ แล้วสรุปผลลัพธ์เป็นภาษาไทยเท่านั้นแบบกระชับ ระบุ bullet หัวข้อสำคัญ และ action items สั้นๆ หากต้นฉบับเป็นภาษาอังกฤษให้แปลใจความเป็นไทยก่อนสรุป';
+        $prompt = 'อ่านไฟล์ที่แนบมา ซึ่งอาจเป็นภาษาไทยหรือภาษาอังกฤษ แล้วสรุปผลลัพธ์เป็นภาษาไทยเท่านั้นให้อ่านง่าย '
+            .'ใช้รูปแบบนี้เท่านั้น: "สรุปภาพรวม:" 2-3 ประโยค, "ประเด็นสำคัญ:" เป็น bullet 4-6 ข้อ, '
+            .'"สิ่งที่ควรจำ:" เป็น bullet 3-5 ข้อ, และ "สิ่งที่ควรทำต่อ:" เป็น bullet สั้นๆ 1-3 ข้อ '
+            .'ไม่เขียนย่อหน้ายาวติดกัน หากต้นฉบับเป็นภาษาอังกฤษให้แปลใจความเป็นไทยก่อนสรุป '
+            .'ห้ามตัดข้อความหรือใช้เครื่องหมาย ... แทนเนื้อหาที่ยังแสดงไม่ครบ';
 
         if ($this->useGemini()) {
             $geminiError = null;
@@ -1702,7 +2823,7 @@ class AIService
                     $fallbackLocalText = $this->extractLocalText($file);
                     if ($this->isUsableLocalText($fallbackLocalText, $extension)) {
                         return [
-                            'summary' => $this->fallbackSummaryFromText($fallbackLocalText),
+                            'summary' => $this->fallbackSummaryFromText($fallbackLocalText, preserveFullText: true),
                             'text' => $fallbackLocalText,
                             'model' => 'fallback-local',
                         ];
@@ -1727,7 +2848,7 @@ class AIService
                     $fallbackLocalText = $this->extractLocalText($file);
                     if ($this->isUsableLocalText($fallbackLocalText, $extension)) {
                         return [
-                            'summary' => $this->fallbackSummaryFromText($fallbackLocalText),
+                            'summary' => $this->fallbackSummaryFromText($fallbackLocalText, preserveFullText: true),
                             'text' => $fallbackLocalText,
                             'model' => 'fallback-local',
                         ];
@@ -1739,6 +2860,30 @@ class AIService
 
         return [
             'summary' => $summary,
+            'model' => $this->summaryModel(),
+        ];
+    }
+
+    public function summarizeDocumentText(string $text): array
+    {
+        $text = $this->normalizeToUtf8($text);
+        if (! $this->isUsableLocalText($text, 'txt')) {
+            throw new RuntimeException('ข้อความจากเอกสารสั้นเกินไปหรืออ่านไม่ได้ กรุณาลองไฟล์อื่น');
+        }
+
+        $summary = $this->summarizeText(
+            $text,
+            'อ่านข้อความต่อไปนี้ ซึ่งอาจเป็นภาษาไทยหรือภาษาอังกฤษ แล้วสรุปผลลัพธ์เป็นภาษาไทยเท่านั้นให้อ่านง่าย '
+            .'ใช้รูปแบบนี้เท่านั้น: "สรุปภาพรวม:" 2-3 ประโยค, "ประเด็นสำคัญ:" เป็น bullet 4-6 ข้อ, '
+            .'"สิ่งที่ควรจำ:" เป็น bullet 3-5 ข้อ, และ "สิ่งที่ควรทำต่อ:" เป็น bullet สั้นๆ 1-3 ข้อ '
+            .'ไม่เขียนย่อหน้ายาวติดกัน หากต้นฉบับเป็นภาษาอังกฤษให้แปลใจความเป็นไทยก่อนสรุป '
+            .'ห้ามตัดข้อความหรือใช้เครื่องหมาย ... แทนเนื้อหาที่ยังแสดงไม่ครบ',
+            preserveFullFallbackText: true
+        );
+
+        return [
+            'summary' => $summary,
+            'text' => $text,
             'model' => $this->summaryModel(),
         ];
     }
@@ -1768,6 +2913,24 @@ class AIService
         }
 
         return $this->extractLooseText($file);
+    }
+
+    private function hasFileDocumentAIKey(): bool
+    {
+        return $this->hasGeminiKey() || $this->hasOpenAIKey();
+    }
+
+    private function unreadableDocumentMessage(string $extension): string
+    {
+        if ($extension === 'pdf') {
+            return 'PDF นี้อ่านข้อความจากไฟล์ไม่ได้ อาจเป็นไฟล์สแกนหรือใช้ฟอนต์เข้ารหัส กรุณาอัปโหลดไฟล์ DOCX/TXT หรือเปิดใช้งาน Gemini/OpenAI สำหรับอ่านไฟล์ PDF';
+        }
+
+        if ($extension === 'doc') {
+            return 'ไฟล์ DOC รุ่นเก่านี้อ่านข้อความโดยตรงไม่ได้ กรุณาแปลงเป็น DOCX/TXT หรือเปิดใช้งาน Gemini/OpenAI สำหรับอ่านไฟล์เอกสาร';
+        }
+
+        return 'ไม่สามารถอ่านข้อความจากเอกสารนี้ได้ กรุณาอัปโหลด DOCX/TXT ที่คัดลอกข้อความได้ หรือเปิดใช้งาน Gemini/OpenAI สำหรับอ่านไฟล์เอกสาร';
     }
 
     private function extractDocxText(UploadedFile $file): ?string
@@ -2272,10 +3435,10 @@ class AIService
             if ($this->looksLikeMojibake($content)) {
                 $repaired = $this->repairMojibakeUtf8AsLatin1($content);
                 if ($repaired !== null && ! $this->looksLikeMojibake($repaired)) {
-                    return $repaired;
+                    return $this->repairSpacedThaiText($repaired);
                 }
             }
-            return $content;
+            return $this->repairSpacedThaiText($content);
         }
 
         // Use canonical encoding names supported by mbstring.
@@ -2286,12 +3449,35 @@ class AIService
                 continue;
             }
             if (mb_check_encoding($converted, 'UTF-8')) {
-                return $converted;
+                return $this->repairSpacedThaiText($converted);
             }
         }
 
         $auto = $this->safeConvertEncoding($content, 'UTF-8', 'auto');
-        return $auto !== null ? $auto : $content;
+        return $this->repairSpacedThaiText($auto !== null ? $auto : $content);
+    }
+
+    private function repairSpacedThaiText(string $text): string
+    {
+        if ($text === '') {
+            return '';
+        }
+
+        $thaiChars = preg_match_all('/\p{Thai}/u', $text);
+        $spacedThaiPairs = preg_match_all('/\p{Thai}[\h\x{00A0}]+(?=\p{Thai})/u', $text);
+        if (($thaiChars ?: 0) < 20 || ($spacedThaiPairs ?: 0) < 8) {
+            return $text;
+        }
+
+        if (($spacedThaiPairs ?: 0) / max(1, ($thaiChars ?: 0)) < 0.12) {
+            return $text;
+        }
+
+        $text = preg_replace('/(\p{Thai})[\h\x{00A0}]+(?=\p{Thai})/u', '$1', $text) ?? $text;
+        $text = preg_replace('/[\h\x{00A0}]{2,}/u', ' ', $text) ?? $text;
+        $text = preg_replace('/\s+([,.;:!?])/u', '$1', $text) ?? $text;
+
+        return trim($text);
     }
 
     private function safeConvertEncoding(string $value, string $to, string $from): ?string
@@ -2460,14 +3646,14 @@ class AIService
         return true;
     }
 
-    private function summarizeText(string $text, string $prompt): string
+    private function summarizeText(string $text, string $prompt, bool $preserveFullFallbackText = false): string
     {
         $text = trim($text);
         if ($text === '') {
             return '';
         }
 
-        $fallback = fn () => $this->fallbackSummaryFromText($text);
+        $fallback = fn () => $this->fallbackSummaryFromText($text, $preserveFullFallbackText);
 
         if ($this->useGemini()) {
             if (! $this->hasGeminiKey() && ! $this->hasFallbackTextKey()) {
@@ -2498,7 +3684,7 @@ class AIService
         }
     }
 
-    private function fallbackSummaryFromText(string $text): string
+    private function fallbackSummaryFromText(string $text, bool $preserveFullText = false): string
     {
         $text = trim($text);
         if ($text === '') {
@@ -2512,20 +3698,97 @@ class AIService
 
         $lines = array_values(array_filter($lines, fn (string $line) => mb_strlen($line, 'UTF-8') >= 12));
         if ($lines === []) {
+            return $preserveFullText ? $text : $this->clipText($text, 300);
+        }
+
+        $overview = $preserveFullText ? $lines[0] : $this->clipText($lines[0], 240);
+        $keyPoints = array_slice($lines, 1, 5);
+        if ($keyPoints === []) {
+            $keyPoints = array_slice($lines, 0, 4);
+        }
+        $bullets = array_map(
+            fn (string $line) => '- '.($preserveFullText ? $line : $this->clipText($line, 180)),
+            $keyPoints
+        );
+
+        return "สรุปภาพรวม:\n{$overview}\n\nประเด็นสำคัญ:\n".implode("\n", $bullets);
+    }
+
+    private function fallbackAudioSummaryFromTranscript(string $text): string
+    {
+        $text = trim($this->normalizeAudioTranscriptText($text));
+        if ($text === '') {
+            return '';
+        }
+
+        $segments = $this->splitSentences($text);
+        if (count($segments) < 3) {
+            $segments = $this->splitLines($text);
+        }
+
+        $segments = array_values(array_filter(
+            array_map(fn (string $line) => trim($line), $segments),
+            fn (string $line) => mb_strlen($line, 'UTF-8') >= 12
+        ));
+
+        if ($segments === []) {
             return $this->clipText($text, 300);
         }
 
-        $lines = array_slice($lines, 0, 5);
-        $bullets = array_map(fn (string $line) => '- '.$this->clipText($line, 180), $lines);
+        $overview = $this->clipText(implode(' ', array_slice($segments, 0, 2)), 260);
+        $latest = $this->latestUniqueAudioSegments($segments, 5);
+        $important = array_slice($segments, 0, 6);
 
-        return implode("\n", $bullets);
+        return implode("\n", array_filter([
+            "สรุปภาพรวม:\n{$overview}",
+            "ใจความสำคัญล่าสุด:\n".implode("\n", array_map(
+                fn (string $line) => '- '.$this->clipText($line, 180),
+                $latest
+            )),
+            "ประเด็นสำคัญทั้งหมด:\n".implode("\n", array_map(
+                fn (string $line) => '- '.$this->clipText($line, 180),
+                $important
+            )),
+        ]));
+    }
+
+    /**
+     * @param array<int,string> $segments
+     * @return array<int,string>
+     */
+    private function latestUniqueAudioSegments(array $segments, int $limit): array
+    {
+        $latest = [];
+        $seen = [];
+
+        for ($index = count($segments) - 1; $index >= 0 && count($latest) < $limit; $index--) {
+            $segment = trim((string) $segments[$index]);
+            if ($segment === '') {
+                continue;
+            }
+
+            $key = mb_strtolower(preg_replace('/[^\p{Thai}\p{Latin}\p{N}]+/u', '', $segment) ?? $segment, 'UTF-8');
+            $key = mb_substr($key, 0, 80, 'UTF-8');
+            if ($key === '' || isset($seen[$key])) {
+                continue;
+            }
+
+            $seen[$key] = true;
+            array_unshift($latest, $segment);
+        }
+
+        return $latest;
     }
 
     private function normalizeAudioSummary(string $summary, string $transcript = ''): string
     {
-        $summary = trim($summary);
+        $summary = $this->normalizeAudioDisplayText($summary);
         if ($summary === '') {
-            return $transcript !== '' ? $this->fallbackSummaryFromText($transcript) : '';
+            return $transcript !== '' ? $this->fallbackAudioSummaryFromTranscript($transcript) : '';
+        }
+
+        if (preg_match('/(สรุปภาพรวม|ใจความสำคัญล่าสุด|ประเด็นสำคัญทั้งหมด|สิ่งที่ควรทำต่อ)\s*:/u', $summary) === 1) {
+            return $summary;
         }
 
         $lines = $this->splitLines($summary);
@@ -2539,13 +3802,20 @@ class AIService
         ), fn (string $line) => $line !== ''));
 
         if ($lines === []) {
-            return $transcript !== '' ? $this->fallbackSummaryFromText($transcript) : $this->clipText($summary, 300);
+            return $transcript !== '' ? $this->fallbackAudioSummaryFromTranscript($transcript) : $this->clipText($summary, 300);
         }
 
         $lines = array_slice($lines, 0, 6);
         $bullets = array_map(fn (string $line) => '- '.$this->clipText($line, 180), $lines);
 
-        return implode("\n", $bullets);
+        if ($transcript !== '') {
+            $fallback = $this->fallbackAudioSummaryFromTranscript($transcript);
+            if ($fallback !== '') {
+                return $fallback;
+            }
+        }
+
+        return "ใจความสำคัญล่าสุด:\n".implode("\n", $bullets);
     }
 
     /**
@@ -2617,7 +3887,7 @@ class AIService
         }
         $segments = array_values(array_filter($segments, fn (string $line) => mb_strlen($line, 'UTF-8') >= 12));
         if ($segments === []) {
-            $segments = [$this->clipText($source, 160)];
+            $segments = [$source];
         }
 
         $keywords = $this->extractKeywords($source);
@@ -2639,11 +3909,13 @@ class AIService
         for ($index = 0; $index < $questionCount; $index++) {
             $type = $types[$index % count($types)];
             $segment = $countSegments > 0 ? $segments[$index % $countSegments] : $source;
-            $segment = $this->clipText($segment, 160);
-            $keyword = $this->pickKeywordFromSegment($segment, $keywords)
-                ?? $keywords[$index % $countKeywords]
+            // Pick a different source keyword for each generated item where
+            // possible. Previously pickKeywordFromSegment always selected the
+            // first match, so looping over a short document produced identical
+            // true/false and multiple-choice questions.
+            $keyword = $keywords[$index % $countKeywords]
+                ?? $this->pickKeywordFromSegment($segment, $keywords)
                 ?? '';
-            $keyword = $this->clipText($keyword, 80);
 
             if ($type === 'true_false') {
                 $statement = $keyword !== '' ? "เอกสารกล่าวถึง {$keyword}" : $segment;
@@ -3419,7 +4691,15 @@ class AIService
 
     private function useGroq(): bool
     {
-        return strtolower((string) (config('ai.provider') ?: env('AI_PROVIDER'))) === 'groq';
+        $provider = strtolower((string) (config('ai.provider') ?: env('AI_PROVIDER')));
+
+        if ($provider === 'groq') {
+            return $this->hasGroqKey();
+        }
+
+        return $this->hasGroqKey()
+            && ! $this->hasOpenAIKey()
+            && ! $this->hasGeminiKey();
     }
 
     private function hasGeminiKey(): bool
@@ -3485,7 +4765,7 @@ class AIService
 
     private function groqModel(): string
     {
-        return (string) (config('ai.groq.model') ?: env('GROQ_MODEL') ?: 'llama-3.1-8b-instant');
+        return (string) (config('ai.groq.model') ?: env('GROQ_MODEL') ?: 'openai/gpt-oss-20b');
     }
 
     private function textClient()
@@ -3598,66 +4878,118 @@ class AIService
     }
 
     /**
-     * @return array{context: string, summary_ids: array<int>, source: string}
+     * @return array{context: string, summary_ids: array<int>, study_log_ids: array<int>, file_ids: array<int>, source: string}
      */
     private function quizSourceContext(Subject $subject): array
     {
-        $summaries = Summary::query()
-            ->select('summaries.id', 'summaries.content', 'study_logs.title', 'study_logs.log_date')
-            ->join('study_logs', 'summaries.study_log_id', '=', 'study_logs.id')
-            ->where('study_logs.subject_id', $subject->id)
-            ->orderByDesc('summaries.created_at')
-            ->limit(3)
-            ->get();
-
-        if ($summaries->isNotEmpty()) {
-            $lines = $summaries->map(function ($summary) {
-                $date = $summary->log_date ? Carbon::parse($summary->log_date)->toDateString() : null;
-                $title = $summary->title ?: 'Study Log';
-                $content = $this->trimContext($summary->content);
-                $label = $date ? "{$title} ({$date})" : $title;
-
-                return "- {$label}: {$content}";
-            })->values()->all();
-
-            return [
-                'context' => implode("\n", $lines),
-                'summary_ids' => $summaries->pluck('id')->all(),
-                'source' => 'summary',
-            ];
-        }
-
         $logs = StudyLog::query()
-            ->select('title', 'note', 'log_date')
+            ->with([
+                'summaries' => fn ($query) => $query->latest(),
+                'files',
+            ])
             ->where('subject_id', $subject->id)
             ->orderByDesc('log_date')
-            ->limit(3)
+            ->orderByDesc('created_at')
+            ->limit(6)
             ->get();
 
-        if ($logs->isNotEmpty()) {
-            $lines = $logs->map(function ($log) {
-                $date = $log->log_date ? Carbon::parse($log->log_date)->toDateString() : null;
-                $title = $log->title ?: 'Study Log';
-                $note = $this->trimContext($log->note ?: '');
-                $label = $date ? "{$title} ({$date})" : $title;
+        $lines = [];
+        $summaryIds = [];
+        $studyLogIds = [];
+        $fileIds = [];
+        $hasRealEvidence = false;
 
-                return $note ? "- {$label}: {$note}" : "- {$label}";
-            })->values()->all();
+        foreach ($logs as $log) {
+            /** @var StudyLog $log */
+            $studyLogIds[] = (int) $log->id;
+            $date = $log->log_date ? Carbon::parse($log->log_date)->toDateString() : null;
+            $label = trim((string) ($log->title ?: 'บันทึกการเรียน'));
+            $heading = $date ? "{$label} ({$date})" : $label;
+            $parts = [];
 
+            if (trim((string) $log->note) !== '') {
+                $parts[] = 'โน้ตผู้เรียน: '.$this->trimContext($log->note, 900);
+                $hasRealEvidence = true;
+            }
+
+            foreach ($log->summaries->take(2) as $summary) {
+                /** @var Summary $summary */
+                if (trim((string) $summary->content) === '') {
+                    continue;
+                }
+
+                $summaryIds[] = (int) $summary->id;
+                $parts[] = 'สรุปจากงานที่บันทึก: '.$this->trimContext($summary->content, 900);
+                $hasRealEvidence = true;
+            }
+
+            foreach ($log->files as $file) {
+                /** @var FileAttachment $file */
+                $fileIds[] = (int) $file->id;
+                $fileLine = 'ไฟล์ที่อัปโหลด: '.trim((string) ($file->original_name ?: basename((string) $file->file_path)));
+                $fileText = $this->quizFileEvidenceText($file);
+                if ($fileText !== '') {
+                    $fileLine .= "\nข้อความจากไฟล์: ".$fileText;
+                    $hasRealEvidence = true;
+                }
+                $parts[] = $fileLine;
+            }
+
+            if ($parts !== []) {
+                $lines[] = "- {$heading}\n  ".implode("\n  ", $parts);
+                $hasRealEvidence = true;
+            } elseif ($heading !== '') {
+                $lines[] = "- {$heading}";
+            }
+        }
+
+        if ($lines !== []) {
             return [
                 'context' => implode("\n", $lines),
-                'summary_ids' => [],
-                'source' => 'study_log',
+                'summary_ids' => array_values(array_unique($summaryIds)),
+                'study_log_ids' => array_values(array_unique($studyLogIds)),
+                'file_ids' => array_values(array_unique($fileIds)),
+                'source' => $hasRealEvidence ? 'learner_evidence' : 'study_log',
             ];
         }
 
         $fallback = $subject->description ? $this->trimContext($subject->description) : $subject->name;
 
         return [
-            'context' => "- Subject overview: {$fallback}",
+            'context' => "- ยังไม่มีบันทึกหรือไฟล์จริงในรายวิชานี้\n- รายละเอียดวิชา: {$fallback}",
             'summary_ids' => [],
+            'study_log_ids' => [],
+            'file_ids' => [],
             'source' => 'subject',
         ];
+    }
+
+    private function quizFileEvidenceText(FileAttachment $file): string
+    {
+        if (! $file->file_path || ! Storage::disk('public')->exists($file->file_path)) {
+            return '';
+        }
+
+        $extension = strtolower(pathinfo((string) $file->original_name, PATHINFO_EXTENSION));
+        if (! in_array($extension, ['pdf', 'docx', 'txt'], true)) {
+            return '';
+        }
+
+        try {
+            $path = Storage::disk('public')->path($file->file_path);
+            $uploaded = new UploadedFile(
+                $path,
+                $file->original_name ?: basename($path),
+                $file->mime_type,
+                null,
+                true
+            );
+            $text = $this->extractDocumentTextBestEffort($uploaded);
+        } catch (\Throwable) {
+            return '';
+        }
+
+        return is_string($text) ? $this->trimContext($text, 1000) : '';
     }
 
     private function trimContext(?string $content, int $limit = 1500): string
@@ -3684,9 +5016,14 @@ class AIService
         array $types,
         array $metadata
     ): array {
+        $title = $this->normalizeQuizText($decoded['title'] ?? ($subject->name.' Quiz'));
+        $description = array_key_exists('description', $decoded)
+            ? $this->normalizeQuizText($decoded['description'])
+            : null;
+
         return [
-            'title' => $decoded['title'] ?? ($subject->name.' Quiz'),
-            'description' => $decoded['description'] ?? null,
+            'title' => $title !== '' ? $title : 'แบบฝึกหัด',
+            'description' => $description !== '' ? $description : null,
             'model' => $this->quizModel(),
             'metadata' => array_merge([
                 'difficulty' => $difficulty,
@@ -3702,8 +5039,9 @@ class AIService
      */
     private function normalizeQuizQuestions(array $questions, int $questionCount): array
     {
-        return collect($questions)
-            ->take($questionCount)
+        $seenQuestions = [];
+
+        $normalized = collect($questions)
             ->map(function (array $question) {
                 $type = $question['question_type'] ?? 'multiple_choice';
                 $allowed = ['multiple_choice', 'true_false', 'short_answer'];
@@ -3711,14 +5049,23 @@ class AIService
                     $type = 'multiple_choice';
                 }
 
-                $questionText = trim((string) ($question['question_text'] ?? 'Question'));
-                $correctAnswer = trim((string) ($question['correct_answer'] ?? ''));
+                $questionText = $this->normalizeQuizText($question['question_text'] ?? 'Question');
+                $correctAnswer = $this->normalizeQuizText($question['correct_answer'] ?? '');
+                if ($type === 'true_false') {
+                    $correctAnswer = $this->normalizeTrueFalseAnswer($correctAnswer);
+                }
                 $options = $question['options'] ?? null;
                 if (is_string($options)) {
-                    $options = array_values(array_filter(array_map('trim', explode('|', $options))));
+                    $options = array_values(array_filter(array_map(
+                        fn ($option) => $this->normalizeQuizText($option),
+                        explode('|', $options)
+                    )));
                 }
                 if (is_array($options)) {
-                    $options = array_values(array_filter($options, fn ($option) => trim((string) $option) !== ''));
+                    $options = array_values(array_filter(array_map(
+                        fn ($option) => $this->normalizeQuizText($option),
+                        $options
+                    ), fn (string $option) => $option !== ''));
                 }
 
                 if ($type === 'multiple_choice') {
@@ -3732,9 +5079,80 @@ class AIService
                     'question_type' => $type,
                     'options' => $options ?: null,
                     'correct_answer' => $correctAnswer !== '' ? $correctAnswer : null,
-                    'explanation' => $question['explanation'] ?? null,
+                    'explanation' => isset($question['explanation'])
+                        ? ($this->normalizeQuizText($question['explanation']) ?: null)
+                        : null,
                 ];
-            })->values()->all();
+            })
+            ->filter(function (array $question) use (&$seenQuestions) {
+
+                // Options and the explanation may vary while the question a
+                // learner sees is still the same. Keep only the first version.
+                $signature = mb_strtolower(
+                    preg_replace('/\s+/u', ' ', trim($question['question_text'])) ?? '',
+                    'UTF-8'
+                );
+
+                if ($signature === '' || isset($seenQuestions[$signature])) {
+                    return false;
+                }
+
+                $seenQuestions[$signature] = true;
+
+                return true;
+            })
+            ->take($questionCount);
+
+        return $normalized->values()->all();
+    }
+
+    private function normalizeQuizText(mixed $value): string
+    {
+        if (is_array($value)) {
+            $value = implode(' ', array_filter(array_map(
+                fn ($item) => $this->normalizeQuizText($item),
+                $value
+            ), fn (string $item) => $item !== ''));
+        } elseif (is_object($value)) {
+            $value = method_exists($value, '__toString') ? (string) $value : '';
+        } elseif (is_bool($value)) {
+            $value = $value ? 'true' : 'false';
+        } elseif ($value === null) {
+            $value = '';
+        } else {
+            $value = (string) $value;
+        }
+
+        $value = trim($this->normalizeToUtf8($value));
+
+        if ($value === '') {
+            return '';
+        }
+
+        if (! mb_check_encoding($value, 'UTF-8')) {
+            if (function_exists('mb_scrub')) {
+                $value = mb_scrub($value, 'UTF-8');
+            } else {
+                $converted = @iconv('UTF-8', 'UTF-8//IGNORE', $value);
+                $value = is_string($converted) ? $converted : '';
+            }
+        }
+
+        $value = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', ' ', $value) ?? $value;
+        $value = preg_replace('/[ \t]+/u', ' ', $value) ?? $value;
+
+        return trim($value);
+    }
+
+    private function normalizeTrueFalseAnswer(string $answer): string
+    {
+        $answer = Str::lower(trim($answer));
+
+        return match ($answer) {
+            'true', 'จริง', 'ถูก', 'ใช่', 'yes' => 'true',
+            'false', 'เท็จ', 'ผิด', 'ไม่ใช่', 'no' => 'false',
+            default => $answer,
+        };
     }
 
     /**
