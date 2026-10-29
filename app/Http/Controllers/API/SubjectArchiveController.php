@@ -38,6 +38,7 @@ class SubjectArchiveController extends Controller
         $data = $request->validate([
             'name' => ['nullable', 'string', 'max:255'],
             'description' => ['nullable', 'string'],
+            'source_type' => ['nullable', 'in:document-file,audio-file,live-audio'],
             'color' => ['nullable', 'string', 'max:20'],
             'target_hours' => ['nullable', 'integer', 'min:0'],
             'start_date' => ['nullable', 'date'],
@@ -58,6 +59,7 @@ class SubjectArchiveController extends Controller
             'original_subject_id' => $subject->id,
             'name' => $data['name'] ?? $subject->name,
             'description' => $description,
+            'source_type' => $data['source_type'] ?? null,
             'color' => $data['color'] ?? $subject->color,
             'target_hours' => $data['target_hours'] ?? $subject->target_hours,
             'start_date' => $startDate,

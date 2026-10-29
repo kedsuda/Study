@@ -1,4 +1,5 @@
 import { Filter, PieChart } from "lucide-react";
+import { useSharedSubjectSelection } from '../../hooks/useAcademicSelection';
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../services/api";
@@ -73,7 +74,7 @@ const safeTrim = (value: unknown) =>
 export const StudyDigestPage = () => {
   const navigate = useNavigate();
   const [subjects, setSubjects] = useState<SubjectOption[]>([]);
-  const [selectedSubject, setSelectedSubject] = useState("all");
+  const [selectedSubject, setSelectedSubject] = useSharedSubjectSelection();
   const [range, setRange] = useState<StudySummaryRange>("today");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -141,7 +142,7 @@ export const StudyDigestPage = () => {
       );
       setLogs(nextLogs);
     } catch {
-      setError("โหลดข้อมูลสรุปการเรียนไม่สำเร็จ ลองใหม่อีกครั้งได้เลย");
+      setError("โหลดข้อมูลสรุปเนื้อหาไม่สำเร็จ ลองใหม่อีกครั้งได้เลย");
     } finally {
       setLoading(false);
     }
@@ -153,7 +154,7 @@ export const StudyDigestPage = () => {
 
   return (
     <div className="space-y-6 bg-[var(--bg-gradient)] pb-6 text-[color:var(--text)]">
-      <section className="mx-auto w-full max-w-6xl rounded-[2rem] border border-[color:var(--border)] bg-[color:var(--surface)] px-6 pb-8 pt-4 shadow-[0_14px_34px_rgba(15,23,42,0.12)]">
+      <section className="w-full rounded-[2rem] border border-[color:var(--border)] bg-[color:var(--surface)] px-6 pb-8 pt-4 shadow-[0_14px_34px_rgba(15,23,42,0.12)]">
         <button
           type="button"
           onClick={() => navigate("/ai-assistant")}
@@ -180,7 +181,7 @@ export const StudyDigestPage = () => {
               Study Summary
             </p>
             <h1 className="mt-1.5 text-[2.1rem] font-bold leading-tight text-[color:var(--text)]">
-              สรุปการเรียน
+              สรุปเนื้อหา
             </h1>
             <p className="mt-2 max-w-2xl text-base leading-7 text-[color:var(--muted)]">
               รองรับการสรุปข้อมูลจากไฟล์ Word (.doc/.docx), PDF และ TXT
@@ -201,7 +202,7 @@ export const StudyDigestPage = () => {
         </div>
       </section>
 
-      <div className="mx-auto w-full max-w-6xl space-y-6 px-6">
+      <div className="w-full space-y-6 px-6">
         <section className="rounded-[1.75rem] border border-[color:var(--border)] bg-[color:var(--surface)] p-6 shadow-[0_10px_26px_rgba(15,23,42,0.10)] backdrop-blur">
           <div className="mb-4 flex items-center gap-3">
             <div
@@ -220,7 +221,7 @@ export const StudyDigestPage = () => {
               className="rounded-full border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-2 text-sm font-bold text-[color:var(--text)] outline-none shadow-sm"
             >
               {subjects.map((subject) => (
-                <option key={subject.id} value={subject.name}>
+                <option key={subject.id} value={String(subject.id)}>
                   {subject.name}
                 </option>
               ))}
@@ -253,11 +254,11 @@ export const StudyDigestPage = () => {
           <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
             <div>
               <h3 className="text-lg font-bold text-[color:var(--text)]">
-                สรุปจากไฟล์และเก็บถาวร
+                สรุปจากไฟล์และไฟล์จากที่สรุป
               </h3>
               <p className="text-sm text-[color:var(--muted)]">
                 อัปโหลดเอกสารหรือไฟล์เสียงเพื่อสรุปด้วย AI
-                แล้วบันทึกสรุปหรือเก็บถาวรได้จากหน้านี้
+                แล้วบันทึกสรุปหรือไฟล์จากที่สรุปได้จากหน้านี้
               </p>
             </div>
             <span

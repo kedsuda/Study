@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="th">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/study/smart-learning-tracker-1/public/app/img/admin.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Smart Learning Tracker</title>
+    <script>
+      // Apply the saved theme before the first paint.
+      (() => {
+        let theme;
+        try { theme = localStorage.getItem('smart-classroom-theme'); } catch {}
+        if (theme !== 'dark' && theme !== 'light') {
+          theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.classList.add('theme-' + theme);
+      })();
+    </script>
+    <script type="module" crossorigin src="/study/smart-learning-tracker-1/public/app/assets/index-vvEovpeL.js"></script>
+    <link rel="stylesheet" crossorigin href="/study/smart-learning-tracker-1/public/app/assets/index-BHu2fLRy.css">
+      <base href="/study/smart-learning-tracker-1/public/app/">
+</head>
+  <body>
+    <div id="root"></div>
+  <script>
+(function () {
+    function improveDifficultyLayout() {
+        var labels = document.querySelectorAll('h1, h2, h3, h4, div, p, span, label');
+        for (var i = 0; i < labels.length; i++) {
+            var label = labels[i];
+            var text = (label.textContent || '').replace(/\s+/g, ' ').trim();
+            if (text !== 'ระดับความยาก') {
+                continue;
+            }
+
+            var card = label.closest('section, article, div');
+            if (!card) {
+                continue;
+            }
+
+            var groups = card.querySelectorAll('div, nav');
+            for (var g = 0; g < groups.length; g++) {
+                var group = groups[g];
+                var options = group.querySelectorAll('button, [role="button"]');
+                if (options.length < 3) {
+                    continue;
+                }
+
+                var matchCount = 0;
+                for (var o = 0; o < options.length; o++) {
+                    var optionText = (options[o].textContent || '').replace(/\s+/g, ' ').trim();
+                    if (optionText === 'ง่าย' || optionText === 'ปานกลาง' || optionText === 'มาก') {
+                        matchCount++;
+                    }
+                }
+                if (matchCount < 3) {
+                    continue;
+                }
+
+                group.style.display = 'flex';
+                group.style.gap = '8px';
+                group.style.flexWrap = 'nowrap';
+                group.style.justifyContent = 'space-between';
+                group.style.alignItems = 'center';
+
+                for (var j = 0; j < options.length; j++) {
+                    var btn = options[j];
+                    var btnText = (btn.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (btnText === 'ปานกลาง') {
+                        btn.textContent = 'กลาง';
+                    }
+                    btn.style.flex = '1 1 0';
+                    btn.style.minWidth = '72px';
+                    btn.style.whiteSpace = 'nowrap';
+                    btn.style.textAlign = 'center';
+                    btn.style.paddingLeft = '10px';
+                    btn.style.paddingRight = '10px';
+                }
+            }
+        }
+    }
+
+    function removeAddSubjectButton() {
+        var path = (window.location.pathname || '').toLowerCase();
+        if (path.indexOf('/calendar') === -1) {
+            return;
+        }
+
+        // Remove any direct "เพิ่มวิชา" action on calendar page.
+        var allActions = document.querySelectorAll('button, a');
+        for (var k = 0; k < allActions.length; k++) {
+            var actionNode = allActions[k];
+            var actionLabel = (actionNode.textContent || '').replace(/\s+/g, ' ').trim();
+            if (actionLabel === 'เพิ่มวิชา' || actionLabel.indexOf('เพิ่มวิชา') !== -1) {
+                actionNode.remove();
+            }
+        }
+
+        var titleNodes = document.querySelectorAll('h1, h2, h3, h4, div, p, span');
+        for (var i = 0; i < titleNodes.length; i++) {
+            var titleNode = titleNodes[i];
+            var titleText = (titleNode.textContent || '').replace(/\s+/g, ' ').trim();
+            if (titleText !== 'จัดการรายวิชาในระบบ') {
+                continue;
+            }
+
+            var container = titleNode.closest('section, article, div');
+            if (!container) {
+                continue;
+            }
+
+            var actionNodes = container.querySelectorAll('button, a');
+            for (var j = 0; j < actionNodes.length; j++) {
+                var action = actionNodes[j];
+                var actionText = (action.textContent || '').replace(/\s+/g, ' ').trim();
+                if (actionText === 'เพิ่มวิชา' || actionText.indexOf('เพิ่มวิชา') !== -1) {
+                    action.remove();
+                }
+            }
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () {
+            removeAddSubjectButton();
+            improveDifficultyLayout();
+        });
+    } else {
+        removeAddSubjectButton();
+        improveDifficultyLayout();
+    }
+
+    var observer = new MutationObserver(function () {
+        removeAddSubjectButton();
+        improveDifficultyLayout();
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+})();
+</script>
+</body>
+</html>

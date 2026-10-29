@@ -6,6 +6,7 @@ import { LAST_SUBJECT_KEY } from '../constants/storage';
 
 const TOKEN_KEY = 'token';
 const USER_KEY = 'user';
+const LOGIN_NOTIFICATION_POPUP_KEY = 'slt::notification-popup-after-login';
 
 type User = {
   id: number;
@@ -118,6 +119,7 @@ export const AuthProvider = ({ children }: PropsWithChildren) => {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(USER_KEY);
     localStorage.removeItem(LAST_SUBJECT_KEY);
+    sessionStorage.removeItem(LOGIN_NOTIFICATION_POPUP_KEY);
 
     setToken(null);
     setUser(null);
@@ -163,6 +165,7 @@ export const AuthProvider = ({ children }: PropsWithChildren) => {
     localStorage.removeItem(LAST_SUBJECT_KEY);
     localStorage.setItem(TOKEN_KEY, newToken);
     localStorage.setItem(USER_KEY, JSON.stringify(newUser));
+    sessionStorage.setItem(LOGIN_NOTIFICATION_POPUP_KEY, '1');
     setToken(newToken);
     setUser(newUser);
   };

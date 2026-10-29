@@ -196,9 +196,9 @@ class StudyCalendarEventController extends Controller
 
         $startTime = array_key_exists('start_time', $validated)
             ? Carbon::parse($validated['start_time'], self::CALENDAR_TIMEZONE)
-            : $calendar_event->start_time;
+            : $calendar_event->start_time->copy()->shiftTimezone(self::CALENDAR_TIMEZONE);
 
-        $endTime = $calendar_event->end_time;
+        $endTime = $calendar_event->end_time?->copy()->shiftTimezone(self::CALENDAR_TIMEZONE);
         if (array_key_exists('end_time', $validated)) {
             $endTime = $validated['end_time']
                 ? Carbon::parse($validated['end_time'], self::CALENDAR_TIMEZONE)
@@ -231,7 +231,9 @@ class StudyCalendarEventController extends Controller
             $endTime,
             $allDay,
             $eventType,
-            $shouldSyncSubject ? (int) $subjectId : null
+            // A linked class can be a manual override of the subject schedule.
+            // Its original subject timing is the same class, not a conflict.
+            $subjectId ? (int) $subjectId : null
         );
         if ($subjectConflict) {
             return response()->json(['message' => $this->subjectTimeConflictMessage($subjectConflict)], 422);
@@ -264,7 +266,7 @@ class StudyCalendarEventController extends Controller
         $eventPayload = [
             'subject_id' => $subjectId,
             'title' => $validated['title'] ?? $calendar_event->title,
-            'description' => $validated['description'] ?? $calendar_event->description,
+            'description' => array_key_exists('description', $validated) ? $validated['description'] : $calendar_event->description,
             'start_time' => $startTime,
             'end_time' => $endTime,
             'status' => $validated['status'] ?? $calendar_event->status,
@@ -669,12 +671,11 @@ class StudyCalendarEventController extends Controller
 
     private function classTimeConflictMessage(StudyCalendarEvent $conflict): string
     {
-        $timezone = config('app.timezone', 'Asia/Bangkok');
         $title = trim((string) ($conflict->subject?->name ?: $conflict->title));
         $timeRange = trim(
-            ($conflict->start_time ? $conflict->start_time->copy()->timezone($timezone)->format('H:i') : '')
+            ($conflict->start_time ? $conflict->start_time->format('H:i') : '')
             . '-'
-            . ($conflict->end_time ? $conflict->end_time->copy()->timezone($timezone)->format('H:i') : ''),
+            . ($conflict->end_time ? $conflict->end_time->format('H:i') : ''),
             '-'
         );
         $detail = $timeRange !== '' ? " เวลา {$timeRange}" : '';
@@ -714,7 +715,9 @@ class StudyCalendarEventController extends Controller
             $query->where('id', '<>', $ignoreSubjectId);
         }
 
-        $timezone = config('app.timezone', 'Asia/Bangkok');
+        // Subject columns store Thai timetable wall-clock values. Converting
+        // requests to app.timezone (often UTC) shifts them seven hours earlier.
+        $timezone = self::CALENDAR_TIMEZONE;
         $newDate = $startTime->copy()->timezone($timezone)->startOfDay();
         $newStart = $startTime->copy()->timezone($timezone)->format('H:i:s');
         $newEnd = $endTime->copy()->timezone($timezone)->format('H:i:s');

@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 import { AlertTriangle } from 'lucide-react';
 
 type ConfirmDialogProps = {
@@ -30,7 +31,7 @@ export const ConfirmDialog = ({
     : 'border-sky-500/20 bg-sky-500/10 text-sky-600 hover:bg-sky-500/20';
 
   return (
-    <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 px-4 py-6 backdrop-blur-sm">
+    <ModalOverlay layer={11000} className="fixed inset-0 flex items-center justify-center bg-black/60 px-4 py-6 backdrop-blur-sm">
       <div className="w-full max-w-md rounded-[32px] border border-[color:var(--border)] bg-[color:var(--surface)] shadow-[0_24px_80px_rgba(15,23,42,0.35)]">
         <div className="px-6 py-6">
           <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-rose-50 text-rose-500">
@@ -58,6 +59,6 @@ export const ConfirmDialog = ({
           </button>
         </div>
       </div>
-    </div>
+    </ModalOverlay>
   );
 };

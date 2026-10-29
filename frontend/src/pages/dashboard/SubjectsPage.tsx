@@ -1,4 +1,6 @@
-import { TimePicker } from '../../components/TimePicker';
+import { ModalOverlay } from '../../components/ModalOverlay';
+import { useSharedSemesterSelection, useSharedSubjectSelection } from '../../hooks/useAcademicSelection';
+import { useSearchParams } from 'react-router-dom';
 // SubjectsPage.tsx
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Controller, useForm } from 'react-hook-form';
@@ -268,6 +270,19 @@ const timeToMinutes = (value?: string | null) => {
   return hour * 60 + minute;
 };
 
+// ใช้คาบเดียวกับตารางเรียน: คาบ 1 เริ่ม 08:30 คาบละ 60 นาที
+const classPeriods = Array.from({ length: 13 }, (_, index) => index + 1);
+const periodTime = (period: number, isEnd = false) => {
+  const minutes = 510 + (period - (isEnd ? 0 : 1)) * 60;
+  return `${String(Math.floor(minutes / 60)).padStart(2, '0')}:30:00`;
+};
+const timePeriod = (value?: string | null, isEnd = false) => {
+  const minutes = timeToMinutes(value);
+  if (minutes === null) return '';
+  const period = isEnd ? Math.ceil((minutes - 510) / 60) : Math.floor((minutes - 510) / 60) + 1;
+  return period >= 1 && period <= classPeriods.length ? String(period) : '';
+};
+
 const getWeekdayIndex = (value?: string | null) => {
   const iso = toIsoDate(value);
   if (!iso) return null;
@@ -379,6 +394,7 @@ const mergeSubjectSchedules = (subjects: Subject[], events: CalendarEventSummary
 const isFallbackStatus = (status?: number) => !status || status === 404 || status === 405 || status === 500;
 
 export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'popup' }) => {
+  const [searchParams, setSearchParams] = useSearchParams();
   const { user } = useAuth();
   const { success, error } = useAppAlert();
   const [subjects, setSubjects] = useState<Subject[]>([]);
@@ -392,7 +408,8 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
   const [editingSubject, setEditingSubject] = useState<Subject | null>(null);
   const [detailSubject, setDetailSubject] = useState<Subject | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedSemesterFilter, setSelectedSemesterFilter] = useState<string>('');
+  const sharedSemesterOptions = useMemo(() => semesterOptions.map(option => ({ ...option, key: String(option.semester_id), label: formatSemesterLabel(option.semester, option.academic_year) ?? '' })), [semesterOptions]);
+  const [selectedSemesterFilter, setSelectedSemesterFilter] = useSharedSemesterSelection(sharedSemesterOptions);
   const [newSemester, setNewSemester] = useState<SemesterCreateForm>({ semester: '1', academic_year: '' });
   const [createSemesterError, setCreateSemesterError] = useState<string>('');
   const mountedRef = useRef(true);
@@ -437,12 +454,14 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
   const activeSemesterId = semesterOptions.some(option => String(option.semester_id) === selectedSemesterFilter)
     ? selectedSemesterFilter
     : (semesterOptions[0] ? String(semesterOptions[0].semester_id) : '');
+  const [selectedSubjectId] = useSharedSubjectSelection();
   const filteredSubjects = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
 
     return subjects.filter(subject => {
+      if (selectedSubjectId && String(subject.id) !== selectedSubjectId) return false;
       const semesterMatch =
-        selectedSemesterFilter !== '' && String(subject.semester_id ?? '') === selectedSemesterFilter;
+        (selectedSemesterFilter === 'all' || (selectedSemesterFilter.startsWith('year:') ? String(subject.academic_year) === selectedSemesterFilter.slice(5) : String(subject.semester_id ?? '') === selectedSemesterFilter));
 
       if (!semesterMatch) return false;
       if (!query) return true;
@@ -457,7 +476,7 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
 
       return haystacks.some(value => value.toLowerCase().includes(query));
     });
-  }, [searchQuery, selectedSemesterFilter, subjects]);
+  }, [searchQuery, selectedSemesterFilter, subjects, selectedSubjectId]);
   const isAdmin = user?.role === 'admin';
   const adminSummary = useMemo(() => {
     const scheduledCount = filteredSubjects.filter(subject => Boolean(subject.start_date)).length;
@@ -751,11 +770,6 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
     setValue('semester_id', String(semesterOptions[0].semester_id));
   }, [semesterOptions, selectedSemesterId, setValue]);
 
-  useEffect(() => {
-    if (!semesterOptions.length) return;
-    if (semesterOptions.some(option => String(option.semester_id) === selectedSemesterFilter)) return;
-    setSelectedSemesterFilter(String(semesterOptions[0].semester_id));
-  }, [semesterOptions, selectedSemesterFilter]);
 
   const onSubmit = async (values: SubjectForm) => {
     try {
@@ -795,6 +809,14 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
         values.all_day ? null : (values.start_time ?? null),
         values.all_day ? null : (values.end_time ?? null)
       );
+      if (schedulePayload.startDate && !values.all_day && (!schedulePayload.startTime || !schedulePayload.endTime)) {
+        const message = 'กรุณาระบุคาบเริ่มและคาบสิ้นสุดให้ครบ หรือเลือกเรียนทั้งวัน';
+        setErrorMsg(message); error(message); return;
+      }
+      if (schedulePayload.startTime && schedulePayload.endTime && (timeToMinutes(schedulePayload.endTime) ?? 0) <= (timeToMinutes(schedulePayload.startTime) ?? 0)) {
+        const message = 'คาบสิ้นสุดต้องไม่น้อยกว่าคาบเริ่ม';
+        setErrorMsg(message); error(message); return;
+      }
 
       const payload = {
         semester_id: semesterId,
@@ -1015,9 +1037,16 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
 
 
   const isPopupVariant = variant === 'popup';
+  useEffect(() => {
+    const editId = searchParams.get('edit');
+    const subject = subjects.find(item => String(item.id) === editId);
+    if (!subject) return;
+    openEditModal(subject);
+    setSearchParams(previous => { const next = new URLSearchParams(previous); next.delete('edit'); return next; }, { replace: true });
+  }, [subjects, searchParams]);
 
   return (
-    <div className={`subjects-page relative mx-auto w-full overflow-hidden pb-4 text-slate-900 ${isPopupVariant ? 'max-w-md space-y-4' : 'max-w-6xl space-y-5'}`}>
+    <div className={`subjects-page relative mx-auto w-full overflow-hidden pb-4 text-slate-900 ${isPopupVariant ? 'max-w-md space-y-4' : 'space-y-5'}`}>
       <section
         className={`subjects-hero relative overflow-hidden border shadow-[0_18px_36px_rgba(15,23,42,0.08)] ${
           isPopupVariant ? 'rounded-[22px] p-4' : 'rounded-[24px] p-4 md:rounded-[28px] md:p-6'
@@ -1114,6 +1143,7 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
               className="flex-1 rounded-xl border px-4 py-3 text-sm font-semibold outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100 md:w-[180px] md:flex-none"
               style={{ color: 'var(--text)', backgroundColor: 'var(--surface-2)', borderColor: 'var(--border)' }}
             >
+              <option value="all">ทุกปีการศึกษา</option>
               {semesterOptions.map(option => (
                 <option key={`filter-${option.semester_id}`} value={option.semester_id}>
                   {formatSemesterLabel(option.semester, option.academic_year)}
@@ -1229,6 +1259,7 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
                         <button
                           type="button"
                           onClick={() => openEditModal(subject)}
+                          aria-label={`แก้ไขชื่อและรายละเอียดรายวิชา ${subject.name}`}
                           className="flex-1 rounded-lg px-2 py-2 text-[11px] font-medium text-[color:var(--muted)] transition hover:bg-[color:var(--surface)] hover:text-[color:var(--text)] md:px-3 md:text-xs"
                         >
                           แก้ไข
@@ -1338,8 +1369,8 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
       `}</style>
 
       {isCreateModalOpen && (
-        <div
-          className="fixed inset-0 z-[90] flex items-center justify-center bg-black/60 px-4 py-6 backdrop-blur-sm sm:px-5 sm:py-8"
+        <ModalOverlay
+          className="fixed inset-0 flex items-center justify-center bg-black/60 px-4 py-6 backdrop-blur-sm sm:px-5 sm:py-8"
           onClick={closeCreateModal}
         >
           <div
@@ -1357,7 +1388,7 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
               <div>
                 <h3 className="text-lg font-semibold text-[color:var(--text)]">{editingSubject ? 'แก้ไขรายวิชา' : 'เพิ่มรายวิชาใหม่'}</h3>
                 <p className="mt-1 text-sm text-muted">
-                  {editingSubject ? 'อัปเดตรายละเอียด วันเวลา และข้อมูลวิชาใน modal นี้' : 'ระบุข้อมูลรายวิชา วันเวลา และรายละเอียดเพื่อใช้ในตารางเรียน'}
+                  {editingSubject ? 'เปลี่ยนชื่อรายวิชา รายละเอียด และวันเวลาเรียน' : 'ระบุข้อมูลรายวิชา วันเวลา และรายละเอียดเพื่อใช้ในตารางเรียน'}
                 </p>
               </div>
             </div>
@@ -1559,7 +1590,7 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
                     </div>
 
                     <div>
-                      <label className="mb-1 block text-xs uppercase tracking-widest text-muted">เวลาเริ่ม</label>
+                      <label className="mb-1 block text-xs uppercase tracking-widest text-muted">คาบเริ่ม</label>
                       <Controller
                         name="start_time"
                         control={control}
@@ -1571,23 +1602,32 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
                           }
                         }}
                         render={({ field }) => (
-                          <TimePicker
-                            value={field.value}
-                            onChange={value => field.onChange(value ? value + ':00' : '')}
+                          <select
+                            name={field.name}
+                            aria-label="คาบเริ่ม"
+                            value={timePeriod(field.value)}
+                            onChange={event => {
+                              const period = Number(event.target.value);
+                              field.onChange(period ? periodTime(period) : '');
+                              if (period && (!watch('end_time') || Number(timePeriod(watch('end_time'), true)) < period)) {
+                                setValue('end_time', periodTime(period, true), { shouldDirty: true, shouldValidate: true });
+                              }
+                            }}
                             onBlur={field.onBlur}
-                            inputRef={field.ref}
+                            ref={field.ref}
                             disabled={isAllDay}
-                            allowEmpty
-                            label="เวลาเริ่ม"
-                            className="w-full"
-                          />
+                            className="w-full rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-3 py-3 text-[color:var(--text)] shadow-sm outline-none focus:border-[color:var(--accent)] disabled:opacity-50"
+                          >
+                            <option value="">เลือกคาบ</option>
+                            {classPeriods.map(period => <option key={period} value={period}>คาบ {period}</option>)}
+                          </select>
                         )}
                       />
                       {errors.start_time?.message && <p className="mt-1 text-xs text-red-200">{errors.start_time.message}</p>}
                     </div>
 
                     <div>
-                      <label className="mb-1 block text-xs uppercase tracking-widest text-muted">เวลาเลิก</label>
+                      <label className="mb-1 block text-xs uppercase tracking-widest text-muted">คาบสิ้นสุด</label>
                       <Controller
                         name="end_time"
                         control={control}
@@ -1598,27 +1638,31 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
                             if (!value) return true;
                             if (!timePattern.test(value)) return 'รูปแบบเวลา 00:00-23:59';
                             const startTime = watch('start_time');
-                            return startTime ? true : 'ต้องระบุเวลาเริ่มก่อนเวลาเลิก';
+                            if (!startTime) return 'ต้องระบุคาบเริ่มก่อนคาบสิ้นสุด';
+                            return (timeToMinutes(value) ?? 0) > (timeToMinutes(startTime) ?? 0) ? true : 'คาบสิ้นสุดต้องไม่น้อยกว่าคาบเริ่ม';
                           }
                         }}
                         render={({ field }) => (
-                          <TimePicker
-                            value={field.value}
-                            onChange={value => field.onChange(value ? value + ':00' : '')}
+                          <select
+                            name={field.name}
+                            aria-label="คาบสิ้นสุด"
+                            value={timePeriod(field.value, true)}
+                            onChange={event => field.onChange(event.target.value ? periodTime(Number(event.target.value), true) : '')}
                             onBlur={field.onBlur}
-                            inputRef={field.ref}
+                            ref={field.ref}
                             disabled={isAllDay}
-                            allowEmpty
-                            label="เวลาเลิก"
-                            className="w-full"
-                          />
+                            className="w-full rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-3 py-3 text-[color:var(--text)] shadow-sm outline-none focus:border-[color:var(--accent)] disabled:opacity-50"
+                          >
+                            <option value="">เลือกคาบ</option>
+                            {classPeriods.map(period => <option key={period} value={period} disabled={period < Number(timePeriod(watch('start_time')))}>คาบ {period}</option>)}
+                          </select>
                         )}
                       />
                       {errors.end_time?.message && <p className="mt-1 text-xs text-red-200">{errors.end_time.message}</p>}
                     </div>
 
                     <div className={isPopupVariant ? 'sm:col-span-2' : 'sm:col-span-2 lg:col-span-3'}>
-                      <p className="text-xs text-muted">รูปแบบเวลา 00:00 ถึง 23:59</p>
+                      <p className="text-xs text-muted">คาบ 1–13 เริ่ม 08:30 น. คาบละ 1 ชั่วโมง</p>
                     </div>
                   </div>
                 </div>
@@ -1642,11 +1686,11 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
             </div>
 
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {detailSubject ? (
-        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/60 px-4 py-6 backdrop-blur-sm">
+        <ModalOverlay className="fixed inset-0 flex items-center justify-center bg-black/60 px-4 py-6 backdrop-blur-sm">
           <div className="w-full max-w-xl rounded-[32px] border border-[color:var(--border)] bg-[color:var(--surface)] shadow-[0_24px_80px_rgba(15,23,42,0.35)]">
             <div className="flex items-start justify-between gap-3 border-b border-[color:var(--border)] bg-[color:var(--surface-2)]/60 px-6 py-5">
               <div>
@@ -1691,7 +1735,7 @@ export const SubjectsPage = ({ variant = 'default' }: { variant?: 'default' | 'p
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       ) : null}
 
     </div>

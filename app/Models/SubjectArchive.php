@@ -18,6 +18,7 @@ class SubjectArchive extends Model
         'user_id',
         'name',
         'description',
+        'source_type',
         'color',
         'target_hours',
         'start_date',

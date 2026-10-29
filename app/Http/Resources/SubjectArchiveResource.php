@@ -17,6 +17,7 @@ class SubjectArchiveResource extends JsonResource
             'original_subject_id' => $this->original_subject_id,
             'name' => $this->name,
             'description' => $this->description,
+            'source_type' => $this->source_type,
             'color' => $this->color,
             'target_hours' => $this->target_hours,
             'start_date' => $this->start_date,

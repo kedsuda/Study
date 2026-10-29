@@ -33,7 +33,7 @@ export const TimePicker = ({
       {(['hour', 'minute'] as const).map(part => (
         <div key={part} className="contents">
           {part === 'minute' && <span aria-hidden="true" className="text-sm font-semibold">:</span>}
-          <div className={`relative min-w-0 ${compact ? 'w-9' : 'w-[72px]'}`}>
+          <div className={`relative shrink-0 ${compact ? 'w-[52px]' : 'w-[72px]'}`}>
             <select
               ref={part === 'hour' ? inputRef : undefined}
               aria-label={`${label}: ${part === 'hour' ? 'ชั่วโมง' : 'นาที'}`}
@@ -46,7 +46,7 @@ export const TimePicker = ({
                 else if (part === 'hour') onChange(`${next}:${selectedMinute || '00'}`);
                 else onChange(`${selectedHour || '00'}:${next}`);
               }}
-              className={`h-8 w-full appearance-none rounded-lg border text-sm font-bold tabular-nums shadow-sm outline-none transition focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20 disabled:cursor-not-allowed ${compact ? 'px-1 pr-4' : 'px-3 pr-6'}`}
+              className={`h-8 w-full appearance-none rounded-lg border text-sm font-bold tabular-nums shadow-sm outline-none transition focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20 disabled:cursor-not-allowed ${compact ? 'pl-2 pr-5' : 'px-3 pr-6'}`}
               style={{ borderColor: 'var(--border)', background: 'var(--surface)', color: 'var(--text)' }}
             >
               {allowEmpty && <option value="">--</option>}

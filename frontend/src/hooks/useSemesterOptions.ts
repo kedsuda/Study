@@ -1,5 +1,6 @@
 import { useEffect, useState, type Dispatch, type SetStateAction } from 'react';
 import { apiFallbackClients } from '../services/api';
+import { useAuth } from '../context/AuthContext';
 import { buildSemesterOptions, SemesterOption, toNumberOrNull } from '../utils/semester';
 
 type SemesterSource = {
@@ -16,10 +17,14 @@ const unwrapCollection = (payload: any) => {
 };
 
 export const useSemesterOptions = () => {
-  const [semesterOptions, setSemesterOptions] = useState<SemesterOption[]>([]);
+  const { user } = useAuth();
+  const userId = user?.id;
+  const [loaded, setLoaded] = useState<{ userId: typeof userId; options: SemesterOption[] }>({ userId, options: [] });
 
   useEffect(() => {
+    let cancelled = false;
     const loadSemesters = async () => {
+      if (!userId) return;
       for (const client of apiFallbackClients) {
         try {
           const res = await client.get('/semesters');
@@ -36,7 +41,7 @@ export const useSemesterOptions = () => {
               Number.isFinite(item.academic_year)
             );
 
-          setSemesterOptions(buildSemesterOptions(semesters));
+          if (!cancelled) setLoaded({ userId, options: buildSemesterOptions(semesters) });
           return;
         } catch (err: any) {
           const status = err?.response?.status;
@@ -46,13 +51,14 @@ export const useSemesterOptions = () => {
         }
       }
 
-      setSemesterOptions([]);
+      if (!cancelled) setLoaded({ userId, options: [] });
     };
 
     void loadSemesters();
-  }, []);
+    return () => { cancelled = true; };
+  }, [userId]);
 
-  return semesterOptions;
+  return loaded.userId === userId ? loaded.options : [];
 };
 
 // Keep controlled semester dropdowns on a real option once the list loads.

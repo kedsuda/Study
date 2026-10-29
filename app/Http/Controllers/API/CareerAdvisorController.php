@@ -173,10 +173,8 @@ class CareerAdvisorController extends Controller
                 $passRatePercent = $attempts > 0 ? ($passedCount / $attempts) * 100 : 0;
                 $isLatestTop = $latestQuiz > 0 && $highestLatestQuizScore > 0 && abs($latestQuiz - $highestLatestQuizScore) < 0.001;
 
-                $score = ($avgQuiz * 0.45)
-                    + ($latestQuiz * 0.30)
-                    + ($maxQuiz * 0.15)
-                    + ($passRatePercent * 0.10)
+                $score = ($avgQuiz * 0.75)
+                    + ($passRatePercent * 0.25)
                     + min(5, $attempts);
 
                 $row['strength_score'] = round($score, 3);
@@ -215,9 +213,8 @@ class CareerAdvisorController extends Controller
                 $passedCount = (int) ($row['passed_count'] ?? 0);
                 $passRatePercent = $attempts > 0 ? ($passedCount / $attempts) * 100 : 0;
 
-                $riskScore = (100 - $avgQuiz) * 0.45
-                    + (100 - $latestQuiz) * 0.35
-                    + (100 - $passRatePercent) * 0.20;
+                $riskScore = (100 - $avgQuiz) * 0.75
+                    + (100 - $passRatePercent) * 0.25;
 
                 $row['weak_score'] = round($riskScore, 3);
                 $row['pass_rate'] = round($passRatePercent, 1);
@@ -234,8 +231,8 @@ class CareerAdvisorController extends Controller
                 $passRate = (float) ($row['pass_rate'] ?? 0);
 
                 $hint = 'คะแนนแบบฝึกหัดยังควรพัฒนา แนะนำทบทวนข้อที่ตอบผิดและลองทำแบบฝึกหัดซ้ำ';
-                if ($latestQuiz < 50) {
-                    $hint = 'คะแนนล่าสุดต่ำกว่า 50% แนะนำทวนเนื้อหาพื้นฐานและทำโจทย์เพิ่มก่อนวิเคราะห์อาชีพ';
+                if ($avgQuiz < 50) {
+                    $hint = 'คะแนนเฉลี่ยต่ำกว่า 50% แนะนำทวนเนื้อหาพื้นฐานและทำโจทย์เพิ่มก่อนวิเคราะห์อาชีพ';
                 } elseif ($avgQuiz < 60) {
                     $hint = 'คะแนนเฉลี่ยยังต่ำกว่า 60% แนะนำฝึกเพิ่มเพื่อให้ข้อมูลวิเคราะห์อาชีพน่าเชื่อถือขึ้น';
                 } elseif ($passRate < 60) {

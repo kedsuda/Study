@@ -1,15 +1,20 @@
+import { ModalOverlay } from '../../components/ModalOverlay';
+import { useAcademicSearchParams, useSharedSemesterSelection } from '../../hooks/useAcademicSelection';
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { SlidersHorizontal } from 'lucide-react';
 import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { QuizAttemptPage } from './QuizAttemptPage';
-import { api, apiFallbackClients, assetBaseURL } from '../../services/api';
+import { QuizHistory } from '../../components/QuizHistory';
+import { displayQuizAnswer } from '../../utils/quizAnswers';
+import { api, apiFallbackClients } from '../../services/api';
 import { useAppAlert } from '../../context/AppAlertContext';
 import { useAuth } from '../../context/AuthContext';
-import { useDefaultSemesterSelection, useSemesterOptions } from '../../hooks/useSemesterOptions';
+import { useSemesterOptions } from '../../hooks/useSemesterOptions';
 import { filterBySemester, toNumberOrNull } from '../../utils/semester';
 import { subscribeSubjectsUpdated } from '../../utils/subjectSync';
-import { downloadStudyFileBlob, resolveStudyFileUrl } from '../../utils/studyFiles';
+import { downloadStudyFileBlob } from '../../utils/localStudyFiles';
+import { belongsToSubject } from '../../utils/subjectFiles';
 
 interface SubjectOption {
   id: number;
@@ -48,6 +53,11 @@ interface Quiz {
   } | null;
 }
 
+const quizSourceFileName = (quiz?: Quiz | null) => {
+  const fileName = quiz?.metadata?.file_name;
+  return typeof fileName === 'string' && fileName.trim() !== '' ? fileName.trim() : null;
+};
+
 interface QuizSummary {
   attempt_count: number;
   attempted_quiz_count: number;
@@ -63,6 +73,7 @@ type QuestionType = 'multiple_choice' | 'true_false' | 'short_answer';
 
 type StudyFile = {
   id: number;
+  subject_id?: number | string | null;
   original_name: string;
   file_path: string;
   file_url?: string | null;
@@ -70,6 +81,11 @@ type StudyFile = {
   mime_type?: string | null;
   file_size?: number | null;
   created_at?: string | null;
+};
+
+type StoredStudyFile = StudyFile & {
+  subject_id?: number | string | null;
+  subjectId: number;
 };
 
 type StudyLogEntry = {
@@ -129,51 +145,100 @@ const normalizeQuizDescription = (value?: string | null) => {
   return text;
 };
 
-const extractPdfTextInBrowser = async (file: File) => {
+const extractPdfTextInBrowser = async (file: File, onStatus: (message: string) => void) => {
+  // Do not pass an HTML/error response renamed as .pdf to PDF.js.  Besides
+  // producing a long stream of worker warnings, it cannot yield document text.
+  const buffer = await file.arrayBuffer();
+  const header = new TextDecoder('latin1').decode(new Uint8Array(buffer.slice(0, 5)));
+  if (header !== '%PDF-') {
+    throw new Error('ไฟล์ที่เลือกมีนามสกุล PDF แต่ข้อมูลภายในไม่ใช่ไฟล์ PDF ที่สมบูรณ์');
+  }
+
   const pdfjs = await import('pdfjs-dist');
   if (!pdfjs.GlobalWorkerOptions.workerPort) {
     pdfjs.GlobalWorkerOptions.workerPort = new PdfWorker();
   }
 
-  const buffer = await file.arrayBuffer();
   const loadingTask = pdfjs.getDocument({ data: new Uint8Array(buffer) });
-  const pdf = await loadingTask.promise;
-  const pages: string[] = [];
+  try {
+    const pdf = await loadingTask.promise;
+    const pages: string[] = [];
 
-  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-    const page = await pdf.getPage(pageNumber);
-    const textContent = await page.getTextContent();
-    const items = textContent.items as Array<{ str?: string }>;
-    const pageText = items
-      .map(item => (typeof item.str === 'string' ? item.str.trim() : ''))
-      .filter(Boolean)
-      .join(' ');
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const textContent = await page.getTextContent();
+      const items = textContent.items as Array<{ str?: string }>;
+      const pageText = items
+        .map(item => (typeof item.str === 'string' ? item.str.trim() : ''))
+        .filter(Boolean)
+        .join(' ');
 
-    if (pageText) {
-      pages.push(pageText);
+      if (pageText) {
+        pages.push(pageText);
+      } else {
+        onStatus(`กำลังอ่านข้อความจากภาพใน PDF หน้า ${pageNumber}/${pdf.numPages}...`);
+        const originalViewport = page.getViewport({ scale: 1 });
+        const viewport = page.getViewport({ scale: Math.min(2, 1600 / Math.max(1, originalViewport.width)) });
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.ceil(viewport.width));
+        canvas.height = Math.max(1, Math.ceil(viewport.height));
+        try {
+          const canvasContext = canvas.getContext('2d', { alpha: false });
+          if (!canvasContext) throw new Error('ไม่สามารถอ่านภาพจาก PDF ได้');
+          await page.render({ canvas, canvasContext, viewport }).promise;
+          const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.86));
+          if (!blob) throw new Error('ไม่สามารถอ่านภาพจาก PDF ได้');
+          const form = new FormData();
+          form.append('images[]', blob, `pdf-page-${pageNumber}.jpg`);
+          const response = await api.post<{ text?: string }>('/ai/analyze/document', form);
+          const text = response.data.text?.trim();
+          if (!text) throw new Error(`ไม่พบข้อความใน PDF หน้า ${pageNumber}`);
+          pages.push(text);
+        } finally {
+          canvas.width = 0;
+          canvas.height = 0;
+        }
+      }
+      page.cleanup();
     }
-  }
 
-  return pages.join('\n\n').trim();
+    return pages.join('\n\n').trim();
+  } finally {
+    await loadingTask.destroy();
+  }
 };
 
 const extractErrorMessage = (error: any, fallback: string) => {
-  const message = error?.response?.data?.message;
-  if (typeof message === 'string' && message.trim() !== '') {
-    return message;
-  }
   const errors = error?.response?.data?.errors;
   if (errors && typeof errors === 'object') {
-    const firstKey = Object.keys(errors)[0];
-    const firstMessage = firstKey ? errors[firstKey]?.[0] : null;
-    if (typeof firstMessage === 'string' && firstMessage.trim() !== '') {
-      return firstMessage;
+    const messages = Object.values(errors)
+      .flatMap(value => (Array.isArray(value) ? value : [value]))
+      .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
+      .map(value => value.trim());
+
+    if (messages.length > 0) {
+      return messages.join('\n');
     }
   }
-  if (typeof error?.message === 'string' && error.message.trim() !== '') {
-    return error.message;
+
+  const message = error?.response?.data?.message;
+  if (typeof message === 'string' && message.trim() !== '') {
+    return message.trim();
   }
+
+  if (typeof error?.message === 'string' && error.message.trim() !== '') {
+    return error.message.trim();
+  }
+
   return fallback;
+};
+
+const MAX_EXTRACTED_TEXT_LENGTH = 50000;
+
+const clampExtractedText = (value: string) => {
+  const text = value.trim();
+  if (text.length <= MAX_EXTRACTED_TEXT_LENGTH) return text;
+  return text.slice(0, MAX_EXTRACTED_TEXT_LENGTH);
 };
 
 const unwrapCollection = (payload: any) => {
@@ -230,9 +295,41 @@ const normalizeSubjects = (payload: any): SubjectOption[] => {
   return normalized;
 };
 
+const WINDOWS_1252_REVERSE: Record<string, number> = {
+  '€': 0x80, '‚': 0x82, 'ƒ': 0x83, '„': 0x84, '…': 0x85, '†': 0x86, '‡': 0x87,
+  'ˆ': 0x88, '‰': 0x89, 'Š': 0x8a, '‹': 0x8b, 'Œ': 0x8c, 'Ž': 0x8e,
+  '‘': 0x91, '’': 0x92, '“': 0x93, '”': 0x94, '•': 0x95, '–': 0x96, '—': 0x97,
+  '˜': 0x98, '™': 0x99, 'š': 0x9a, '›': 0x9b, 'œ': 0x9c, 'ž': 0x9e, 'Ÿ': 0x9f,
+};
+
+const repairUtf8Mojibake = (value?: string | null) => {
+  if (typeof value !== 'string' || value === '') return value ?? '';
+
+  // อาการที่พบบ่อยเมื่อ UTF-8 ภาษาไทยถูก decode เป็น Windows-1252/Latin-1
+  // เช่น "ข้อความ" กลายเป็น "à¸‚à¹‰à¸­à¸„à¸§à¸²à¸¡"
+  if (!/[ÃÂà¸à¹]/.test(value)) return value;
+
+  try {
+    const bytes = Uint8Array.from(Array.from(value, char => {
+      const codePoint = char.codePointAt(0) ?? 0;
+      if (codePoint <= 0xff) return codePoint;
+      const windows1252Byte = WINDOWS_1252_REVERSE[char];
+      if (windows1252Byte !== undefined) return windows1252Byte;
+      throw new Error('Character cannot be mapped back to a single byte');
+    }));
+
+    const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    const beforeMarkers = (value.match(/[ÃÂà¸à¹]/g) ?? []).length;
+    const afterMarkers = (decoded.match(/[ÃÂà¸à¹]/g) ?? []).length;
+    return afterMarkers < beforeMarkers ? decoded : value;
+  } catch {
+    return value;
+  }
+};
+
 const stripTrailingEllipsis = (value?: string | null) => {
   if (typeof value !== 'string') return '';
-  return value.replace(/\s*\.\.\.\s*$/, '').trimEnd();
+  return repairUtf8Mojibake(value).replace(/\s*\.\.\.\s*$/, '').trimEnd();
 };
 
 const formatPercent = (value?: number | null) => {
@@ -252,22 +349,20 @@ const difficultyOptions: { value: Difficulty; label: string }[] = [
   { value: 'hard', label: 'ยาก' },
 ];
 
-const storageBase = assetBaseURL || (api.defaults.baseURL ?? '').replace(/\/api\/?$/, '');
 
 export const QuizLibraryPage = () => {
   const { success, error: showError } = useAppAlert();
   const { user } = useAuth();
   const [subjects, setSubjects] = useState<SubjectOption[]>([]);
-  const [selectedSemesterKey, setSelectedSemesterKey] = useState('all');
   const [quizzes, setQuizzes] = useState<Quiz[]>([]);
   const [quizSummary, setQuizSummary] = useState<QuizSummary | null>(null);
-  const [selectedSubject, setSelectedSubject] = useState<number | null>(null);
+  const [searchParams, setSearchParams] = useAcademicSearchParams();
   const [fileTitle, setFileTitle] = useState('');
   const [fileDifficulty, setFileDifficulty] = useState<Difficulty>('medium');
   const [fileQuestionCount, setFileQuestionCount] = useState(5);
   const [fileQuestionTypes, setFileQuestionTypes] = useState<QuestionType[]>(['multiple_choice']);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [subjectFiles, setSubjectFiles] = useState<StudyFile[]>([]);
+  const [subjectFiles, setSubjectFiles] = useState<StoredStudyFile[]>([]);
   const [selectedStoredFileId, setSelectedStoredFileId] = useState('');
   const [isLoadingSubjectFiles, setIsLoadingSubjectFiles] = useState(false);
   const [isLoadingStoredFile, setIsLoadingStoredFile] = useState(false);
@@ -279,12 +374,15 @@ export const QuizLibraryPage = () => {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewQuiz, setPreviewQuiz] = useState<Quiz | null>(null);
   const [attemptQuizId, setAttemptQuizId] = useState<number | null>(null);
+  const [historyQuizId, setHistoryQuizId] = useState<number | null>(null);
   const [deletingQuizId, setDeletingQuizId] = useState<number | null>(null);
   const [confirmState, setConfirmState] = useState<ConfirmState | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const semesterOptions = useSemesterOptions();
-  useDefaultSemesterSelection(semesterOptions, selectedSemesterKey, setSelectedSemesterKey);
+  const [selectedSemesterKey, setSelectedSemesterKey] = useSharedSemesterSelection(semesterOptions);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const storedFileRequestRef = useRef(0);
+  const openedStoredFileRef = useRef<string | null>(null);
   const previewContentRef = useRef<HTMLDivElement | null>(null);
 
   const fileInfo = useMemo(() => {
@@ -296,6 +394,18 @@ export const QuizLibraryPage = () => {
     [subjects]
   );
   const filteredSubjects = useMemo(() => filterBySemester(subjects, selectedSemesterKey), [subjects, selectedSemesterKey]);
+  const requestedSubjectId = Number(searchParams.get('subject'));
+  // The subject comes from the shared "ข้อมูลการเรียน" selector.  Do not
+  // require its semester metadata to match again here: older subject records
+  // can lack that metadata in this response, which previously made a valid
+  // selected subject become null and left the exercise list empty.
+  const selectedSubject = subjects.find(subject => subject.id === requestedSubjectId)?.id
+    ?? null;
+  const setSelectedSubject = (subjectId: number) => {
+    const next = new URLSearchParams(searchParams);
+    next.set('subject', String(subjectId));
+    setSearchParams(next);
+  };
   const attemptedQuizCount = quizSummary?.attempt_count ?? 0;
   const averageScore = quizSummary?.average_score ?? null;
   const selectedSubjectName = useMemo(
@@ -303,7 +413,11 @@ export const QuizLibraryPage = () => {
     [selectedSubject, subjectNameMap]
   );
   const hasSubjects = filteredSubjects.length > 0;
-  const hasSubjectFiles = subjectFiles.length > 0;
+  const selectedSubjectFiles = useMemo(
+    () => subjectFiles.filter(file => file.subjectId === selectedSubject),
+    [subjectFiles, selectedSubject]
+  );
+  const hasSubjectFiles = selectedSubjectFiles.length > 0;
 
   const fetchSubjects = async (cancelledRef?: { current: boolean }) => {
     const requestConfigs =
@@ -320,10 +434,6 @@ export const QuizLibraryPage = () => {
           if (cancelledRef?.current) return;
 
           setSubjects(list);
-          setSelectedSubject(prev => {
-            if (prev && list.some(subject => subject.id === prev)) return prev;
-            return list[0]?.id ?? null;
-          });
           return;
         } catch {
           // try next config / client
@@ -333,7 +443,6 @@ export const QuizLibraryPage = () => {
 
     if (!cancelledRef?.current) {
       setSubjects([]);
-      setSelectedSubject(null);
     }
   };
 
@@ -350,42 +459,52 @@ export const QuizLibraryPage = () => {
   }, []);
 
   useEffect(() => {
-    if (!selectedSubject && filteredSubjects[0]) {
-      setSelectedSubject(filteredSubjects[0].id);
-    }
-  }, [filteredSubjects, selectedSubject]);
-
-  useEffect(() => {
-    if (selectedSubject && filteredSubjects.some(subject => subject.id === selectedSubject)) return;
-    const fallback = filteredSubjects[0];
-    setSelectedSubject(fallback ? fallback.id : null);
-  }, [filteredSubjects, selectedSubject]);
-
-  useEffect(() => {
+    let cancelled = false;
+    setQuizzes([]);
     if (!selectedSubject) return;
     api.get(`/subjects/${selectedSubject}/quizzes`).then(res => {
+      if (cancelled) return;
       const payload = Array.isArray(res.data) ? res.data : res.data?.data;
       setQuizzes(Array.isArray(payload) ? payload : []);
+    }).catch(() => {
+      if (!cancelled) setQuizzes([]);
     });
+    return () => { cancelled = true; };
   }, [selectedSubject]);
 
   useEffect(() => {
-    if (!selectedSubject) {
-      setSubjectFiles([]);
-      setSelectedStoredFileId('');
-      return;
-    }
+    storedFileRequestRef.current += 1;
+    setIsLoadingStoredFile(false);
+    setSubjectFiles([]);
+    setSelectedFile(null);
+    setFileStatus(null);
+    setFileError(null);
+    setIsLoadingSubjectFiles(false);
+    setSelectedStoredFileId('');
+    if (!selectedSubject) return;
 
     let cancelled = false;
     setIsLoadingSubjectFiles(true);
-    setSelectedStoredFileId('');
 
-    api.get(`/subjects/${selectedSubject}/study-logs`)
-      .then(res => {
+    const loadSubjectFiles = async () => {
+      try {
+        const response = await api.get(`/subjects/${selectedSubject}/files`);
+        return unwrapCollection(response.data) as StudyFile[];
+      } catch (error: any) {
+        // Older APIs expose attachments through study logs instead.
+        if (![404, 405, 501].includes(error?.response?.status)) throw error;
+        const response = await api.get(`/subjects/${selectedSubject}/study-logs`);
+        return (unwrapCollection(response.data) as StudyLogEntry[])
+          .flatMap(log => unwrapNestedArray(log.files) as StudyFile[]);
+      }
+    };
+
+    loadSubjectFiles()
+      .then(rows => {
         if (cancelled) return;
-        const logs = unwrapCollection(res.data) as StudyLogEntry[];
-        const files = logs
-          .flatMap(log => (Array.isArray(log.files) ? log.files : []))
+        const files = rows
+          .filter(file => belongsToSubject(file, selectedSubject))
+          .map(file => ({ ...file, subjectId: selectedSubject }))
           .filter(file => {
             const name = typeof file.original_name === 'string' ? file.original_name : '';
             const ext = name.split('.').pop()?.toLowerCase();
@@ -395,8 +514,10 @@ export const QuizLibraryPage = () => {
 
         setSubjectFiles(files);
       })
-      .catch(() => {
-        if (!cancelled) setSubjectFiles([]);
+      .catch(error => {
+        if (cancelled) return;
+        setSubjectFiles([]);
+        setFileError(extractErrorMessage(error, 'โหลดไฟล์ของวิชาที่เลือกไม่สำเร็จ กรุณาลองใหม่'));
       })
       .finally(() => {
         if (!cancelled) setIsLoadingSubjectFiles(false);
@@ -404,6 +525,7 @@ export const QuizLibraryPage = () => {
 
     return () => {
       cancelled = true;
+      storedFileRequestRef.current += 1;
     };
   }, [selectedSubject]);
 
@@ -455,6 +577,9 @@ export const QuizLibraryPage = () => {
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
+    storedFileRequestRef.current += 1;
+    setIsLoadingStoredFile(false);
+    setSelectedStoredFileId('');
     if (!isAllowedFile(file)) {
       setFileError('รองรับเฉพาะไฟล์ PDF, DOC, DOCX หรือ TXT เท่านั้น');
       setFileStatus(null);
@@ -477,12 +602,16 @@ export const QuizLibraryPage = () => {
     });
   };
 
-  const handleStoredFileSelect = async (event: ChangeEvent<HTMLSelectElement>) => {
-    const fileId = event.target.value;
+  const selectStoredFile = async (fileId: string) => {
+    const requestId = ++storedFileRequestRef.current;
     setSelectedStoredFileId(fileId);
+    setSelectedFile(null);
+    setFileStatus(null);
+    setFileError(null);
+    setIsLoadingStoredFile(false);
     if (!fileId) return;
 
-    const storedFile = subjectFiles.find(file => String(file.id) === fileId);
+    const storedFile = selectedSubjectFiles.find(file => String(file.id) === fileId);
     if (!storedFile) return;
 
     setIsLoadingStoredFile(true);
@@ -490,20 +619,27 @@ export const QuizLibraryPage = () => {
     setFileStatus(`กำลังดึงไฟล์จากกระเป๋า: ${storedFile.original_name}`);
 
     try {
-      const downloadedBlob =
-        storedFile.file_path?.startsWith('supabase:')
-          ? await downloadStudyFileBlob(storedFile.file_path)
-          : null;
+      const downloadedBlob = storedFile.file_path?.startsWith('supabase:')
+        ? await downloadStudyFileBlob(storedFile.file_path)
+        : null;
 
-      const blob = downloadedBlob ?? await fetch(storedFile.file_url || resolveStudyFileUrl(storedFile.file_path, storageBase)).then(response => {
-        if (!response.ok) {
-          throw new Error('ไม่สามารถดาวน์โหลดไฟล์จากกระเป๋าได้');
-        }
-        return response.blob();
-      });
+      // Read locally stored attachments through Laravel rather than its public
+      // `/storage` link.  The link can be absent or stale on shared hosting,
+      // in which case Apache returns index.html with a successful status.
+      const blob = downloadedBlob ?? (await api.get(`/files/${storedFile.id}/download`, {
+        responseType: 'blob',
+      })).data as Blob;
 
       if (!blob) {
         throw new Error('ไม่สามารถดาวน์โหลดไฟล์จากกระเป๋าได้');
+      }
+
+      // A missing storage URL is commonly rewritten to the SPA's index.html.
+      // Its filename still ends in .pdf/.docx, so without this guard the
+      // server extracts `<!doctype html>` and creates unrelated questions.
+      const header = new TextDecoder('latin1').decode(new Uint8Array(await blob.slice(0, 512).arrayBuffer())).trimStart().toLowerCase();
+      if (header.startsWith('<!doctype html') || header.startsWith('<html') || header.includes('<head')) {
+        throw new Error('ดาวน์โหลดไฟล์ต้นฉบับไม่สำเร็จ ระบบได้รับหน้าเว็บแทนเอกสาร กรุณาลองใหม่หรืออัปโหลดไฟล์จากเครื่อง');
       }
 
       const file = new File([blob], storedFile.original_name, {
@@ -514,17 +650,37 @@ export const QuizLibraryPage = () => {
         throw new Error('ไฟล์ในกระเป๋ารายการนี้ไม่ใช่ PDF, DOC, DOCX หรือ TXT');
       }
 
+      if (requestId !== storedFileRequestRef.current) return;
       setSelectedFile(file);
       setFileStatus(`เลือกไฟล์จากกระเป๋าแล้ว: ${storedFile.original_name}`);
     } catch (error) {
+      if (requestId !== storedFileRequestRef.current) return;
       setSelectedFile(null);
       setSelectedStoredFileId('');
-      setFileError(extractErrorMessage(error, 'ไม่สามารถดึงไฟล์จากกระเป๋าได้'));
+      const message = extractErrorMessage(error, 'ไม่สามารถดึงไฟล์จากกระเป๋าได้');
+      setFileError(/failed to fetch|fetch failed|network|load failed/i.test(message)
+        ? 'เชื่อมต่อที่เก็บไฟล์ไม่ได้ กรุณาลองใหม่ภายหลัง หรือเลือกอัปโหลดไฟล์ต้นฉบับจากเครื่อง'
+        : message);
       setFileStatus(null);
     } finally {
-      setIsLoadingStoredFile(false);
+      if (requestId === storedFileRequestRef.current) setIsLoadingStoredFile(false);
     }
   };
+
+  const handleStoredFileSelect = (event: ChangeEvent<HTMLSelectElement>) => {
+    void selectStoredFile(event.target.value);
+  };
+
+  // The storage page sends the chosen document here as ?subject=…&file=… .
+  // Load it only once so re-renders do not download the same file repeatedly.
+  useEffect(() => {
+    const fileId = searchParams.get('file');
+    if (!fileId || !selectedSubject || openedStoredFileRef.current === fileId) return;
+    if (!selectedSubjectFiles.some(file => String(file.id) === fileId)) return;
+
+    openedStoredFileRef.current = fileId;
+    void selectStoredFile(fileId);
+  }, [searchParams, selectedSubject, selectedSubjectFiles]);
 
   const handleFileSubmit = async (event?: FormEvent) => {
     event?.preventDefault();
@@ -534,58 +690,148 @@ export const QuizLibraryPage = () => {
       setFileStatus(null);
       return;
     }
+
     if (!selectedFile) {
       setFileError('กรุณาเลือกไฟล์เอกสารก่อนสร้างแบบฝึกหัดจากเอกสาร');
       setFileStatus(null);
       return;
     }
 
+    if (!isAllowedFile(selectedFile)) {
+      setFileError('รองรับเฉพาะไฟล์ PDF, DOC, DOCX หรือ TXT เท่านั้น');
+      setFileStatus(null);
+      return;
+    }
+
+    const normalizedQuestionCount = Math.min(50, Math.max(3, Number(fileQuestionCount) || 5));
+    if (normalizedQuestionCount !== fileQuestionCount) {
+      setFileQuestionCount(normalizedQuestionCount);
+    }
+
+    if (fileQuestionTypes.length === 0) {
+      setFileError('กรุณาเลือกชนิดคำถามอย่างน้อย 1 ชนิด');
+      setFileStatus(null);
+      return;
+    }
+
     setIsFileSubmitting(true);
     setFileError(null);
-    setFileStatus('กำลังอัปโหลดไฟล์และสร้างแบบฝึกหัดจากเอกสาร...');
+    setFileStatus('กำลังเตรียมไฟล์และสร้างแบบฝึกหัดจากเอกสาร...');
 
-    const formData = new FormData();
-    formData.append('file', selectedFile);
-    if (fileTitle.trim()) {
-      formData.append('title', fileTitle.trim());
-    }
-    formData.append('difficulty', fileDifficulty);
-    formData.append('question_count', String(fileQuestionCount));
-    fileQuestionTypes.forEach(type => {
-      formData.append('question_types[]', type);
-    });
-
+    let pdfExtractionError = '';
     try {
+      const formData = new FormData();
+      if (selectedStoredFileId) {
+        formData.append('file_id', selectedStoredFileId);
+      } else {
+        formData.append('file', selectedFile, selectedFile.name);
+      }
+
+      const trimmedTitle = fileTitle.trim();
+      if (trimmedTitle) {
+        formData.append('title', trimmedTitle);
+      }
+
+      formData.append('difficulty', fileDifficulty);
+      formData.append('question_count', String(normalizedQuestionCount));
+
+      fileQuestionTypes.forEach(type => {
+        formData.append('question_types[]', type);
+      });
+
       const fileExtension = selectedFile.name.split('.').pop()?.toLowerCase();
       if (fileExtension === 'pdf') {
         setFileStatus('กำลังอ่านข้อความจาก PDF...');
-        const extractedText = await extractPdfTextInBrowser(selectedFile);
-        if (extractedText) {
-          formData.append('extracted_text', extractedText);
-          setFileStatus('อ่านเนื้อหา PDF สำเร็จ กำลังสร้างแบบฝึกหัด...');
-        } else {
-          setFileStatus('ไม่พบข้อความที่เลือกคัดลอกได้ใน PDF กำลังลองส่งให้ระบบตรวจสอบต่อ...');
+
+        try {
+          const extractedText = await extractPdfTextInBrowser(selectedFile, setFileStatus);
+          const safeExtractedText = clampExtractedText(repairUtf8Mojibake(extractedText));
+
+          if (safeExtractedText) {
+            formData.append('extracted_text', safeExtractedText);
+            setFileStatus(
+              extractedText.length > MAX_EXTRACTED_TEXT_LENGTH
+                ? 'อ่านข้อความ PDF สำเร็จ และย่อเนื้อหาให้อยู่ในขนาดที่ระบบรองรับ กำลังสร้างแบบฝึกหัด...'
+                : 'อ่านข้อความ PDF สำเร็จ กำลังสร้างแบบฝึกหัด...'
+            );
+          } else {
+            setFileStatus('ไม่พบข้อความที่เลือกคัดลอกได้ใน PDF กำลังส่งไฟล์ให้ระบบตรวจสอบต่อ...');
+          }
+        } catch (pdfError) {
+          console.warn('PDF text extraction failed; continuing with the original file.', pdfError);
+          pdfExtractionError = extractErrorMessage(pdfError, 'ไม่สามารถอ่านข้อความจาก PDF ได้');
+          setFileStatus(
+            /ไม่ใช่ไฟล์ PDF ที่สมบูรณ์/.test(pdfExtractionError)
+              ? 'ไฟล์ในกระเป๋ามีนามสกุล PDF แต่ข้อมูลไฟล์ไม่สมบูรณ์ ระบบจะสร้างแบบฝึกหัดเบื้องต้นแทน'
+              : 'ไม่สามารถอ่านข้อความ PDF ในเบราว์เซอร์ได้ กำลังส่งไฟล์ต้นฉบับให้ระบบตรวจสอบต่อ...'
+          );
         }
       }
 
-      const response = await api.post<Quiz & { message?: string }>(`/subjects/${selectedSubject}/quizzes/from-file`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
-      });
+      // ไม่กำหนด Content-Type เอง เพื่อให้ browser/Axios ใส่ multipart boundary ให้ถูกต้อง
+      const response = await api.post<Quiz & { message?: string }>(
+        `/subjects/${selectedSubject}/quizzes/from-file`,
+        formData
+      );
+
       const createdQuiz = normalizeQuizPayload(response.data) ?? response.data;
+
+      if (!createdQuiz || !Number.isFinite(Number(createdQuiz.id))) {
+        throw new Error('ระบบสร้างแบบฝึกหัดสำเร็จแต่ข้อมูลที่ตอบกลับไม่สมบูรณ์');
+      }
+
       const fallbackMessage = createdQuiz.metadata?.fallback_message;
       setFileStatus(
         typeof response.data.message === 'string' && response.data.message.trim() !== ''
-          ? response.data.message
+          ? response.data.message.trim()
           : fallbackMessage || 'สร้างแบบฝึกหัดจากเอกสารเรียบร้อยแล้ว'
       );
+
       setSelectedFile(null);
+      setSelectedStoredFileId('');
       setFileTitle('');
-      if (selectedSubject === createdQuiz.subject_id) {
-        setQuizzes(prev => [createdQuiz, ...prev]);
+
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
       }
-      setAttemptQuizId(createdQuiz.id);
-    } catch (error) {
-      setFileError(extractErrorMessage(error, 'ไม่สามารถสร้างแบบฝึกหัดจากเอกสารได้'));
+
+      if (selectedSubject === createdQuiz.subject_id) {
+        setQuizzes(prev => [createdQuiz, ...prev.filter(item => item.id !== createdQuiz.id)]);
+      } else {
+        const res = await api.get(`/subjects/${selectedSubject}/quizzes`);
+        const payload = Array.isArray(res.data) ? res.data : res.data?.data;
+        setQuizzes(Array.isArray(payload) ? payload : []);
+      }
+
+      void fetchQuizSummary();
+      setAttemptQuizId(Number(createdQuiz.id));
+    } catch (error: any) {
+      const status = error?.response?.status;
+      const backendData = error?.response?.data;
+
+      console.error('Create quiz from file failed:', {
+        status,
+        data: backendData,
+        subjectId: selectedSubject,
+        fileName: selectedFile?.name,
+        fileType: selectedFile?.type,
+        fileSize: selectedFile?.size,
+        difficulty: fileDifficulty,
+        questionCount: normalizedQuestionCount,
+        questionTypes: fileQuestionTypes,
+      });
+
+      const message = extractErrorMessage(
+        error,
+        status === 422
+          ? 'ข้อมูลที่ส่งไปไม่ผ่านการตรวจสอบของระบบ กรุณาตรวจสอบไฟล์และค่าที่เลือก'
+          : 'ไม่สามารถสร้างแบบฝึกหัดจากเอกสารได้'
+      );
+
+      const detail = status === 422 && pdfExtractionError
+        ? `${message}\nรายละเอียดการอ่าน PDF: ${pdfExtractionError}`
+        : message;
+      setFileError(detail);
       setFileStatus(null);
     } finally {
       setIsFileSubmitting(false);
@@ -632,7 +878,7 @@ export const QuizLibraryPage = () => {
   const deleteQuiz = async (quiz: Quiz) => {
     openConfirmDialog({
       title: 'ลบแบบฝึกหัด',
-      description: `ต้องการลบแบบฝึกหัด "${quiz.title}" ใช่หรือไม่?`,
+      description: `ต้องการลบแบบฝึกหัด "${repairUtf8Mojibake(quiz.title)}" ใช่หรือไม่?`,
       confirmLabel: 'ลบแบบฝึกหัด',
       onConfirm: async () => {
         setDeletingQuizId(quiz.id);
@@ -663,20 +909,21 @@ export const QuizLibraryPage = () => {
   return (
     <div>
       <div className="hidden print:block">
-        <h1 className="text-2xl font-semibold">{previewQuiz?.title ?? 'แบบฝึกหัด'}</h1>
+        <h1 className="text-2xl font-semibold">{repairUtf8Mojibake(previewQuiz?.title) || 'แบบฝึกหัด'}</h1>
         {normalizeQuizDescription(previewQuiz?.description) ? (
-          <p className="mt-2 text-sm">{normalizeQuizDescription(previewQuiz?.description)}</p>
+          <p className="mt-2 text-sm">{repairUtf8Mojibake(normalizeQuizDescription(previewQuiz?.description))}</p>
         ) : null}
         <ol className="mt-6 space-y-6 text-sm">
           {(previewQuiz?.questions ?? []).map((question, index) => (
             <li key={question.id} className="space-y-3">
-              <p className="font-semibold">{index + 1}. {question.question_text}</p>
+              <p className="font-semibold">{index + 1}. {stripTrailingEllipsis(question.question_text)}</p>
               {question.question_type === 'multiple_choice' && (
                 <div className="space-y-2">
-                  {(question.options ?? []).map(option => (
+                  {(question.options ?? []).map((option, optionIndex) => (
                     <div key={option} className="flex items-start gap-2">
                       <span className="mt-1 inline-block h-3 w-3 shrink-0 rounded border border-slate-400"></span>
-                      <span className="min-w-0 whitespace-pre-wrap break-words">{option}</span>
+                      <span className="shrink-0 font-semibold">{String.fromCharCode(97 + optionIndex)}.</span>
+                      <span className="min-w-0 whitespace-pre-wrap break-words">{stripTrailingEllipsis(option)}</span>
                     </div>
                   ))}
                 </div>
@@ -705,7 +952,7 @@ export const QuizLibraryPage = () => {
       </div>
 
       <div className="quiz-library-page px-4 pb-10 pt-4 print:hidden sm:px-0 sm:pt-0 lg:pb-0">
-        <div className="mx-auto w-full max-w-6xl space-y-6">
+        <div className="w-full space-y-6">
           <section className="quiz-hero quiz-fade-in rounded-[1.75rem] p-5 shadow-soft md:p-6">
             <div className="grid gap-4 lg:grid-cols-[1.25fr,0.9fr] lg:items-end">
               <div className="space-y-3">
@@ -746,7 +993,7 @@ export const QuizLibraryPage = () => {
                     <div className="flex items-start justify-between gap-4">
                       <div>
                         <h3 className="text-2xl font-bold tracking-[-0.03em] text-[color:var(--text)]">ตั้งค่าแบบฝึกหัด</h3>
-                        <p className="mt-1 text-sm text-muted">กำหนดรายละเอียดเพื่อให้ AI สร้างคำถามที่ตรงจุด</p>
+                   
                       </div>
                       <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl border border-[color:var(--border)] bg-[color:rgba(var(--accent-rgb),0.08)] text-accent shadow-sm">
                         <SlidersHorizontal className="h-6 w-6" strokeWidth={2} aria-hidden="true" />
@@ -754,7 +1001,19 @@ export const QuizLibraryPage = () => {
                     </div>
 
                     <div className="mt-6 grid gap-5">
-                      <div className="grid gap-4 md:grid-cols-2">
+                      <div className="hidden rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-3 md:block">
+                        <p className="text-sm text-muted">{selectedSubject ? 'แบบฝึกหัดนี้จะสร้างให้กับวิชา' : 'เลือกวิชาที่ต้องการสร้างแบบฝึกหัด'}</p>
+                        <p className="mt-1 break-words text-lg font-semibold text-[color:var(--text)]">{selectedSubject ? selectedSubjectName : 'ยังไม่ได้เลือกวิชา'}</p>
+                        <div className="mt-3 border-t border-[color:var(--border)] pt-3 text-sm leading-relaxed">
+                          <p className="font-semibold">{selectedSubject ? 'วิธีเปลี่ยนวิชา' : 'วิธีเลือกวิชา'}</p>
+                          <ol className="mt-1 list-decimal space-y-1 pl-5 text-muted">
+                            <li>เปิดเมนู <strong className="font-medium text-[color:var(--text)]">ข้อมูลการเรียน</strong> ทางซ้าย</li>
+                            <li>เลือกปีการศึกษาและภาคเรียนที่ต้องการ</li>
+                            <li>ที่ช่อง <strong className="font-medium text-[color:var(--text)]">รายวิชา</strong> เลือกวิชาที่ต้องการสร้างแบบฝึกหัด</li>
+                          </ol>
+                        </div>
+                      </div>
+                      <div className="grid gap-4 md:hidden">
                         <div>
                           <label className="mb-1.5 block text-sm font-semibold text-muted">ภาคเรียน</label>
                           <select
@@ -778,7 +1037,7 @@ export const QuizLibraryPage = () => {
                             onChange={event => setSelectedSubject(Number(event.target.value))}
                             disabled={!hasSubjects}
                           >
-                            {!hasSubjects ? <option value="">ไม่พบรายวิชา</option> : null}
+                            <option value="" disabled>{hasSubjects ? 'เลือกรายวิชา' : 'ไม่พบรายวิชา'}</option>
                             {filteredSubjects.map(subject => (
                               <option key={subject.id} value={subject.id}>
                                 {subject.name}
@@ -811,7 +1070,7 @@ export const QuizLibraryPage = () => {
                                   onClick={() => setFileDifficulty(option.value)}
                                   className={`min-w-0 w-full whitespace-nowrap rounded-xl px-1.5 py-2 text-center text-[11px] font-semibold leading-none transition sm:px-3 sm:py-2.5 sm:text-sm ${
                                     isActive
-                                      ? 'bg-[color:rgba(var(--accent-rgb),0.10)] text-accent shadow-sm'
+                                      ? 'bg-accent text-[color:var(--on-accent)] shadow-sm ring-2 ring-inset ring-[color:var(--accent)]'
                                       : 'text-muted hover:bg-[color:var(--surface)] hover:text-[color:var(--text)]'
                                   }`}
                                   aria-pressed={isActive}
@@ -848,7 +1107,7 @@ export const QuizLibraryPage = () => {
                                 onClick={() => toggleQuestionType(option.value)}
                                 className={`min-w-0 w-full rounded-xl px-2 py-2 text-center text-xs font-semibold leading-none transition sm:px-3 sm:py-2.5 sm:text-sm ${
                                   isActive
-                                    ? 'bg-[color:rgba(var(--accent-rgb),0.10)] text-accent shadow-sm'
+                                    ? 'bg-accent text-[color:var(--on-accent)] shadow-sm ring-2 ring-inset ring-[color:var(--accent)]'
                                     : 'text-muted hover:bg-[color:var(--surface)] hover:text-[color:var(--text)]'
                                 }`}
                                 aria-pressed={isActive}
@@ -891,21 +1150,24 @@ export const QuizLibraryPage = () => {
 
                         <div className="mt-8 flex flex-col items-center gap-2">
                           <div className="w-full max-w-sm text-left">
-                            <label className="mb-1.5 block text-xs font-semibold text-muted">ไฟล์ในกระเป๋าของวิชานี้</label>
+                            <label htmlFor="quiz-subject-file" className="mb-1.5 block text-xs font-semibold text-muted">ไฟล์จากวิชา: {selectedSubjectName}</label>
                             <select
+                              id="quiz-subject-file"
                               className="w-full rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] px-4 py-3 text-sm text-[color:var(--text)] shadow-sm outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20"
                               value={selectedStoredFileId}
                               onChange={handleStoredFileSelect}
                               disabled={!selectedSubject || isLoadingSubjectFiles || isLoadingStoredFile || !hasSubjectFiles}
                             >
                               <option value="">
-                                {isLoadingSubjectFiles
+                                {!selectedSubject
+                                  ? 'กรุณาเลือกวิชาก่อน'
+                                  : isLoadingSubjectFiles
                                   ? 'กำลังโหลดไฟล์...'
                                   : hasSubjectFiles
-                                    ? 'เลือกไฟล์จากกระเป๋า'
+                                    ? 'เลือกไฟล์จากกระเป๋าเก็บไฟล์'
                                     : 'ยังไม่มีไฟล์เอกสารในวิชานี้'}
                               </option>
-                              {subjectFiles.map(file => (
+                              {selectedSubjectFiles.map(file => (
                                 <option key={file.id} value={file.id}>
                                   {file.original_name}
                                 </option>
@@ -913,17 +1175,6 @@ export const QuizLibraryPage = () => {
                             </select>
                           </div>
 
-                          <button
-                            type="button"
-                            onClick={() => fileInputRef.current?.click()}
-                            className="inline-flex w-full max-w-xs items-center justify-center rounded-[1.1rem] px-8 py-3.5 text-lg font-bold text-[color:var(--on-accent)] shadow-[0_16px_30px_rgba(var(--accent-rgb),0.24)] transition hover:-translate-y-0.5 hover:opacity-95 sm:w-auto sm:px-14 sm:text-xl"
-                            style={{
-                              background: 'var(--accent)',
-                              border: '1px solid color-mix(in srgb, var(--accent) 70%, var(--border))'
-                            }}
-                          >
-                            เลือกไฟล์
-                          </button>
                           <input
                             ref={fileInputRef}
                             type="file"
@@ -975,36 +1226,19 @@ export const QuizLibraryPage = () => {
           </div>
 
           <section className="space-y-4 quiz-fade-in-delayed-2" id="quiz-list" style={{ marginTop: '1rem' }}>
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <h3 className="text-2xl font-bold text-[color:var(--text)]">แบบฝึกหัดล่าสุด</h3>
-           
-              </div>
-              <div className="flex items-center gap-2">
-            <select
-              className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-2.5 text-sm text-[color:var(--text)] shadow-sm outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20"
-              value={selectedSubject ?? ''}
-              onChange={event => setSelectedSubject(Number(event.target.value))}
-              disabled={!hasSubjects}
-            >
-              {!hasSubjects ? <option value="">ไม่พบรายวิชา</option> : null}
-              {filteredSubjects.map(subject => (
-                <option key={subject.id} value={subject.id}>
-                  {subject.name}
-                </option>
-              ))}
-            </select>
-              </div>
-            </div>
+            <h3 className="text-2xl font-bold text-[color:var(--text)]">แบบฝึกหัดล่าสุด</h3>
 
             <div className="grid gap-4 md:grid-cols-2">
           {quizzes.map(quiz => (
             <article key={quiz.id} className="quiz-card rounded-[2rem] p-6 transition hover:-translate-y-1 hover:shadow-glow">
               <header>
-                <p className="text-xs font-medium uppercase tracking-[0.3em] text-primary/60">
+                <p className="text-lg font-medium tracking-normal text-primary/60">
                   {subjectNameMap.get(quiz.subject_id) ?? `วิชา ${quiz.subject_id}`}
                 </p>
-                <h4 className="mt-2 text-lg font-semibold text-[color:var(--text)]">{quiz.title}</h4>
+                <h4 className="mt-2 text-lg font-semibold text-[color:var(--text)]">{repairUtf8Mojibake(quiz.title)}</h4>
+                {quizSourceFileName(quiz) ? (
+                  <p className="mt-2 break-all text-xs text-muted">ไฟล์ต้นทาง: {repairUtf8Mojibake(quizSourceFileName(quiz))}</p>
+                ) : null}
                 {normalizeQuizDescription(quiz.description) ? (
                   <p className="mt-1 text-sm text-muted">{normalizeQuizDescription(quiz.description)}</p>
                 ) : null}
@@ -1020,12 +1254,13 @@ export const QuizLibraryPage = () => {
                 <p className="mt-4 rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] px-4 py-3 text-sm text-muted">ยังไม่ได้ทำแบบฝึกหัดนี้</p>
               )}
               <div className="mt-4 flex flex-wrap gap-2">
+                <button type="button" onClick={() => setHistoryQuizId(quiz.id)} className="quiz-outline-btn text-sm">ประวัติการทำข้อสอบ</button>
                 <button
                   type="button"
                   onClick={() => openPreview(quiz.id)}
                   className="quiz-outline-btn inline-flex w-fit items-center text-sm"
                 >
-                  <span>ดูแบบฝึกหัดจากเอกสาร</span>
+                  <span>เฉลย</span>
                 </button>
                 <button
                   type="button"
@@ -1063,17 +1298,19 @@ export const QuizLibraryPage = () => {
           </section>
         </div>
       </div>
-      {previewOpen && (
-        <div className="fixed inset-0 z-[120] flex items-end justify-center overflow-y-auto bg-slate-950/60 px-3 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] pt-6 backdrop-blur-md sm:items-center sm:px-4 sm:pb-8 sm:pt-10">
+      {previewOpen && (<ModalOverlay className="fixed inset-0 flex items-end justify-center overflow-y-auto bg-slate-950/60 px-3 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] pt-6 backdrop-blur-md sm:items-center sm:px-4 sm:pb-8 sm:pt-10">
           <div className="flex max-h-full w-full max-w-3xl flex-col overflow-hidden rounded-[1.75rem] border border-muted surface p-4 shadow-glow sm:rounded-3xl sm:p-6">
             <div className="flex shrink-0 flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-primary/80 sm:text-xs sm:tracking-[0.35em]">Quiz Preview</p>
                 <h3 className="mt-2 break-words text-2xl font-bold leading-tight text-[color:var(--text)] sm:text-2xl sm:font-semibold">
-                  {previewQuiz?.title ?? 'แบบฝึกหัด'}
+                  {repairUtf8Mojibake(previewQuiz?.title) || 'แบบฝึกหัด'}
                 </h3>
                 {normalizeQuizDescription(previewQuiz?.description) ? (
-                  <p className="mt-2 text-[15px] leading-6 text-muted sm:mt-1 sm:text-sm">{normalizeQuizDescription(previewQuiz?.description)}</p>
+                  <p className="mt-2 text-[15px] leading-6 text-muted sm:mt-1 sm:text-sm">{repairUtf8Mojibake(normalizeQuizDescription(previewQuiz?.description))}</p>
+                ) : null}
+                {quizSourceFileName(previewQuiz) ? (
+                  <p className="mt-2 break-all text-xs text-muted">ไฟล์ต้นทาง: {repairUtf8Mojibake(quizSourceFileName(previewQuiz))}</p>
                 ) : null}
               </div>
               <div className="flex shrink-0 items-center gap-2">
@@ -1118,11 +1355,12 @@ export const QuizLibraryPage = () => {
                     </p>
                     {question.question_type === 'multiple_choice' && (
                       <div className="mt-3 space-y-2.5 text-[15px] leading-6 text-muted sm:space-y-2 sm:text-sm sm:leading-normal">
-                        {(question.options ?? []).map(option => (
-                          <div key={option} className="flex items-start gap-2">
-                            <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-primary/70 sm:mt-1"></span>
+                        {(question.options ?? []).map((option, optionIndex) => (
+                          <div key={option} className={`flex items-start gap-2 rounded-xl p-2 ${option === question.correct_answer ? 'bg-emerald-500/10 text-emerald-600' : ''}`}>
+                            <span className="shrink-0 font-semibold text-primary">{String.fromCharCode(97 + optionIndex)}.</span>
                             <span className="min-w-0 whitespace-pre-wrap break-words">
                               {stripTrailingEllipsis(option)}
+                              {option === question.correct_answer && <strong className="ml-2">✓ คำตอบที่ถูกต้อง</strong>}
                             </span>
                           </div>
                         ))}
@@ -1143,7 +1381,7 @@ export const QuizLibraryPage = () => {
                       <div className="mt-3 rounded-xl border border-primary/25 bg-primary/10 px-3 py-3 text-sm text-primary sm:bg-primary/5 sm:py-2">
                         <p className="text-xs font-bold uppercase tracking-widest text-primary/75 sm:font-normal">คำตอบ</p>
                         <p className="mt-1 whitespace-pre-wrap break-words text-[15px] font-semibold leading-6 text-[color:var(--text)] sm:text-sm sm:font-normal sm:leading-normal">
-                          {stripTrailingEllipsis(question.correct_answer)}
+                          {displayQuizAnswer(stripTrailingEllipsis(question.correct_answer), question.question_type)}
                         </p>
                       </div>
                     ) : null}
@@ -1161,11 +1399,25 @@ export const QuizLibraryPage = () => {
               )}
             </div>
           </div>
+        </ModalOverlay>)}
+      {historyQuizId !== null && <ModalOverlay className="fixed inset-0 flex items-center justify-center bg-black/60 p-4">
+        <div className="surface w-full max-w-3xl max-h-[85vh] overflow-y-auto rounded-3xl p-6">
+          <div className="mb-4 flex items-center justify-between gap-4">
+            <h3 className="text-xl font-semibold">ประวัติการทำข้อสอบ</h3>
+            <button
+              type="button"
+              onClick={() => setHistoryQuizId(null)}
+              className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-red-600 text-sm font-semibold text-white transition hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-2"
+              aria-label="ปิดประวัติการทำข้อสอบ"
+            >
+              ปิด
+            </button>
+          </div>
+          <QuizHistory quizId={historyQuizId} />
         </div>
-      )}
-      {attemptQuizId !== null && (
-        <div
-          className="fixed inset-0 z-[130] flex items-end justify-center bg-slate-950/60 px-3 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] pt-6 backdrop-blur-md sm:items-center sm:px-4 sm:pb-8 sm:pt-10"
+      </ModalOverlay>}
+      {attemptQuizId !== null && (<ModalOverlay
+          className="fixed inset-0 flex items-end justify-center bg-slate-950/60 px-3 pb-[calc(1rem+env(safe-area-inset-bottom,0px))] pt-6 backdrop-blur-md sm:items-center sm:px-4 sm:pb-8 sm:pt-10"
           role="dialog"
           aria-modal="true"
           aria-label="ทำแบบฝึกหัด"
@@ -1196,8 +1448,7 @@ export const QuizLibraryPage = () => {
               }}
             />
           </div>
-        </div>
-      )}
+        </ModalOverlay>)}
       <ConfirmDialog
         isOpen={Boolean(confirmState)}
         title={confirmState?.title ?? ''}

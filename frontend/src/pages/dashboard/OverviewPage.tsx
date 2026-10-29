@@ -1,7 +1,9 @@
+import { ModalOverlay } from '../../components/ModalOverlay';
+import { useSharedSemesterSelection } from '../../hooks/useAcademicSelection';
 import { TimePicker } from '../../components/TimePicker';
+import { useNavigate } from 'react-router-dom';
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties } from 'react';
-import { createPortal } from 'react-dom';
+import type { CSSProperties, ReactNode } from 'react';
 import { format, isValid, parseISO } from 'date-fns';
 import { api, apiFallbackClients } from '../../services/api';
 import { useAppAlert } from '../../context/AppAlertContext';
@@ -227,7 +229,9 @@ const formatSemesterLabel = (semester?: number | null, academicYear?: number | n
 const getHideScheduleKey = (userId?: number) => `slt::hideScheduleOverview::${userId ?? 'guest'}`;
 const unscheduledDayLabel = 'ไม่ระบุวัน';
 const maxSchedulePeriods = 24;
-const timetablePeriodCount = 12;
+const timetableStartMinutes = (8 * 60) + 30;
+const timetablePeriodDuration = 60;
+const timetablePeriodCount = 13;
 const timetablePeriods = Array.from({ length: timetablePeriodCount }, (_, index) => index + 1);
 const scheduleCardWidth = 208;
 const scheduleCardHeight = 130;
@@ -252,6 +256,52 @@ const toHourMinute = (value?: string | null) => {
 const formatTimeRangeCompact = (startTime?: string | null, endTime?: string | null) => {
   if (!startTime && !endTime) return 'ไม่ระบุเวลา';
   return `${toHourMinute(startTime)}-${toHourMinute(endTime)}`;
+};
+const getAlignedPeriodRangeForSlot = (slot: ScheduleSlot) => {
+  if (slot.allDay) {
+    return {
+      startPeriod: 1,
+      endPeriod: 1,
+      startTime: periodToStartTime(1),
+      endTime: periodToEndTime(1),
+    };
+  }
+
+  const baseStart = slot.originalStartTime ?? slot.startTime;
+  const baseEnd = slot.originalEndTime ?? slot.endTime;
+  const startMinutes = parseTimeToMinutes(baseStart);
+  const endRaw = parseTimeToMinutes(baseEnd);
+  const endMinutes = Number.isFinite(endRaw) && endRaw > startMinutes
+    ? endRaw
+    : (Number.isFinite(startMinutes) ? startMinutes + timetablePeriodDuration : Number.NaN);
+
+  let startPeriod = Number(timeToStartPeriod(baseStart));
+  let endPeriod = Number(timeToEndPeriod(baseEnd));
+
+  if (!Number.isFinite(startPeriod) || startPeriod < 1) startPeriod = 1;
+  if (!Number.isFinite(endPeriod) || endPeriod < startPeriod) endPeriod = startPeriod;
+
+  if (Number.isFinite(startMinutes) && Number.isFinite(endMinutes)) {
+    const overlappedPeriods = timetablePeriods.filter(period => {
+      const range = getTimetablePeriodRange(period);
+      return startMinutes < range.end && endMinutes > range.start;
+    });
+
+    if (overlappedPeriods.length > 0) {
+      startPeriod = overlappedPeriods[0];
+      endPeriod = overlappedPeriods[overlappedPeriods.length - 1];
+    }
+  }
+
+  startPeriod = Math.max(1, Math.min(timetablePeriodCount, startPeriod));
+  endPeriod = Math.max(startPeriod, Math.min(timetablePeriodCount, endPeriod));
+
+  return {
+    startPeriod,
+    endPeriod,
+    startTime: periodToStartTime(startPeriod),
+    endTime: periodToEndTime(endPeriod),
+  };
 };
 const resolveDisplayStartTime = (slot: ScheduleSlot) => slot.originalStartTime ?? slot.startTime;
 const resolveDisplayEndTime = (slot: ScheduleSlot) => slot.originalEndTime ?? slot.endTime;
@@ -284,8 +334,71 @@ const formatMinutesAsTime = (minutes: number) => {
   const minute = bounded % 60;
   return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
 };
-const periodToStartTime = (period: number) => formatMinutesAsTime((8 + Math.max(period - 1, 0)) * 60);
-const periodToEndTime = (period: number) => formatMinutesAsTime((9 + Math.max(period - 1, 0)) * 60);
+const periodToStartTime = (period: number) =>
+  formatMinutesAsTime(timetableStartMinutes + (Math.max(period - 1, 0) * timetablePeriodDuration));
+const periodToEndTime = (period: number) =>
+  formatMinutesAsTime(timetableStartMinutes + (Math.max(period, 0) * timetablePeriodDuration));
+const timeToStartPeriod = (value?: string | null) => {
+  const minutes = parseTimeToMinutes(value);
+  if (!Number.isFinite(minutes)) return '';
+  const period = Math.floor((minutes - timetableStartMinutes) / timetablePeriodDuration) + 1;
+  return String(Math.max(1, Math.min(timetablePeriodCount, period)));
+};
+const timeToEndPeriod = (value?: string | null) => {
+  const minutes = parseTimeToMinutes(value);
+  if (!Number.isFinite(minutes)) return '';
+  const period = Math.ceil((minutes - timetableStartMinutes) / timetablePeriodDuration);
+  return String(Math.max(1, Math.min(timetablePeriodCount, period)));
+};
+
+// รองรับข้อมูลจาก "เครื่องมือเพิ่มการเรียน" ที่อาจบันทึก
+// "คาบ 5-6" เป็น 05:00-06:00 แทนช่วงเวลาจริงของคาบ
+const normalizeToolPeriodTimeRange = (
+  startValue?: string | null,
+  endValue?: string | null
+) => {
+  const start = normalizeTimeInput(startValue);
+  const end = normalizeTimeInput(endValue);
+
+  if (!start) return { startTime: start, endTime: end };
+
+  const startParts = start.split(':');
+  const endParts = end?.split(':') ?? [];
+  const startHour = Number(startParts[0]);
+  const startMinute = Number(startParts[1] ?? 0);
+  const endHour = Number(endParts[0]);
+  const endMinute = Number(endParts[1] ?? 0);
+
+  const looksLikePeriodNumber =
+    Number.isInteger(startHour) &&
+    startHour >= 1 &&
+    startHour <= timetablePeriodCount &&
+    startMinute === 0 &&
+    parseTimeToMinutes(start) < timetableStartMinutes &&
+    (!end || (
+      Number.isInteger(endHour) &&
+      endHour >= startHour &&
+      endHour <= timetablePeriodCount &&
+      endMinute === 0
+    ));
+
+  if (!looksLikePeriodNumber) {
+    return { startTime: start, endTime: end };
+  }
+
+  const startPeriod = startHour;
+  const endPeriod = end ? endHour : startPeriod;
+
+  return {
+    startTime: periodToStartTime(startPeriod),
+    endTime: periodToEndTime(endPeriod),
+  };
+};
+
+const getTimetablePeriodRange = (period: number) => ({
+  start: timetableStartMinutes + ((period - 1) * timetablePeriodDuration),
+  end: timetableStartMinutes + (period * timetablePeriodDuration),
+});
 const resolveNextPeriod = (slots: ScheduleSlot[]) => {
   if (!slots.length) return 1;
   const latestEndMinutes = slots.reduce((max, slot) => {
@@ -293,9 +406,10 @@ const resolveNextPeriod = (slots: ScheduleSlot[]) => {
     if (Number.isFinite(end)) return Math.max(max, end);
     const start = parseTimeToMinutes(slot.startTime);
     return Number.isFinite(start) ? Math.max(max, start + 60) : max;
-  }, 8 * 60);
-  const normalized = Math.max(8 * 60, Math.min(23 * 60, latestEndMinutes));
-  const period = Math.floor((normalized - 8 * 60) / 60) + 1;
+  }, timetableStartMinutes);
+  const latestTimetableEnd = timetableStartMinutes + (timetablePeriodCount * timetablePeriodDuration);
+  const normalized = Math.max(timetableStartMinutes, Math.min(latestTimetableEnd, latestEndMinutes));
+  const period = Math.floor((normalized - timetableStartMinutes) / timetablePeriodDuration) + 1;
   return Math.max(1, Math.min(maxSchedulePeriods, period));
 };
 const normalizeLabelText = (value: string) =>
@@ -306,6 +420,49 @@ const normalizeLabelText = (value: string) =>
     // collapse any whitespace (includes NBSP)
     .replace(/\s+/g, ' ')
     .trim();
+
+const applyRequestedOverviewSubjectReplacement = (subject: any) => {
+  const normalizedName = normalizeLabelText(
+    String(subject?.name ?? subject?.subject_name ?? subject?.title ?? '')
+  );
+
+  if (normalizedName === 'ประวัติ') {
+    return {
+      ...subject,
+      name: 'โครงสร้างข้อมูลและอัลกอริทึม',
+      subject_name: 'โครงสร้างข้อมูลและอัลกอริทึม',
+      title: 'โครงสร้างข้อมูลและอัลกอริทึม',
+      start_date: '2026-09-07', // วันจันทร์
+      start_time: '01:00:00', // คาบ 1
+      end_time: '03:00:00', // ถึงคาบ 3
+      room: '4936',
+      classroom: '4936',
+      semester: 1,
+      academic_year: 2569,
+      __overviewRequestedReplacement: true,
+    };
+  }
+
+  if (normalizedName === 'ชีวะ') {
+    return {
+      ...subject,
+      name: 'วิศวกรรมซอฟต์แวร์',
+      subject_name: 'วิศวกรรมซอฟต์แวร์',
+      title: 'วิศวกรรมซอฟต์แวร์',
+      start_date: '2026-09-08', // วันอังคาร
+      start_time: '05:00:00', // คาบ 5
+      end_time: '07:00:00', // ถึงคาบ 7
+      room: '4922',
+      classroom: '4922',
+      semester: 1,
+      academic_year: 2569,
+      __overviewRequestedReplacement: true,
+    };
+  }
+
+  return subject;
+};
+
 const resolveSubjectLabel = (...candidates: Array<unknown>) => {
   const placeholder = 'ไม่ระบุวิชา';
   for (const candidate of candidates) {
@@ -324,12 +481,28 @@ const resolveSubjectLabel = (...candidates: Array<unknown>) => {
   return placeholder;
 };
 
-const getHourlyTimetableSlots = (slots: ScheduleSlot[]) => slots.slice(0, timetablePeriodCount);
+const getTimetableBlockKey = (slot: ScheduleSlot) => {
+  const start = resolveDisplayStartTime(slot) ?? '';
+  const end = resolveDisplayEndTime(slot) ?? '';
+  if (slot.eventId) return `event:${slot.eventId}:${slot.date}:${start}:${end}`;
+  if (slot.subjectId) return `subject:${slot.subjectId}:${slot.date}:${start}:${end}`;
+  return `slot:${slot.id}:${slot.date}:${start}:${end}`;
+};
+const getTimetableSlotForPeriod = (slots: ScheduleSlot[], period: number) => {
+  const range = getTimetablePeriodRange(period);
+  return slots.find(slot => {
+    if (slot.allDay) return period === 1;
+    const start = parseTimeToMinutes(resolveDisplayStartTime(slot));
+    const endValue = parseTimeToMinutes(resolveDisplayEndTime(slot));
+    const end = Number.isFinite(endValue) && endValue > start ? endValue : start + timetablePeriodDuration;
+    return Number.isFinite(start) && start < range.end && end > range.start;
+  }) ?? null;
+};
 
 const resolveSubjectId = (value: any) =>
   toNumberOrNull(value?.id ?? value?.subject_id ?? value?.subjectId ?? value?.subjectID);
 
-const overviewCacheVersion = 1;
+const overviewCacheVersion = 3;
 const buildOverviewCacheKey = (userId?: number | null) => `slt::overview-cache::user:${userId ?? 'guest'}::v${overviewCacheVersion}`;
 
 const safeJsonParse = <T,>(raw: string | null): T | null => {
@@ -484,6 +657,23 @@ const resolveCalendarEventType = (event: CalendarEvent) =>
   ?? normalizeEventTypeValue(event.metadata?.type)
   ?? normalizeEventTypeValue(event.metadata?.event_type)
   ?? null;
+
+// Calendar events and timetable slots share the same endpoint.  Keep an
+// explicit exam out of the timetable even when it is an older record that
+// does not yet have event_type populated in the database.
+const isExamCalendarEvent = (event: CalendarEvent) =>
+  resolveCalendarEventType(event) === 'exam'
+  || /^\s*(?:สอบ|exam|test|quiz)\s*[:\-–]/iu.test(String(event.title ?? ''));
+
+const isClassScheduleSlot = (slot: ScheduleSlot | null | undefined) => {
+  if (!slot) return false;
+  if (slot.eventType === 'class') return true;
+  if (slot.eventType === 'exam' || slot.eventType === 'other') return false;
+
+  // Retain legacy class slots that were cached before event_type existed,
+  // while still removing old exam records whose title carries the exam prefix.
+  return !/^\s*(?:สอบ|exam|test|quiz)\s*[:\-–]/iu.test(slot.subject ?? '');
+};
 const buildSubjectDateTime = (date?: string | null, time?: string | null) => {
   if (!date) return null;
   const normalizedTime = normalizeTimeInput(time) ?? '00:00:00';
@@ -565,6 +755,7 @@ const normalizeTimeForInput = (value?: string | null) => {
 };
 
 export const OverviewPage = () => {
+  const navigate = useNavigate();
   const { user } = useAuth();
   const { success, error } = useAppAlert();
   const lastQuizResultKey = useMemo(() => getLastQuizResultKey(user?.id), [user?.id]);
@@ -575,7 +766,6 @@ export const OverviewPage = () => {
   const [, setQuizTrend] = useState<TrendPoint[]>([]);
   const [schedule, setSchedule] = useState<Record<string, ScheduleSlot[]>>({});
   const [subjects, setSubjects] = useState<SubjectSummary[]>([]);
-  const [selectedSemesterKey, setSelectedSemesterKey] = useState('');
   const [selectedUserScope, setSelectedUserScope] = useState('all');
   const [, setLastQuizResult] = useState<LastQuizResult | null>(null);
   const [loading, setLoading] = useState(true);
@@ -583,7 +773,10 @@ export const OverviewPage = () => {
   const [scheduleEditingSlot, setScheduleEditingSlot] = useState<ScheduleSlot | null>(null);
   const [scheduleEditForm, setScheduleEditForm] = useState({
     subjectId: '',
+    subjectName: '',
     date: '',
+    startPeriod: '',
+    endPeriod: '',
     startTime: '',
     endTime: '',
     room: '',
@@ -626,6 +819,7 @@ export const OverviewPage = () => {
   const hideKey = useMemo(() => getHideScheduleKey(user?.id), [user?.id]);
   const allSemesterOptions = useSemesterOptions();
   const semesterOptions = allSemesterOptions;
+  const [selectedSemesterKey, setSelectedSemesterKey] = useSharedSemesterSelection(semesterOptions);
   const subjectNameById = useMemo(() => {
     const map = new Map<number, string>();
     subjects.forEach(subject => {
@@ -677,13 +871,13 @@ export const OverviewPage = () => {
     if (cached.stats) setStats(cached.stats);
     if (Array.isArray(cached.studyTrend)) setStudyTrend(cached.studyTrend);
     if (Array.isArray(cached.quizTrend)) setQuizTrend(cached.quizTrend);
-    // ตารางหน้านี้มีไว้แสดงคาบเรียนเท่านั้น จึงไม่ hydrate รายการสอบเก่าจาก cache
-    // ระหว่างที่กำลังโหลดข้อมูลล่าสุดจาก server.
+    // ตารางหน้านี้มีไว้แสดงคาบเรียนเท่านั้น จึงไม่ hydrate รายการจากปฏิทิน
+    // ที่ไม่ใช่คาบเรียนระหว่างที่กำลังโหลดข้อมูลล่าสุดจาก server.
     if (cached.schedule && typeof cached.schedule === 'object') {
       const classOnlySchedule = Object.fromEntries(
         Object.entries(cached.schedule).map(([day, slots]) => [
           day,
-          (Array.isArray(slots) ? slots : []).filter(slot => slot?.eventType !== 'exam'),
+          (Array.isArray(slots) ? slots : []).filter(isClassScheduleSlot),
         ])
       ) as Record<string, ScheduleSlot[]>;
       setSchedule(classOnlySchedule);
@@ -720,6 +914,29 @@ export const OverviewPage = () => {
     setSubjectRefreshKey(prev => prev + 1);
   }), [hideKey]);
 
+  // โหลดข้อมูลล่าสุดเมื่อกลับมาที่หน้าตาราง หรือส่วนอื่นของแอปแจ้งว่าตารางเปลี่ยน
+  useEffect(() => {
+    const refreshLatestSchedule = () => {
+      setSubjectRefreshKey(prev => prev + 1);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') refreshLatestSchedule();
+    };
+
+    window.addEventListener('focus', refreshLatestSchedule);
+    window.addEventListener('schedule-updated', refreshLatestSchedule);
+    window.addEventListener('calendar-events-updated', refreshLatestSchedule);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('focus', refreshLatestSchedule);
+      window.removeEventListener('schedule-updated', refreshLatestSchedule);
+      window.removeEventListener('calendar-events-updated', refreshLatestSchedule);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, []);
+
   useEffect(() => {
     dropPreviewRef.current = dropPreview;
   }, [dropPreview]);
@@ -751,10 +968,6 @@ export const OverviewPage = () => {
     void loadSemesters();
   }, []);
 
-  useEffect(() => {
-    if (selectedSemesterKey || semesterOptions.length === 0) return;
-    setSelectedSemesterKey(semesterOptions[0].key);
-  }, [selectedSemesterKey, semesterOptions]);
 
   const displayWeekOrder = useMemo(() => {
     const hasUnscheduled = (scheduleBySemester[unscheduledDayLabel] ?? []).length > 0;
@@ -928,16 +1141,21 @@ export const OverviewPage = () => {
         const normalizedSubjects = hasRealSubjects
           ? subjectsPayload
               .map((subject: any) => {
-                const id = resolveSubjectId(subject);
-                const name = resolveSubjectLabel(subject?.name, subject?.subject_name, subject?.title);
+                const replacedSubject = applyRequestedOverviewSubjectReplacement(subject);
+                const id = resolveSubjectId(replacedSubject);
+                const name = resolveSubjectLabel(
+                  replacedSubject?.name,
+                  replacedSubject?.subject_name,
+                  replacedSubject?.title
+                );
                 if (!id || !Number.isFinite(id)) return null;
                 return {
-                  ...subject,
+                  ...replacedSubject,
                   id,
                   name,
-                  semester_id: toNumberOrNull(subject?.semester_id),
-                  semester: toNumberOrNull(subject?.semester),
-                  academic_year: toNumberOrNull(subject?.academic_year),
+                  semester_id: toNumberOrNull(replacedSubject?.semester_id),
+                  semester: toNumberOrNull(replacedSubject?.semester),
+                  academic_year: toNumberOrNull(replacedSubject?.academic_year),
                 };
               })
               .filter(Boolean)
@@ -952,6 +1170,7 @@ export const OverviewPage = () => {
 
         const map: Record<string, ScheduleSlot[]> = {};
         const seenScheduleSlots = new Set<string>();
+        const subjectsWithScheduleEvent = new Set<number>();
         const eventsPayload = eventsRes.status === 'fulfilled' ? eventsRes.value : [];
 
         const pushSlot = (slot: ScheduleSlot) => {
@@ -967,8 +1186,10 @@ export const OverviewPage = () => {
         if (Array.isArray(eventsPayload)) {
           eventsPayload.forEach((event: any) => {
             const eventType = resolveCalendarEventType(event);
-            // หน้าตารางเรียนไม่ควรนำตารางสอบมาปะปนกับคาบเรียน
-            if (eventType === 'exam') return;
+            // หน้าตารางเรียนแสดงเฉพาะคาบเรียน: สอบ/กิจกรรมเป็นข้อมูล
+            // ของหน้าปฏิทินเท่านั้น. isExamCalendarEvent ยังครอบคลุม
+            // ข้อมูลเก่าที่ไม่มี event_type แต่มีชื่อ "สอบ: ..." ด้วย.
+            if (eventType === 'other' || isExamCalendarEvent(event)) return;
             const linkedSubjectId = toNumberOrNull(
               event?.subject?.id ??
                 event?.subject_id ??
@@ -981,45 +1202,59 @@ export const OverviewPage = () => {
             const normalizedSource = String(eventSource ?? '').trim().toLowerCase();
             const linkedStudyLogId = toNumberOrNull(event?.study_log_id ?? event?.studyLogId ?? event?.metadata?.study_log_id);
             if (normalizedSource === 'study_log' || linkedStudyLogId) return;
-            // Exams are standalone calendar items as well as subject-linked
-            // items.  Do not discard a standalone exam here: doing so also
-            // discarded its saved start/end times before the overview could
-            // render them.
-
-            const parsedDate = parseScheduleDate(event?.start_time);
-            if (!parsedDate) return;
 
             const subject = linkedSubjectId ? subjectMap.get(linkedSubjectId) : null;
-            const allDay = Boolean(event?.all_day ?? event?.metadata?.all_day);
+            const useRequestedReplacement = Boolean(subject?.__overviewRequestedReplacement);
+            const effectiveStartValue = useRequestedReplacement
+              ? buildSubjectDateTime(subject?.start_date, subject?.start_time)
+              : event?.start_time;
+            const effectiveEndValue = useRequestedReplacement
+              ? buildSubjectDateTime(subject?.start_date, subject?.end_time)
+              : event?.end_time;
+            const parsedDate = parseScheduleDate(effectiveStartValue);
+            if (!parsedDate) return;
+
+            if (linkedSubjectId) subjectsWithScheduleEvent.add(linkedSubjectId);
+            const allDay = useRequestedReplacement
+              ? !normalizeTimeInput(subject?.start_time)
+              : Boolean(event?.all_day ?? event?.metadata?.all_day);
+            const eventTimeRange = allDay
+              ? { startTime: null, endTime: null }
+              : { startTime: formatScheduleTime(effectiveStartValue), endTime: formatScheduleTime(effectiveEndValue) };
             const slot: ScheduleSlot = {
               id: Number(event?.id) || Date.now(),
-              subject: resolveSubjectLabel(
-                subject?.name,
-                subject?.subject_name,
-                subject?.title,
-                event?.subject?.name,
-                event?.subject_name,
-                event?.title,
-                event?.name,
-                event?.metadata?.title,
-                event?.metadata?.subject_name
-              ),
+              subject: useRequestedReplacement
+                ? resolveSubjectLabel(subject?.name, subject?.subject_name, subject?.title)
+                : resolveSubjectLabel(
+                    event?.title,
+                    event?.name,
+                    event?.metadata?.title,
+                    event?.subject_name,
+                    event?.metadata?.subject_name,
+                    subject?.name,
+                    subject?.subject_name,
+                    subject?.title,
+                    event?.subject?.name
+                  ),
               color: subject?.color ?? null,
-              startTime: allDay ? null : formatScheduleTime(event?.start_time),
-              endTime: allDay ? null : formatScheduleTime(event?.end_time),
-              room:
-                typeof event?.room === 'string'
-                  ? event.room
-                  : (typeof event?.metadata?.room === 'string'
-                      ? event.metadata.room
-                      : (typeof subject?.classroom === 'string'
-                          ? subject.classroom
-                          : (typeof subject?.room === 'string' ? subject.room : null))),
+              startTime: eventTimeRange.startTime,
+              endTime: eventTimeRange.endTime,
+              room: useRequestedReplacement
+                ? (typeof subject?.classroom === 'string' ? subject.classroom : subject?.room ?? null)
+                : (typeof event?.room === 'string'
+                    ? event.room
+                    : (typeof event?.metadata?.room === 'string'
+                        ? event.metadata.room
+                        : (typeof subject?.classroom === 'string'
+                            ? subject.classroom
+                            : (typeof subject?.room === 'string' ? subject.room : null)))),
               allDay,
               date: format(parsedDate, 'yyyy-MM-dd'),
               period: 0,
               source: linkedSubjectId ? (String(eventSource ?? '').trim().toLowerCase() === 'subject' ? 'subject' : 'subject-event') : 'manual',
-              eventType,
+              // รายการแบบเก่าที่ไม่มี type เป็นตารางเรียนเดิม จึงระบุเป็น
+              // class หลังคัดรายการสอบออกแล้ว เพื่อให้ cache รอบต่อไปถูกต้อง.
+              eventType: eventType ?? 'class',
               eventId: Number(event?.id) > 0 ? Number(event.id) : null,
               subjectId: linkedSubjectId,
               ownerUserId: Number.isFinite(Number(subject?.user_id)) ? Number(subject.user_id) : null,
@@ -1031,12 +1266,20 @@ export const OverviewPage = () => {
         // รายวิชาที่ผู้ใช้เพิ่มจะมีวันและเวลาอยู่ที่ subject โดยตรงได้ แม้ยังไม่มี
         // calendar-event จึงสร้างคาบเรียนจากข้อมูลวิชาด้วย เพื่อให้ขึ้นทันทีตามตารางเรียน.
         (normalizedSubjects as any[]).forEach(subject => {
+          const subjectId = Number(subject?.id);
+          if (Number.isFinite(subjectId) && subjectsWithScheduleEvent.has(subjectId)) return;
+
           const date = toIsoDate(subject?.start_date);
           if (!date) return;
 
-          const startTime = normalizeTimeInput(subject?.start_time);
-          const endTime = normalizeTimeInput(subject?.end_time);
-          const allDay = !startTime;
+          const rawStartTime = normalizeTimeInput(subject?.start_time);
+          const rawEndTime = normalizeTimeInput(subject?.end_time);
+          const allDay = !rawStartTime;
+          const subjectTimeRange = allDay
+            ? { startTime: null, endTime: null }
+            : { startTime: rawStartTime, endTime: rawEndTime };
+          const startTime = subjectTimeRange.startTime;
+          const endTime = subjectTimeRange.endTime;
           pushSlot({
             id: Number(subject.id),
             subject: resolveSubjectLabel(subject?.name, subject?.subject_name, subject?.title),
@@ -1111,11 +1354,15 @@ export const OverviewPage = () => {
     const nextDate = slot.date || fallbackDate;
     setScheduleEditingSlot(slot);
     setScheduleEditError(null);
+    const alignedRange = getAlignedPeriodRangeForSlot(slot);
     setScheduleEditForm({
       subjectId: slot.subjectId ? String(slot.subjectId) : '',
+      subjectName: slot.subject ?? '',
       date: nextDate,
-      startTime: normalizeTimeForInput(resolveDisplayStartTime(slot)),
-      endTime: normalizeTimeForInput(resolveDisplayEndTime(slot)),
+      startPeriod: String(alignedRange.startPeriod),
+      endPeriod: String(alignedRange.endPeriod),
+      startTime: normalizeTimeForInput(resolveDisplayStartTime(slot) ?? alignedRange.startTime),
+      endTime: normalizeTimeForInput(resolveDisplayEndTime(slot) ?? alignedRange.endTime),
       room: slot.room ?? '',
       allDay: slot.allDay ?? false,
       color: slot.color ?? resolveScheduleAccent(slot),
@@ -1138,7 +1385,10 @@ export const OverviewPage = () => {
     setScheduleEditError(null);
     setScheduleEditForm({
       subjectId: '',
+      subjectName: '',
       date: nextDate,
+      startPeriod: period ? String(period) : '',
+      endPeriod: period ? String(period) : '',
       startTime: period ? toHourMinute(periodToStartTime(period)) : '',
       endTime: period ? toHourMinute(periodToEndTime(period)) : '',
       room: '',
@@ -1321,7 +1571,21 @@ export const OverviewPage = () => {
     patch: Partial<ScheduleSlot>,
     placement?: { day: string; index: number }
   ) => {
-    const updatedSlot: ScheduleSlot = { ...slot, ...patch };
+    // เมื่อแก้คาบ/เวลา ต้องอัปเดต originalStartTime/originalEndTime ด้วย
+    // ไม่เช่นนั้น resolveDisplayStartTime/EndTime จะยังอ่านเวลาเก่า
+    // ทำให้กดบันทึกแล้วการ์ดในตารางดูเหมือนไม่ย้ายคาบ
+    const updatedSlot: ScheduleSlot = {
+      ...slot,
+      ...patch,
+      originalStartTime:
+        Object.prototype.hasOwnProperty.call(patch, 'startTime')
+          ? (patch.startTime ?? null)
+          : slot.originalStartTime,
+      originalEndTime:
+        Object.prototype.hasOwnProperty.call(patch, 'endTime')
+          ? (patch.endTime ?? null)
+          : slot.originalEndTime,
+    };
     setSchedule(prev => {
       const next: Record<string, ScheduleSlot[]> = {};
       Object.entries(prev).forEach(([day, slots]) => {
@@ -1365,20 +1629,54 @@ export const OverviewPage = () => {
 
     let nextEventId = slot.eventId ?? null;
     if (slot.subjectId && slot.source === 'subject' && !slot.eventId) {
-      await updateSubjectSchedule(
-        slot.subjectId,
-        slot.subject,
-        patch.date,
-        patch.allDay ? null : startTime,
-        patch.allDay ? null : endTime,
-        patch.room ?? slot.room ?? null,
-        patch.color ?? slot.color ?? null,
-        patch.semesterId
-      );
+      try {
+        await updateSubjectSchedule(
+          slot.subjectId,
+          patch.subject ?? slot.subject,
+          patch.date,
+          patch.allDay ? null : startTime,
+          patch.allDay ? null : endTime,
+          patch.room ?? slot.room ?? null,
+          patch.color ?? slot.color ?? null,
+          patch.semesterId
+        );
+      } catch (subjectUpdateError: any) {
+        const status = Number(subjectUpdateError?.response?.status ?? 0);
+        const message = String(
+          subjectUpdateError?.response?.data?.message ?? subjectUpdateError?.message ?? ''
+        ).toLowerCase();
+        const isScheduleConflict =
+          status === 409 ||
+          status === 422 ||
+          message.includes('ซ้อน') ||
+          message.includes('overlap') ||
+          message.includes('conflict');
+
+        if (!isScheduleConflict) throw subjectUpdateError;
+
+        // Backend บางเวอร์ชันยังตรวจตารางเดิมของ subject แล้วมองว่า
+        // การย้ายคาบชนกันเอง จึงสร้าง calendar-event เป็นตาราง override แทน
+        // เพื่อให้คาบที่ผู้ใช้เลือก (เช่น 7-11) ถูกบันทึกตามเวลาจริงของคาบนั้น
+        const response = await api.post('/calendar-events', {
+          title: patch.subject ?? slot.subject,
+          subject_id: slot.subjectId,
+          source: 'manual',
+          type: 'class',
+          all_day: patch.allDay,
+          start_time: startDateTime,
+          end_time: endDateTime,
+          status: 'planned',
+          room: patch.room ?? slot.room ?? null,
+        });
+        const created = response.data?.data ?? response.data;
+        if (created?.id) nextEventId = Number(created.id);
+      }
     } else if (slot.eventId) {
       await api.put(`/calendar-events/${slot.eventId}`, {
         title: patch.subject ?? slot.subject,
         subject_id: patch.subjectId ?? slot.subjectId ?? null,
+        source: (patch.subjectId ?? slot.subjectId) ? 'subject' : 'manual',
+        type: 'class',
         start_time: startDateTime,
         end_time: endDateTime,
         all_day: patch.allDay,
@@ -1408,11 +1706,13 @@ export const OverviewPage = () => {
         date: patch.date,
         startTime: patch.allDay ? null : startTime,
         endTime: patch.allDay ? null : endTime,
+        originalStartTime: patch.allDay ? null : startTime,
+        originalEndTime: patch.allDay ? null : endTime,
         room: patch.room ?? slot.room ?? null,
         allDay: patch.allDay,
         color: patch.color ?? slot.color ?? null,
         eventId: nextEventId,
-        source: slot.subjectId && !nextEventId ? 'subject' : slot.source ?? 'manual',
+        source: nextEventId ? 'subject-event' : (slot.subjectId ? 'subject' : slot.source ?? 'manual'),
       },
       placement
     );
@@ -1628,11 +1928,11 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
     if (!scheduleEditingSlot) return;
     const selectedSubject = subjects.find(subject => String(subject.id) === scheduleEditForm.subjectId) ?? null;
     const activeSubjectId = selectedSubject?.id ?? scheduleEditingSlot.subjectId ?? null;
-    const activeSubjectName = selectedSubject?.name ?? scheduleEditingSlot.subject;
+    const activeSubjectName = scheduleEditForm.subjectName.trim();
     const activeColor = selectedSubject?.color ?? scheduleEditForm.color;
 
-    if (!activeSubjectId || !activeSubjectName?.trim()) {
-      setScheduleEditError('กรุณาเลือกวิชา');
+    if (!activeSubjectName) {
+      setScheduleEditError('กรุณากรอกชื่อวิชา');
       return;
     }
 
@@ -1643,11 +1943,17 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
     }
 
     const startTime = normalizeTimeInput(scheduleEditForm.startTime);
-    if (!startTime) {
-      setScheduleEditError('กรุณาระบุเวลาเริ่ม');
+    const endTime = normalizeTimeInput(scheduleEditForm.endTime);
+    const validTime = /^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$/;
+    if (!startTime || !endTime || !validTime.test(startTime) || !validTime.test(endTime)) {
+      setScheduleEditError('กรุณาระบุเวลาเริ่มและเวลาเลิกให้ครบ');
       return;
     }
-    const endTime = normalizeTimeInput(scheduleEditForm.endTime);
+    if (parseTimeToMinutes(endTime) <= parseTimeToMinutes(startTime)) {
+      setScheduleEditError('เวลาเลิกต้องอยู่หลังเวลาเริ่ม');
+      return;
+    }
+
     const nextDay = resolveScheduleDayLabel(effectiveDate);
     const editingSlot = {
       ...scheduleEditingSlot,
@@ -1675,7 +1981,19 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
         semesterId: selectedSubject?.semester_id ?? undefined,
       });
 
+      if (activeSubjectId) {
+        setSubjects(prev => prev.map(subject => (
+          subject.id === activeSubjectId
+            ? { ...subject, name: activeSubjectName }
+            : subject
+        )));
+      }
+
+      // ปิดหน้าต่างก่อน แล้วสั่งโหลดตารางล่าสุดจาก backend อัตโนมัติ
+      // เพื่อให้คาบที่เพิ่งแก้แสดงในตารางทันทีโดยไม่ต้อง refresh หน้าเอง
       closeScheduleEditor();
+      setSubjectRefreshKey(prev => prev + 1);
+      success('แก้ไขคาบเรียนเรียบร้อยแล้ว');
     } catch (err: any) {
       setScheduleEditError(err?.response?.data?.message ?? 'บันทึกวันเวลาไม่สำเร็จ');
     } finally {
@@ -1739,13 +2057,13 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
       return;
     }
 
-    if (endTime && !startTime) {
-      setSubjectEditorError('กรุณาระบุเวลาเริ่ม');
+    if (startDate && (!startTime || !endTime)) {
+      setSubjectEditorError('กรุณาเลือกเวลาเริ่มและสิ้นสุดให้ครบ เพื่อแสดงในตารางเรียน');
       return;
     }
 
     if (startTime && endTime && parseTimeToMinutes(endTime) <= parseTimeToMinutes(startTime)) {
-      setSubjectEditorError('เวลาเลิกต้องช้ากว่าเวลาเริ่ม');
+      setSubjectEditorError('คาบสิ้นสุดต้องอยู่หลังคาบเริ่ม');
       return;
     }
 
@@ -1905,7 +2223,7 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
 
   // Overview is the entry point for creating AI summaries.  Keep the existing
   return (
-    <div className="space-y-6 sm:space-y-8">
+    <div className="max-w-[1500px] space-y-6 sm:space-y-8">
       <section className="hidden rounded-xl border border-slate-200 bg-white p-3 shadow-sm sm:p-4">
         <div className="rounded-lg bg-gradient-to-r from-blue-600 to-cyan-400 px-4 py-2 text-base font-bold text-white sm:text-lg">
           ตารางแสดงรายการ (ผู้ดูแลระบบ)
@@ -2038,12 +2356,12 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
               background: `linear-gradient(180deg, rgba(var(--accent-rgb), 0.07) 0%, rgba(var(--accent-rgb), 0.035) 100%)`,
             }}
           >
-            <div className="relative">
-              <div className={`min-w-0 ${filteredSubjects.length > 0 ? 'pr-36' : 'pr-14'}`}>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
                 <h3 className="text-base font-bold text-[color:var(--text)] sm:text-lg">จัดการรายวิชาในระบบ</h3>
                 <p className="mt-1 text-xs text-[color:var(--muted)] sm:text-sm">รายวิชาที่พร้อมนำไปจัดตารางเรียน</p>
               </div>
-              <div className="absolute right-0 top-0 flex items-center gap-2">
+              <div className="flex shrink-0 items-center gap-2">
                 {filteredSubjects.length > 0 ? (
                   <button
                     type="button"
@@ -2075,12 +2393,12 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
 
             <div className="mt-4">
               {filteredSubjects.length > 0 ? (
-                <div className="flex gap-2 overflow-x-auto pb-1">
+                <div className="flex flex-wrap gap-2">
                   {filteredSubjects.map(subject => {
                     return (
                       <article
                         key={subject.id}
-                        className="min-w-[210px] max-w-[240px] shrink-0 rounded-[1.25rem] border border-white/80 bg-white/90 px-4 py-3.5 shadow-sm"
+                        className="min-w-0 flex-1 basis-[210px] rounded-[1.25rem] border border-white/80 bg-white/90 px-4 py-3.5 shadow-sm"
                       >
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
@@ -2134,117 +2452,106 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
           <div className="bg-transparent px-3 pb-32 sm:px-6 md:px-8 md:pb-16">
             <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
               <div>
-                <p className="text-[10px] font-semibold uppercase tracking-[0.42em] text-[color:var(--accent)]">Classroom Schedule</p>
+                <p className="text-[10px] font-semibold tracking-[0.42em] text-[color:var(--accent)]">ตารางเรียน</p>
                 <p className="mt-1 text-lg font-extrabold leading-tight text-[color:var(--text)] sm:text-xl">{selectedSemesterOption?.label ?? 'กรุณาเลือกภาคเรียน'}</p>
               </div>
             </div>
 
-            <div className="timetable-board schedule-scroll overflow-x-auto rounded-[1.35rem] border p-1.5 sm:p-2">
-              <div className="min-w-[1660px] space-y-2">
-              {displayWeekOrder.map(day => {
+            <div className="timetable-board period-timetable schedule-scroll overflow-x-auto rounded-[1.35rem] border">
+              <div className="min-w-[1730px]">
+                <div className="timetable-grid timetable-period-header-row">
+                  <div className="timetable-period-corner">คาบเรียน</div>
+                  {timetablePeriods.map(period => (
+                    <div key={`period-header-${period}`} className="timetable-period-header">
+                      <span>คาบ {period}</span>
+                      <time>{formatTimeRangeCompact(periodToStartTime(period), periodToEndTime(period))}</time>
+                    </div>
+                  ))}
+                </div>
+
+                {displayWeekOrder.map(day => {
                   const daySlots = scheduleDisplayByDay[day] ?? [];
-                  const hourlySlots = getHourlyTimetableSlots(daySlots);
-                  const slotsByPeriod = new Map(hourlySlots.map((slot, index) => [index + 1, slot] as const));
                   const dayDistinctSubjects = countDistinctSubjects(daySlots);
                   const dayTone = scheduleDayToneMap[day] ?? scheduleDayToneMap.default;
 
-                  return (
-                    <div
-                      key={`schedule-day-${day}`}
-                      className="timetable-row grid grid-cols-[86px_repeat(12,minmax(126px,1fr))] gap-1.5 scroll-mt-28"
-                    >
+                  const cells: ReactNode[] = [];
+                  let period = 1;
+                  while (period <= timetablePeriodCount) {
+                    const slot = getTimetableSlotForPeriod(daySlots, period);
+
+                    if (!slot) {
+                      cells.push(
+                        <button
+                          key={`schedule-empty-${day}-${period}`}
+                          type="button"
+                          onClick={() => openScheduleEditorForCreate(day, period)}
+                          className="timetable-cell empty-timetable-cell min-h-[92px] border px-2 py-2 text-center transition hover:border-[color:var(--accent)]"
+                          aria-label={`เพิ่มคาบเรียน วัน${day} คาบ ${period}`}
+                        />
+                      );
+                      period += 1;
+                      continue;
+                    }
+
+                    const blockKey = getTimetableBlockKey(slot);
+                    let span = 1;
+                    while (
+                      period + span <= timetablePeriodCount
+                      && getTimetableSlotForPeriod(daySlots, period + span)
+                      && getTimetableBlockKey(getTimetableSlotForPeriod(daySlots, period + span)!) === blockKey
+                    ) {
+                      span += 1;
+                    }
+
+                    const accent = resolveScheduleAccent(slot);
+                    const isOwner = Number(slot.ownerUserId ?? user?.id) === Number(user?.id);
+                    const canManagePrimary = user?.role === 'admin' || isOwner;
+                    const warning = scheduleWarnings.get(getSlotKey(slot));
+                    const subjectFromMap = slot.subjectId ? subjectNameById.get(Number(slot.subjectId)) ?? null : null;
+                    const displayTitle = resolveSubjectLabel(subjectFromMap, slot.subject);
+                    const roomLabel = slot.room?.trim() || 'ไม่ระบุห้อง';
+                    const hourRangeLabel = slot.allDay
+                      ? 'ทั้งวัน'
+                      : formatTimeRangeCompact(resolveDisplayStartTime(slot), resolveDisplayEndTime(slot));
+
+                    cells.push(
                       <div
-                        className="day-label-column flex min-h-[76px] flex-col items-center justify-center rounded-[1rem] border px-2 py-2 text-center"
-                        style={{
-                          borderColor: hexToRgba(dayTone.accent, 0.22),
-                          backgroundColor: hexToRgba(dayTone.accent, 0.11),
-                        }}
+                        key={`schedule-cell-${day}-${period}-${blockKey}`}
+                        className="timetable-cell subject-card group relative min-h-[92px] overflow-hidden border px-2.5 py-2.5 shadow-sm transition"
+                        style={{ '--glow-color': accent, gridColumn: `span ${span}` } as CSSProperties}
                       >
-                        <h3 className="text-sm font-extrabold leading-tight" style={{ color: dayTone.accent }}>
-                          {day}
-                        </h3>
-                        <span
-                          className="mt-1 inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-bold"
-                          style={{
-                            backgroundColor: hexToRgba(dayTone.accent, 0.16),
-                            color: dayTone.accent,
-                          }}
-                        >
-                          {dayDistinctSubjects} วิชา
-                        </span>
+                        <div className="subject-card-content flex h-full flex-col">
+                          <div className="flex items-start justify-between gap-1.5">
+                            <span className="text-[10px] font-bold text-[color:var(--muted)]">{hourRangeLabel}</span>
+                            {canManagePrimary ? (
+                              <button
+                                type="button"
+                                onClick={() => openScheduleEditor(slot)}
+                                className="inline-flex h-5 shrink-0 items-center rounded-full bg-blue-500 px-2 text-[9px] font-bold text-white transition hover:bg-blue-600"
+                                title="แก้ไขวิชา"
+                              >
+                                แก้ไข
+                              </button>
+                            ) : null}
+                          </div>
+                          <h4 className="schedule-subject mt-1 line-clamp-2 text-[13px] font-extrabold leading-[1.18]">
+                            {displayTitle}
+                          </h4>
+                          <p className="mt-1.5 truncate text-[10px] font-semibold text-[color:var(--muted)]">ห้อง: {roomLabel}</p>
+                          {warning ? <p className="mt-1 truncate text-[10px] font-semibold text-rose-500">{warning.message}</p> : null}
+                        </div>
                       </div>
+                    );
+                    period += span;
+                  }
 
-                      {timetablePeriods.map(period => {
-                        const slot = slotsByPeriod.get(period) ?? null;
-                        const nextPeriod = period;
-
-                        if (slot) {
-                          const accent = resolveScheduleAccent(slot);
-                          const isContinuationSegment = (slot.hourSegment ?? 1) > 1;
-                          const isOwner = Number(slot.ownerUserId ?? user?.id) === Number(user?.id);
-                          const canManage = user?.role === 'admin' || isOwner;
-                          const canManagePrimary = canManage && !isContinuationSegment;
-                          const slotKey = getSlotKey(slot);
-                          const warning = scheduleWarnings.get(slotKey);
-                          const subjectFromMap = slot.subjectId
-                            ? subjectNameById.get(Number(slot.subjectId)) ?? null
-                            : null;
-                          const displaySubject = resolveSubjectLabel(subjectFromMap, slot.subject);
-                          const displayTitle = displaySubject;
-                          const roomLabel = slot.room?.trim() || 'ไม่ระบุห้อง';
-                          const hourRangeLabel = slot.allDay
-                            ? 'ทั้งวัน'
-                            : formatTimeRangeCompact(slot.startTime, slot.endTime);
-
-                          return (
-                            <div
-                              key={`schedule-cell-${day}-${period}-${slotKey}`}
-                              className="timetable-cell subject-card group relative min-h-[76px] overflow-hidden rounded-[1rem] border px-2.5 py-2.5 shadow-sm transition"
-                              style={{ '--glow-color': accent } as CSSProperties}
-                            >
-                              <div className="subject-card-content flex h-full flex-col">
-                                <div className="mb-1.5 flex items-start justify-between gap-1.5">
-                                  <span className="text-[10px] font-bold text-[color:var(--muted)]">{hourRangeLabel}</span>
-                                  {canManagePrimary ? (
-                                    <div className="flex shrink-0 items-center gap-1 opacity-100">
-                                      <button
-                                        type="button"
-                                        onClick={() => openScheduleEditor(slot)}
-                                        className="inline-flex h-5 items-center rounded-full bg-blue-500 px-2 text-[9px] font-bold text-white transition hover:bg-blue-600"
-                                        title="แก้ไขวิชา"
-                                      >
-                                        แก้ไข
-                                      </button>
-                                    </div>
-                                  ) : null}
-                                </div>
-
-                                <h4 className="schedule-subject mt-1 line-clamp-2 text-[13px] font-extrabold leading-[1.18]">
-                                  {displayTitle || 'ไม่ระบุวิชา'}
-                                </h4>
-                                <p className="mt-1.5 truncate text-[10px] font-semibold text-[color:var(--muted)]">
-                                  ห้อง: {roomLabel}
-                                </p>
-                                {warning ? (
-                                  <p className="mt-1 truncate text-[10px] font-semibold text-rose-500">{warning.message}</p>
-                                ) : null}
-                              </div>
-                            </div>
-                          );
-                        }
-
-                        return (
-                          <button
-                            key={`schedule-empty-${day}-${period}`}
-                            type="button"
-                            onClick={() => openScheduleEditorForCreate(day, nextPeriod)}
-                            className="timetable-cell empty-timetable-cell flex min-h-[76px] flex-col items-center justify-center rounded-[1rem] border border-dashed px-2 py-2 text-center transition hover:border-[color:var(--accent)] hover:text-[color:var(--accent)]"
-                            style={{ borderColor: 'var(--border)', background: 'rgba(255,255,255,0.02)', color: 'var(--muted)' }}
-                          >
-                            <span className="mt-auto mb-auto text-[11px] font-semibold">ว่าง</span>
-                          </button>
-                        );
-                      })}
+                  return (
+                    <div key={`schedule-day-${day}`} className="timetable-grid timetable-row scroll-mt-28">
+                      <div className="day-label-column flex min-h-[92px] flex-col items-center justify-center border px-2 py-2 text-center">
+                        <h3 className="text-sm font-extrabold leading-tight" style={{ color: dayTone.accent }}>{day}</h3>
+                        <span className="mt-1 text-[10px] font-bold text-[color:var(--muted)]">{dayDistinctSubjects} วิชา</span>
+                      </div>
+                      {cells}
                     </div>
                   );
                 })}
@@ -2256,11 +2563,11 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
 
       {/* ... ส่วนอื่นของไฟล์เดิมคุณต่อได้เหมือนเดิม ... */}
       {subjectCatalogOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 py-6">
+        <ModalOverlay className="fixed inset-0 flex items-center justify-center bg-black/60 px-4 py-6">
           <div className="surface w-full max-w-2xl rounded-3xl border border-slate-200 bg-white p-5 shadow-glow">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
-                <p className="text-xs uppercase tracking-[0.35em] text-emerald-600">Subjects</p>
+                <p className="text-xs tracking-[0.35em] text-emerald-600">รายวิชา</p>
                 <h3 className="mt-2 text-lg font-semibold text-slate-900">รายวิชาทั้งหมด</h3>
                 <label className="mt-3 block text-xs font-semibold text-slate-500" htmlFor="subject-catalog-semester">
                   ภาคเรียน
@@ -2311,7 +2618,7 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
                         type="button"
                         onClick={event => {
                           event.stopPropagation();
-                          openSubjectEditorForSubject(subject);
+                          navigate(`/subjects?edit=${subject.id}`);
                         }}
                         className="inline-flex items-center gap-1 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50"
                         title="แก้ไขวิชา"
@@ -2346,11 +2653,10 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
-      {subjectEditorOpen && typeof document !== 'undefined' && createPortal(
-        <div className="fixed inset-0 z-[70] overflow-y-auto bg-slate-950/55 px-4 py-2 backdrop-blur-sm sm:py-4">
+      {subjectEditorOpen && typeof document !== 'undefined' && (<ModalOverlay className="fixed inset-0 overflow-y-auto bg-slate-950/55 px-4 py-2 backdrop-blur-sm sm:py-4">
           <div className="flex min-h-full items-start justify-center pt-1 sm:pt-2">
             <div
               className="surface my-2 w-full max-w-lg overflow-hidden rounded-[1.75rem] border p-0 shadow-[0_28px_80px_rgba(15,23,42,0.30)]"
@@ -2367,7 +2673,7 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
                       className="inline-flex rounded-full px-3 py-1 text-[10px] font-bold uppercase tracking-[0.2em]"
                       style={{ background: 'rgba(var(--accent-rgb),0.10)', color: 'var(--accent)' }}
                     >
-                      Subject
+                      รายวิชา
                     </span>
                     <h3 className="mt-3 text-xl font-bold text-[color:var(--text)]">
                       {subjectEditor.subjectId ? 'แก้ไขวิชา' : 'เพิ่มวิชา'}
@@ -2538,24 +2844,70 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
 
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">เวลาเริ่ม</label>
-                      <TimePicker
-                      value={subjectEditor.startTime}
-                      onChange={value => setSubjectEditor(prev => ({ ...prev, startTime: value }))}
-                      allowEmpty
-                      label="เวลาเริ่ม"
-                      className="w-full"
-                    />
+                      <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">คาบเริ่ม</label>
+                      <select
+                        value={(() => {
+                          const minutes = parseTimeToMinutes(subjectEditor.startTime);
+                          if (!Number.isFinite(minutes)) return '';
+                          const period = Math.floor((minutes - timetableStartMinutes) / timetablePeriodDuration) + 1;
+                          return period >= 1 && period <= timetablePeriodCount ? String(period) : '';
+                        })()}
+                        onChange={event => {
+                          const period = Number(event.target.value);
+                          setSubjectEditor(prev => ({
+                            ...prev,
+                            startTime: period ? toHourMinute(periodToStartTime(period)) : '',
+                            endTime: period && (!prev.endTime || parseTimeToMinutes(prev.endTime) <= parseTimeToMinutes(periodToStartTime(period)))
+                              ? toHourMinute(periodToEndTime(period))
+                              : prev.endTime,
+                          }));
+                        }}
+                        className="w-full rounded-xl border px-3.5 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:ring-2"
+                        style={{
+                          borderColor: 'var(--border)',
+                          background: 'var(--surface-2)',
+                          ['--tw-ring-color' as string]: 'rgba(var(--accent-rgb),0.24)',
+                        }}
+                      >
+                        <option value="">เลือกคาบ</option>
+                        {timetablePeriods.map(period => (
+                          <option key={`subject-start-period-${period}`} value={period}>
+                            คาบ {period}
+                          </option>
+                        ))}
+                      </select>
                     </div>
+
                     <div>
-                      <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">เวลาเลิก</label>
-                      <TimePicker
-                      value={subjectEditor.endTime}
-                      onChange={value => setSubjectEditor(prev => ({ ...prev, endTime: value }))}
-                      allowEmpty
-                      label="เวลาเลิก"
-                      className="w-full"
-                    />
+                      <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">คาบสิ้นสุด</label>
+                      <select
+                        value={(() => {
+                          const minutes = parseTimeToMinutes(subjectEditor.endTime);
+                          if (!Number.isFinite(minutes)) return '';
+                          const period = Math.ceil((minutes - timetableStartMinutes) / timetablePeriodDuration);
+                          return period >= 1 && period <= timetablePeriodCount ? String(period) : '';
+                        })()}
+                        onChange={event => {
+                          const period = Number(event.target.value);
+                          setSubjectEditor(prev => ({
+                            ...prev,
+                            endTime: period ? toHourMinute(periodToEndTime(period)) : '',
+                          }));
+                        }}
+                        className="w-full rounded-xl border px-3.5 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:ring-2"
+                        style={{
+                          borderColor: 'var(--border)',
+                          background: 'var(--surface-2)',
+                          ['--tw-ring-color' as string]: 'rgba(var(--accent-rgb),0.24)',
+                        }}
+                      >
+                        <option value="">เลือกคาบ</option>
+                        {timetablePeriods.map(period => (
+                          <option key={`subject-end-period-${period}`} value={period}>
+                            คาบ {period}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                   </div>
 
@@ -2621,12 +2973,10 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
               </div>
             </div>
           </div>
-        </div>,
-        document.body
-      )}
+        </ModalOverlay>)}
 
       {scheduleEditingSlot && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/55 px-4 py-6 backdrop-blur-sm">
+        <ModalOverlay className="fixed inset-0 flex items-center justify-center bg-slate-950/55 px-4 py-6 backdrop-blur-sm">
           <div
             className="surface w-full max-w-lg overflow-hidden rounded-[1.75rem] border shadow-[0_28px_80px_rgba(15,23,42,0.30)]"
             style={{ borderColor: 'var(--border)', background: 'var(--surface)', color: 'var(--text)' }}
@@ -2636,14 +2986,14 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <span className="inline-flex rounded-full bg-[color:rgba(var(--accent-rgb),0.10)] px-3 py-1 text-[10px] font-bold uppercase tracking-[0.22em] text-[color:var(--accent)]">
-                  Schedule
+                  ตารางเรียน
                 </span>
                 <h3 className="mt-3 text-xl font-bold text-[color:var(--text)]">
                   {scheduleEditingSlot.source === 'draft' ? 'จัดตารางเรียน' : 'แก้ไขคาบเรียน'}
                 </h3>
                 <p className="mt-1 text-sm leading-6 text-[color:var(--muted)]">
                   {scheduleEditingSlot.source === 'draft'
-                    ? 'เลือกวิชาที่มีในระบบมากำหนดเวลาเรียนในตาราง'
+                    ? 'กรอกชื่อวิชาและกำหนดเวลาเรียนในตาราง'
                     : scheduleEditingSlot.subject}
                 </p>
               </div>
@@ -2668,28 +3018,20 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
 
             <div className="mt-5 space-y-4 text-sm">
               <div>
-                <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">เลือกวิชา</label>
-                <select
-                  value={scheduleEditForm.subjectId}
-                  onChange={event => {
-                    const nextId = event.target.value;
-                    const selectedSubject = subjects.find(subject => String(subject.id) === nextId) ?? null;
-                    setScheduleEditForm(prev => ({
-                      ...prev,
-                      subjectId: nextId,
-                      color: selectedSubject?.color ?? prev.color,
-                    }));
-                  }}
-                  className="w-full rounded-xl border px-4 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:border-[color:var(--accent)] focus:ring-4 focus:ring-[color:rgba(var(--accent-rgb),0.10)]"
+                <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">ชื่อวิชา</label>
+                <input
+                  type="text"
+                  value={scheduleEditForm.subjectName}
+                  readOnly={Boolean(scheduleEditingSlot.subjectId)}
+                  onChange={event => setScheduleEditForm(prev => ({
+                    ...prev,
+                    subjectName: event.target.value,
+                  }))}
+                  placeholder="กรอกชื่อวิชา"
+                  className="w-full rounded-xl border px-4 py-3 text-[color:var(--text)] shadow-sm outline-none transition placeholder:text-[color:var(--muted)] focus:border-[color:var(--accent)] focus:ring-4 focus:ring-[color:rgba(var(--accent-rgb),0.10)]"
                   style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
-                >
-                  <option value="">-- เลือกวิชา --</option>
-                  {subjects.map(subject => (
-                    <option key={subject.id} value={subject.id}>
-                      {subject.name}
-                    </option>
-                  ))}
-                </select>
+                />
+                {scheduleEditingSlot.subjectId && <button type="button" onClick={() => navigate(`/subjects?edit=${scheduleEditingSlot.subjectId}`)} className="mt-2 text-xs font-semibold text-primary">เปลี่ยนชื่อและรายละเอียดที่หน้ารายวิชา</button>}
               </div>
               <div>
                 <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">ห้องเรียน</label>
@@ -2704,26 +3046,68 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">เวลาเริ่ม</label>
-                  <TimePicker
-                      value={scheduleEditForm.startTime}
-                      onChange={value => setScheduleEditForm(prev => ({ ...prev, startTime: value }))}
-                      disabled={scheduleEditForm.allDay}
-                      allowEmpty
-                      label="เวลาเริ่ม"
-                      className="w-full"
-                    />
+                  <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">คาบเริ่ม</label>
+                  <select
+                    value={scheduleEditForm.startPeriod}
+                    onChange={event => {
+                      const nextStartPeriod = Number(event.target.value);
+                      if (!Number.isInteger(nextStartPeriod)) return;
+                      setScheduleEditForm(prev => {
+                        const currentEndPeriod = Number(prev.endPeriod);
+                        const nextEndPeriod = Number.isInteger(currentEndPeriod) && currentEndPeriod >= nextStartPeriod
+                          ? currentEndPeriod
+                          : nextStartPeriod;
+                        return {
+                          ...prev,
+                          startPeriod: String(nextStartPeriod),
+                          endPeriod: String(nextEndPeriod),
+                          startTime: toHourMinute(periodToStartTime(nextStartPeriod)),
+                          endTime: toHourMinute(periodToEndTime(nextEndPeriod)),
+                        };
+                      });
+                    }}
+                    disabled={scheduleEditForm.allDay}
+                    className="w-full rounded-xl border px-4 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:border-[color:var(--accent)] focus:ring-4 focus:ring-[color:rgba(var(--accent-rgb),0.10)] disabled:opacity-60"
+                    style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
+                  >
+                    <option value="">เลือกคาบ</option>
+                    {timetablePeriods.map(period => (
+                      <option key={`start-period-${period}`} value={period}>
+                        คาบ {period}
+                      </option>
+                    ))}
+                  </select>
                 </div>
                 <div>
-                  <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">เวลาเลิก</label>
-                  <TimePicker
-                      value={scheduleEditForm.endTime}
-                      onChange={value => setScheduleEditForm(prev => ({ ...prev, endTime: value }))}
-                      disabled={scheduleEditForm.allDay}
-                      allowEmpty
-                      label="เวลาเลิก"
-                      className="w-full"
-                    />
+                  <label className="mb-2 block text-xs font-semibold text-[color:var(--muted)]">คาบสิ้นสุด</label>
+                  <select
+                    value={scheduleEditForm.endPeriod}
+                    onChange={event => {
+                      const nextEndPeriod = Number(event.target.value);
+                      if (!Number.isInteger(nextEndPeriod)) return;
+                      const currentStartPeriod = Number(scheduleEditForm.startPeriod);
+                      if (Number.isInteger(currentStartPeriod) && nextEndPeriod < currentStartPeriod) {
+                        setScheduleEditError('คาบสิ้นสุดต้องไม่น้อยกว่าคาบเริ่ม');
+                        return;
+                      }
+                      setScheduleEditError(null);
+                      setScheduleEditForm(prev => ({
+                        ...prev,
+                        endPeriod: String(nextEndPeriod),
+                        endTime: toHourMinute(periodToEndTime(nextEndPeriod)),
+                      }));
+                    }}
+                    disabled={scheduleEditForm.allDay}
+                    className="w-full rounded-xl border px-4 py-3 text-[color:var(--text)] shadow-sm outline-none transition focus:border-[color:var(--accent)] focus:ring-4 focus:ring-[color:rgba(var(--accent-rgb),0.10)] disabled:opacity-60"
+                    style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
+                  >
+                    <option value="">เลือกคาบ</option>
+                    {timetablePeriods.map(period => (
+                      <option key={`end-period-${period}`} value={period}>
+                        คาบ {period}
+                      </option>
+                    ))}
+                  </select>
                 </div>
               </div>
             </div>
@@ -2749,7 +3133,7 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
             </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {draggingSlot && dragPointer && draggingSlotDataRef.current ? (
@@ -2871,6 +3255,69 @@ const deleteCalendarEventWithFallback = async (eventId: number) => {
         .theme-dark .timetable-print:hover {
           background: rgba(255, 255, 255, 0.1) !important;
           color: rgba(255, 255, 255, 0.92) !important;
+        }
+
+        .timetable-grid {
+          display: grid;
+          grid-template-columns: 86px repeat(13, minmax(126px, 1fr));
+        }
+
+        .period-timetable {
+          background: var(--surface);
+        }
+
+        .timetable-period-header-row {
+          position: sticky;
+          top: 0;
+          z-index: 4;
+        }
+
+        .timetable-period-corner,
+        .timetable-period-header {
+          display: flex;
+          min-height: 64px;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          border-bottom: 1px solid var(--border);
+          border-right: 1px solid var(--border);
+          background: color-mix(in srgb, var(--surface) 92%, var(--accent) 8%);
+          color: var(--text);
+          text-align: center;
+          font-size: 14px;
+          font-weight: 800;
+          line-height: 1.25;
+        }
+
+        .timetable-period-corner {
+          font-size: 14px;
+        }
+
+        .timetable-period-header time {
+          margin-top: 4px;
+          color: var(--muted);
+          font-size: 12px;
+          font-weight: 700;
+        }
+
+        .period-timetable .day-label-column {
+          border-width: 0 1px 1px 0;
+          border-color: var(--border);
+          background: color-mix(in srgb, var(--surface) 94%, var(--accent) 6%);
+        }
+
+        .period-timetable .timetable-cell {
+          border-width: 0 1px 1px 0;
+          border-color: var(--border);
+          border-radius: 0;
+        }
+
+        .period-timetable .empty-timetable-cell {
+          background: transparent;
+        }
+
+        .period-timetable .empty-timetable-cell:hover {
+          background: color-mix(in srgb, var(--surface) 82%, var(--accent) 18%);
         }
 
         .theme-dark .timetable-board {

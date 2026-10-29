@@ -1,8 +1,11 @@
+import { ModalOverlay } from '../../components/ModalOverlay';
 import { useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { House, BookOpen, ClipboardText, CalendarBlank, Target, Bell, Microphone, Suitcase, Robot, FileText, User, Archive, DotsThree, Sun, Moon, X } from 'phosphor-react';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
+import { useTheme } from '../../context/ThemeContext';
+import { StorageNavigation } from '../../components/StorageNavigation';
 import { api, assetBaseURL } from '../../services/api';
 import robotImage from '../../img/robot.png';
 import {
@@ -97,7 +100,9 @@ const ThemeModeSwitch = ({
     <button
       type="button"
       onClick={() => onChange(isDark ? 'light' : 'dark')}
-      aria-label="Toggle theme"
+      aria-label={isDark ? 'เปลี่ยนเป็นโหมดสว่าง' : 'เปลี่ยนเป็นโหมดมืด'}
+      aria-pressed={isDark}
+      title={isDark ? 'เปลี่ยนเป็นโหมดสว่าง' : 'เปลี่ยนเป็นโหมดมืด'}
       className={`flex h-10 w-10 items-center justify-center rounded-full border transition ${
         isDark ? 'border-white/10 text-slate-200 hover:border-white/20' : 'border-slate-200 bg-white text-slate-600 shadow-sm hover:text-slate-900'
       }`}
@@ -109,10 +114,10 @@ const ThemeModeSwitch = ({
 
 const accentStorageKey = 'smart-classroom-accent';
 const customAccentStorageKey = 'smart-classroom-custom-accent';
-const themeStorageKey = 'smart-classroom-theme';
 const fontScaleStorageKey = 'smart-classroom-font-scale';
 const browserNotifyEnabledStorageKey = 'slt::browser-notify-enabled';
 const seenNotificationKeysStoragePrefix = 'slt::seen-notification-keys::user:';
+const loginNotificationPopupStorageKey = 'slt::notification-popup-after-login';
 const FONT_SCALE_MIN = 0.8;
 const FONT_SCALE_MAX = 1.3;
 type IconName =
@@ -445,7 +450,7 @@ const MobileIcon = ({
           <rect x="8" y="6" width="8" height="2" rx="1" fill={accentColor} />
         </svg>
       );
-    case 'studyDigest': // สรุปการเรียน
+    case 'studyDigest': // สรุปเนื้อหา
       return (
         <svg viewBox="0 0 24 24" className={className} fill="none">
           {active ? (
@@ -463,7 +468,7 @@ const MobileIcon = ({
           )}
         </svg>
       );
-    case 'studyStorage': // กระเป๋าเก็บไฟล์
+    case 'studyStorage': // ไฟล์ทั้งหมด
       return (
         <svg viewBox="0 0 24 24" className={className} fill="none">
           {active ? (
@@ -534,6 +539,14 @@ const shadeColor = (hex: string, percent: number) => {
   )
     .toString(16)
     .slice(1)}`;
+};
+
+const tintColor = (hex: string, whiteRatio = 0.68) => {
+  const normalized = normalizeHexColor(hex).slice(1);
+  const value = Number.parseInt(normalized, 16);
+  const channels = [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+  const tinted = channels.map(channel => Math.round(channel + (255 - channel) * whiteRatio));
+  return `#${tinted.map(channel => channel.toString(16).padStart(2, '0')).join('')}`;
 };
 
 const normalizeHexColor = (value: string, fallback = '#3b82f6') =>
@@ -639,6 +652,16 @@ const persistSeenNotificationKey = (userId: number | null | undefined, key: stri
   window.localStorage.setItem(getSeenNotificationKeyStorage(userId), JSON.stringify(capped));
 };
 
+const hasPendingLoginNotificationPopup = () => {
+  if (typeof window === 'undefined') return false;
+  return window.sessionStorage.getItem(loginNotificationPopupStorageKey) === '1';
+};
+
+const consumeLoginNotificationPopup = () => {
+  if (typeof window === 'undefined') return;
+  window.sessionStorage.removeItem(loginNotificationPopupStorageKey);
+};
+
 const normalizeNotifications = (payload: unknown): StudyNotification[] => {
   if (Array.isArray(payload)) {
     return payload as StudyNotification[];
@@ -713,11 +736,7 @@ export const DashboardLayout = () => {
     target.dataset.logoFallbackIndex = String(nextIndex);
     target.src = logoCandidates[nextIndex];
   };
-  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
-    if (typeof window === 'undefined') return 'light';
-    const stored = window.localStorage.getItem(themeStorageKey);
-    return stored === 'light' || stored === 'dark' ? stored : 'light';
-  });
+  const { theme, setTheme } = useTheme();
   const [accentThemeId, setAccentThemeId] = useState(() => {
     if (typeof window === 'undefined') return accentThemes[0].id;
     const stored = window.localStorage.getItem(accentStorageKey);
@@ -792,6 +811,7 @@ export const DashboardLayout = () => {
   const requestedBrowserPermissionRef = useRef(false);
   const hasLoadedNotificationsRef = useRef(false);
   const hasAutoOpenedNotificationsRef = useRef(false);
+  const entryPopupKeysRef = useRef<Set<string>>(new Set());
 
   const unreadCount = useMemo(
     () => (Array.isArray(notifications) ? notifications.filter(n => !n.is_read).length : 0),
@@ -956,9 +976,21 @@ export const DashboardLayout = () => {
 
         // When the dashboard is opened after sign-in, show unread items before
         // the user starts interacting with the current page.
-        if (!hasAutoOpenedNotificationsRef.current && merged.some(item => !item.is_read)) {
+        const unreadItems = merged.filter(item => !item.is_read);
+        if (
+          !hasAutoOpenedNotificationsRef.current &&
+          hasPendingLoginNotificationPopup() &&
+          unreadItems.length > 0
+        ) {
           hasAutoOpenedNotificationsRef.current = true;
+          consumeLoginNotificationPopup();
           setNotifyOpen(true);
+          unreadItems.slice(0, 3).forEach(item => {
+            const entryKey = `entry:${item.id}:${item.notify_at}`;
+            if (entryPopupKeysRef.current.has(entryKey)) return;
+            entryPopupKeysRef.current.add(entryKey);
+            pushWebToast(entryKey, item.title, item.message);
+          });
         }
 
         // Notify only when due time has arrived.
@@ -1074,13 +1106,18 @@ export const DashboardLayout = () => {
   useEffect(() => {
     if (typeof document === 'undefined') return;
     const root = document.documentElement;
-    root.style.setProperty('--accent', activeAccentTheme.accent);
-    root.style.setProperty('--accent-strong', activeAccentTheme.accentStrong);
-    root.style.setProperty('--accent-soft', activeAccentTheme.accentSoft);
+    // Keep the selected swatch intact, but use pastel fills with dark ink in light mode.
+    const isLight = theme === 'light';
+    const accent = isLight ? tintColor(activeAccentTheme.accent, 0.68) : activeAccentTheme.accent;
+    const accentStrong = isLight ? tintColor(activeAccentTheme.accent, 0.58) : activeAccentTheme.accentStrong;
+    const accentSoft = isLight ? tintColor(activeAccentTheme.accent, 0.82) : activeAccentTheme.accentSoft;
+    root.style.setProperty('--accent', accent);
+    root.style.setProperty('--accent-strong', accentStrong);
+    root.style.setProperty('--accent-soft', accentSoft);
     root.style.setProperty('--accent-ink', getAccentInkColor(activeAccentTheme.accent, theme));
-    root.style.setProperty('--accent-rgb', activeAccentTheme.accentRgb);
-    root.style.setProperty('--on-accent', activeAccentTheme.onAccent);
-    root.style.setProperty('--on-accent-rgb', activeAccentTheme.onAccentRgb);
+    root.style.setProperty('--accent-rgb', hexToRgbString(accent));
+    root.style.setProperty('--on-accent', isLight ? '#0f172a' : activeAccentTheme.onAccent);
+    root.style.setProperty('--on-accent-rgb', isLight ? '15,23,42' : activeAccentTheme.onAccentRgb);
     root.dataset.accent = activeAccentTheme.id;
     if (typeof window !== 'undefined') {
       window.localStorage.setItem(accentStorageKey, activeAccentTheme.id);
@@ -1114,21 +1151,11 @@ export const DashboardLayout = () => {
   }, [fontScale]);
 
   useEffect(() => {
-    const root = document.documentElement;
-    const body = document.body;
-    root.classList.toggle('theme-dark', theme === 'dark');
-    root.classList.toggle('theme-light', theme === 'light');
-    body.classList.toggle('theme-dark', theme === 'dark');
-    body.classList.toggle('theme-light', theme === 'light');
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem(themeStorageKey, theme);
-    }
-
+    document.body.classList.add('user-area');
     return () => {
-      root.classList.remove('theme-dark', 'theme-light');
-      body.classList.remove('theme-dark', 'theme-light');
+      document.body.classList.remove('user-area');
     };
-  }, [theme]);
+  }, []);
 
   const markAsRead = async (id: number) => {
     if (id < 0) {
@@ -1173,14 +1200,13 @@ export const DashboardLayout = () => {
       { to: '/ai-assistant', label: 'หน้าหลัก', icon: 'assistant', accent: activeAccentTheme.accent },
       { to: '/overview', label: 'ตารางเรียน', icon: 'subjects', accent: activeAccentTheme.accent },
       { to: '/calendar', label: 'ปฏิทิน', icon: 'calendar', accent: activeAccentTheme.accent },
-      { to: '/document-summary', label: 'สรุปจากเนื้อหา', icon: 'documentSummary', accent: activeAccentTheme.accent },
-      { to: '/study-storage', label: 'กระเป๋าเก็บไฟล์', icon: 'studyStorage', accent: activeAccentTheme.accent },
-      { to: '/archived-summaries', label: 'เก็บถาวร', icon: 'archive', accent: activeAccentTheme.accent },
+      { to: '/document-summary', label: 'สรุปเนื้อหาจากไฟล์', icon: 'documentSummary', accent: activeAccentTheme.accent },
+      { to: '/archived-summaries', label: 'สรุปที่บันทึกไว้', icon: 'archive', accent: activeAccentTheme.accent },
       { to: '/quizzes', label: 'แบบฝึกหัด', icon: 'quizzes', accent: activeAccentTheme.accent },
-      { to: '/goals', label: 'เป้าหมายกิจกรรม', icon: 'goals', accent: activeAccentTheme.accent },
+      { to: '/goals', label: 'เป้าหมายของฉัน', icon: 'goals', accent: activeAccentTheme.accent },
       { to: '/learning-stats', label: 'สถิติ', icon: 'stats', accent: activeAccentTheme.accent },
       { to: '/career-advisor', label: 'อาชีพแนะนำ', icon: 'careerAdvisor', accent: activeAccentTheme.accent },
-      { to: '/profile', label: 'โปรไฟล์', icon: 'profile', accent: activeAccentTheme.accent },
+      { to: '/study-storage', label: 'ไฟล์ทั้งหมด', icon: 'studyStorage', accent: activeAccentTheme.accent },
       ],
       [activeAccentTheme.accent]
     );
@@ -1199,19 +1225,6 @@ export const DashboardLayout = () => {
   );
   const mobileBottomNavItems = bottomNavItems.slice(0, 5);
   const topNavItems = bottomNavItems.slice(5);
-  const pageTitle = useMemo(() => {
-    if (location.pathname === '/' || location.pathname === '/overview' || location.pathname.startsWith('/overview/')) return 'ตารางเรียน';
-    if (location.pathname === '/ai-assistant' || location.pathname.startsWith('/ai-assistant/')) return 'หน้าหลัก';
-    if (location.pathname === '/notifications' || location.pathname.startsWith('/notifications/')) return 'การแจ้งเตือน';
-    if (location.pathname === '/document-summary' || location.pathname.startsWith('/document-summary/')) return 'สรุปจากเนื้อหา';
-    if (location.pathname === '/voice-summary' || location.pathname.startsWith('/voice-summary/')) return 'สรุปจากเสียง';
-    if (location.pathname === '/study-digest' || location.pathname.startsWith('/study-digest/')) return 'สรุปการเรียน';
-    if (location.pathname === '/study-storage' || location.pathname.startsWith('/study-storage/')) return 'กระเป๋าเก็บไฟล์';
-    if (location.pathname === '/learning-stats' || location.pathname.startsWith('/learning-stats/')) return 'สถิติ';
-    if (location.pathname === '/admin' || location.pathname.startsWith('/admin/')) return 'ผู้ดูแลระบบ';
-    const match = navItems.find(item => location.pathname === item.to || location.pathname.startsWith(`${item.to}/`));
-    return match?.label ?? 'Home';
-  }, [location.pathname, navItems]);
   const isAiPage = location.pathname.startsWith('/ai-assistant');
   const isLearningStatsPage = location.pathname.startsWith('/learning-stats');
   useEffect(() => {
@@ -1327,8 +1340,8 @@ export const DashboardLayout = () => {
                     </span>
 
                     <span
-                      className={`mobile-bottom-nav__label ${isActive ? 'is-active' : ''} pointer-events-none absolute inset-x-0 truncate px-1 text-center text-[11px] font-bold leading-none transition-colors duration-300`}
-                      style={{ bottom: '10px', color: navItemColor }}
+                      className={`mobile-bottom-nav__label ${isActive ? 'is-active' : ''} pointer-events-none absolute inset-x-0 truncate px-1 text-center text-[11px] font-bold leading-none !text-white transition-colors duration-300`}
+                      style={{ bottom: '10px', color: navItemColor, WebkitTextFillColor: navItemColor }}
                     >
                       {item.label}
                     </span>
@@ -1386,7 +1399,7 @@ export const DashboardLayout = () => {
 	                >
                   <img
                     src={logoUrl}
-                    alt="Smart Room"
+                    alt="โลโก้Smart Room"
                     className="h-full w-full rounded-2xl object-cover p-1"
                     onError={handleLogoImageError}
                   />
@@ -1394,30 +1407,39 @@ export const DashboardLayout = () => {
                 <span className={`text-[17px] font-semibold tracking-tight ${theme === 'dark' ? 'text-white' : 'text-[color:var(--text)]'}`}>Smart Room</span>
               </Link>
           </div>
-          <nav className="flex-1 space-y-1.5 overflow-y-auto px-3 py-5">
+          <nav className="flex-1 space-y-1.5 overflow-y-auto px-2 py-5">
             {navItems.map(item => {
-              return (
+              if (item.to === '/archived-summaries') return null;
+              if (item.to === '/study-storage') {
+                return (
+                  <StorageNavigation
+                    key={`${item.to}-${user?.id}`}
+                    dark={theme === 'dark'}
+                    to={item.to}
+                    label={item.label}
+                    icon={<MobileIcon name={item.icon} active={location.pathname === item.to} accent={theme === 'dark' ? '#ffffff' : activeAccentTheme.accent} className="h-5 w-5" />}
+                  />
+                );
+              }
+              const navigationLink = (
                 <NavLink
                   key={item.to}
                   to={item.to}
                     className={({ isActive }) =>
-                      `group flex items-center gap-3 rounded-2xl px-4 py-2.5 text-[15px] transition-all duration-200 ${
+                      `sidebar-menu-link group flex items-center gap-3 rounded-2xl px-4 py-2.5 text-[15px] transition-all duration-200 ${
                         theme === 'dark'
                           ? isActive
-                            ? 'font-medium text-white'
+                            ? 'font-bold text-white'
                             : 'text-white/70 hover:bg-white/10 hover:text-white'
                           : isActive
-                            ? 'font-medium text-[color:var(--accent)]'
-                            : 'text-[color:var(--muted)] hover:bg-[color:var(--surface-3)] hover:text-[color:var(--text)]'
+                            ? 'font-bold text-[color:var(--text)]'
+                            : 'text-[color:var(--text)] hover:bg-[color:var(--surface-3)]'
                       }`
-                    }
-                    style={({ isActive }) =>
-                      isActive ? { backgroundColor: 'rgba(var(--accent-rgb), 0.12)' } : undefined
                     }
                   >
                   {({ isActive }) => (
                     <>
-                      <span className="relative flex h-[22px] w-[22px] shrink-0 items-center justify-center">
+                      <span className="sidebar-menu-icon relative flex h-[22px] w-[22px] shrink-0 items-center justify-center">
                         <MobileIcon
                           name={item.to === '/ai-assistant' ? 'overview' : item.icon}
                           active={isActive}
@@ -1433,7 +1455,7 @@ export const DashboardLayout = () => {
                                 ? { color: '#ffffff' }
                                 : { color: 'rgba(255,255,255,0.82)' }
 	                            : theme === 'light' && isActive
-	                              ? { color: 'var(--accent)' }
+	                              ? { color: 'var(--text)' }
 	                              : undefined
 	                        }
 	                      >
@@ -1443,9 +1465,23 @@ export const DashboardLayout = () => {
                   )}
                 </NavLink>
               );
+              if (item.to === '/document-summary') {
+                const archiveItem = navItems.find(navItem => navItem.to === '/archived-summaries')!;
+                return (
+                  <StorageNavigation
+                    key={`${archiveItem.to}-${user?.id}`}
+                    dark={theme === 'dark'}
+                    to={archiveItem.to}
+                    label={archiveItem.label}
+                    icon={<MobileIcon name={archiveItem.icon} active={location.pathname === archiveItem.to} accent={theme === 'dark' ? '#ffffff' : activeAccentTheme.accent} className="h-5 w-5" />}
+                    beforeNavigation={navigationLink}
+                  />
+                );
+              }
+              return navigationLink;
             })}
           </nav>
-          <div className={`mt-auto hidden px-4 pt-4 ${theme === 'dark' ? 'border-t border-white/10' : 'border-t border-slate-100'}`}>
+          <div className={`mt-auto px-3 pt-4 ${theme === 'dark' ? 'border-t border-white/10' : 'border-t border-slate-100'}`}>
             <nav className="mb-4 space-y-2" aria-label="เมนูผู้ใช้">
               {secondaryNavItems.map(item => (
                 <NavLink
@@ -1481,16 +1517,14 @@ export const DashboardLayout = () => {
             </nav>
             <Link
               to="/profile"
-              className={`flex items-center gap-3 rounded-2xl px-3 py-3 transition ${
+              className={`flex items-center gap-3 rounded-2xl border px-3 py-3 transition ${
                   theme === 'dark'
-                    ? 'bg-slate-950/40 hover:bg-slate-900/60'
-                    : 'hover:bg-slate-100'
+                    ? 'border-white/10 bg-white/[0.04] hover:bg-white/[0.08]'
+                    : 'border-slate-100 bg-white shadow-[0_6px_18px_rgba(15,23,42,0.05)] hover:bg-slate-50'
               }`}
             >
               <span
-                className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full ${
-                  theme === 'dark' ? 'bg-slate-900/60' : 'bg-slate-100'
-                }`}
+                className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-violet-600 text-white shadow-sm"
               >
                 {profileImageUrl ? (
                   <img
@@ -1501,14 +1535,14 @@ export const DashboardLayout = () => {
                     onError={handleProfileImageError}
                   />
                 ) : (
-                  <span className={`text-sm font-semibold ${theme === 'dark' ? 'text-white/85' : 'text-slate-700'}`}>
-                    {user?.name?.charAt(0) ?? 'U'}
+                  <span className="text-sm font-semibold">
+                    {(user?.name?.trim() || user?.email?.trim() || 'U').charAt(0).toUpperCase()}
                   </span>
                 )}
               </span>
               <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-medium">{user?.name ?? 'ผู้ใช้งาน'}</span>
-                <span className={`block truncate text-xs ${theme === 'dark' ? 'text-white/55' : 'text-slate-500'}`}>
+                <span className={`block truncate text-sm font-semibold ${theme === 'dark' ? 'text-white' : 'text-sky-700'}`}>{user?.name ?? 'ผู้ใช้งาน'}</span>
+                <span className={`block truncate text-[11px] ${theme === 'dark' ? 'text-white/55' : 'text-slate-500'}`}>
                   {user?.email ?? 'ดูโปรไฟล์'}
                 </span>
               </span>
@@ -1517,7 +1551,7 @@ export const DashboardLayout = () => {
               <button
                 type="button"
                 onClick={logout}
-                className="flex w-full items-center justify-center gap-2 rounded-full bg-rose-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-rose-700"
+                className="flex w-full items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_8px_18px_rgba(225,29,72,0.18)] transition hover:bg-rose-700"
                 style={{ color: '#ffffff', WebkitTextFillColor: '#ffffff' }}
               >
                 <LogOut size={18} />
@@ -1528,17 +1562,17 @@ export const DashboardLayout = () => {
         </aside>
 
         <div
-          className={`mobile-app-shell relative flex-1 px-0 pb-0 pt-0 ${isAiPage ? 'sm:px-0 md:h-screen md:overflow-hidden' : 'sm:px-6'}`}
+          className={`mobile-app-shell relative min-w-0 flex-1 px-0 pb-0 pt-0 ${isAiPage ? 'sm:px-0 md:h-screen md:overflow-hidden' : 'sm:px-6'}`}
           style={{
             paddingBottom: 'env(safe-area-inset-bottom, 0px)',
             paddingTop: 'env(safe-area-inset-top, 0px)'
           }}
         >
           <header
-            className={`relative z-30 ml-auto hidden h-20 items-center justify-end overflow-visible px-2 ${
+            className={`sticky top-0 z-30 ml-auto hidden h-[72px] items-center justify-end overflow-visible border-b px-8 backdrop-blur-xl md:flex ${
               theme === 'dark'
-                ? 'text-white'
-                : 'text-slate-900'
+                ? 'border-white/10 bg-slate-950/75 text-white'
+                : 'border-slate-200/80 bg-[#fbfbfd]/90 text-slate-900'
             }`}
           >
             <div className="relative z-10 flex w-full items-center justify-end">
@@ -1570,6 +1604,7 @@ export const DashboardLayout = () => {
                       <div
                         className="fixed inset-0 z-[60] flex items-start justify-end bg-[linear-gradient(180deg,rgba(255,255,255,0.20),rgba(255,255,255,0.58))] px-6 pt-20 backdrop-blur-sm"
                         onClick={() => setDesktopThemeOpen(false)}
+                        style={theme === 'dark' ? { background: 'rgba(2, 6, 23, 0.65)' } : undefined}
                         role="presentation"
                       >
                         <div
@@ -1603,7 +1638,7 @@ export const DashboardLayout = () => {
                                     className={`relative flex h-[52px] w-[52px] items-center justify-center rounded-full transition hover:-translate-y-0.5 hover:scale-105 ${
                                       isSelected ? 'shadow-[0_14px_28px_rgba(15,23,42,0.22)]' : 'shadow-[0_8px_18px_rgba(148,163,184,0.14)]'
                                     }`}
-                                    style={{ backgroundColor: color }}
+                                    style={{ backgroundColor: tintColor(color) }}
                                     aria-label={`เลือกสี ${color}`}
                                   >
                                     {isSelected ? (
@@ -1653,14 +1688,14 @@ export const DashboardLayout = () => {
                           />
                     <div
                       ref={desktopNotificationDialogRef}
-                      className={`fixed right-10 top-20 z-[9999] hidden w-[360px] max-w-[80vw] rounded-2xl border p-3 text-sm shadow-[0_22px_60px_rgba(15,23,42,0.22)] lg:block ${
+                      className={`fixed right-10 top-20 z-[9999] hidden w-[440px] max-w-[80vw] max-h-[calc(100dvh-6rem)] overflow-y-auto rounded-2xl border p-5 text-sm shadow-[0_22px_60px_rgba(15,23,42,0.22)] lg:block ${
                         theme === 'dark'
                           ? 'border-white/10 bg-slate-900/90 text-white'
                           : 'border-slate-100 bg-[color:var(--panel-bg)]'
                       }`}
                     >
-                    <div className="mb-2 flex items-center justify-between">
-                      <div className={`flex items-center gap-2 font-semibold ${theme === 'dark' ? 'text-[color:var(--text)]' : 'text-slate-950'}`}>
+                    <div className="mb-3 flex items-center justify-between gap-3">
+                      <div className={`flex items-center gap-2 text-base font-semibold ${theme === 'dark' ? 'text-[color:var(--text)]' : 'text-slate-950'}`}>
                         <MobileIcon name="notifications" accent={activeAccentTheme.accent} className="h-5 w-5" active />
                         แจ้งเตือนเรียน
                       </div>
@@ -1687,15 +1722,15 @@ export const DashboardLayout = () => {
                     {notifications.length === 0 ? (
                       <p className={`rounded-xl surface-2 px-3 py-3 ${theme === 'dark' ? 'text-muted' : 'text-slate-900'}`}>ยังไม่มีการแจ้งเตือน</p>
                     ) : (
-                      <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
+                      <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
                         {latestNotifications.map(n => (
                           <div
                             key={n.id}
-                            className={`rounded-xl border px-3 py-2 ${n.is_read ? 'border-muted surface' : 'border-muted surface-2'}`}
+                            className={`rounded-xl border px-4 py-3 ${n.is_read ? 'border-muted surface' : 'border-muted surface-2'}`}
                           >
                             <div className="flex items-start justify-between gap-2">
                               <div>
-                                <p className="text-[13px] font-semibold text-[color:var(--text)]">{n.title}</p>
+                                <p className="text-sm font-semibold text-[color:var(--text)]">{n.title}</p>
                                 <p className={`text-[11px] ${theme === 'dark' ? 'text-muted' : 'text-slate-800'}`}>
                                   {n.delivered_at ? 'แจ้งเมื่อ ' : 'กำหนดแจ้ง '}
                                   {formatNotificationTimestamp(n.delivered_at ?? n.notify_at)}
@@ -1718,17 +1753,17 @@ export const DashboardLayout = () => {
                                 </button>
                               </div>
                             </div>
-                            <p className={`mt-1 text-[13px] ${theme === 'dark' ? 'text-muted' : 'text-slate-900'}`}>{n.message}</p>
+                            <p className={`mt-2 text-sm leading-relaxed ${theme === 'dark' ? 'text-muted' : 'text-slate-900'}`}>{n.message}</p>
                             <p className={`mt-1 text-[10px] uppercase tracking-wider ${theme === 'dark' ? 'text-muted' : 'text-slate-800'}`}>ประเภท: {n.type}</p>
                           </div>
                         ))}
                       </div>
                     )}
-                    <div className="mt-3 flex justify-center">
+                    <div className="mt-4 flex justify-center">
                       <Link
                         to="/notifications"
                         onClick={() => setNotifyOpen(false)}
-                        className="rounded-full border border-muted px-4 py-1.5 text-[11px] font-semibold text-accent transition hover:opacity-90"
+                        className="rounded-full border border-muted px-5 py-2 text-xs font-semibold text-accent transition hover:opacity-90"
                       >
                         ดูทั้งหมด
                       </Link>
@@ -1753,7 +1788,7 @@ export const DashboardLayout = () => {
                     to="/profile"
                     aria-label="เปิดหน้าโปรไฟล์"
                     className="flex min-w-0 items-center gap-2.5 rounded-full py-1.5 pl-1.5 pr-3 shadow-sm"
-                    style={{ background: '#ffffff' }}
+                    style={{ background: 'var(--surface)' }}
                   >
                     <div
                       className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full text-sm font-bold text-white"
@@ -1772,14 +1807,15 @@ export const DashboardLayout = () => {
                       )}
                     </div>
                     <div className="min-w-0">
-                      <p className="truncate text-[11px] font-medium" style={{ color: '#475569' }}>
+                      <p className="truncate text-[11px] font-medium" style={{ color: 'var(--muted)' }}>
                         สวัสดี, {user?.name?.split(' ')[0] ?? 'ผู้ใช้'} 👋
                       </p>
-                      <p className="truncate text-sm font-bold" style={{ color: '#0f172a' }}>Smart Room</p>
+                      <p className="truncate text-sm font-bold" style={{ color: 'var(--text)' }}>Smart Room</p>
                     </div>
                   </Link>
 
                   <div className="flex items-center gap-2">
+                    <ThemeModeSwitch theme={theme} onChange={setTheme} size="sm" />
                     <div className="relative" ref={mobileDropdownRef}>
                       <button
                         type="button"
@@ -1995,6 +2031,38 @@ export const DashboardLayout = () => {
                     </div>
 
                     <div className="space-y-4">
+                    <Link
+                      to="/profile"
+                      onClick={() => setMobileMenuOpen(false)}
+                      className={`flex items-center gap-3 rounded-[1.35rem] border p-4 transition ${
+                        theme === 'dark'
+                          ? 'border-white/10 bg-white/[0.04] hover:bg-white/[0.08]'
+                          : 'border-slate-100 bg-white shadow-[0_10px_28px_rgba(15,23,42,0.07)] hover:bg-slate-50'
+                      }`}
+                    >
+                      <span className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-full bg-violet-600 text-sm font-semibold text-white shadow-sm">
+                        {profileImageUrl ? (
+                          <img
+                            src={profileImageUrl}
+                            alt="โปรไฟล์"
+                            className="h-full w-full object-cover"
+                            referrerPolicy="no-referrer"
+                            onError={handleProfileImageError}
+                          />
+                        ) : (
+                          (user?.name?.trim() || user?.email?.trim() || 'U').charAt(0).toUpperCase()
+                        )}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className={`block truncate text-sm font-semibold ${theme === 'dark' ? 'text-white' : 'text-sky-700'}`}>
+                          {user?.name ?? 'ผู้ใช้งาน'}
+                        </span>
+                        <span className={`block truncate text-xs ${theme === 'dark' ? 'text-white/55' : 'text-slate-500'}`}>
+                          {user?.email ?? 'ดูโปรไฟล์'}
+                        </span>
+                      </span>
+                    </Link>
+
                     <div
                       className={`rounded-[1.6rem] border p-5 ${
                         theme === 'dark'
@@ -2041,7 +2109,7 @@ export const DashboardLayout = () => {
                               className={`relative flex h-[52px] w-[52px] items-center justify-center rounded-full transition active:scale-95 ${
                                 isSelected ? 'shadow-[0_14px_26px_rgba(15,23,42,0.2)]' : 'shadow-[0_8px_18px_rgba(148,163,184,0.14)]'
                               }`}
-                              style={{ backgroundColor: color }}
+                              style={{ backgroundColor: tintColor(color) }}
                               aria-label={`เลือกสี ${color}`}
                             >
                               {isSelected ? (
@@ -2126,12 +2194,12 @@ export const DashboardLayout = () => {
               </div>
             </div>
 
-          <main className={`relative z-10 ${isAiPage ? 'mt-0 md:h-screen' : 'mt-0 sm:mt-6'}`}>
+          <main className={`relative z-10 ${isAiPage ? 'mt-0 md:h-[calc(100vh-72px)]' : 'mt-0 sm:mt-6'}`}>
             <div
               className={
                 isAiPage
                   ? 'w-full px-0 pb-[calc(122px+env(safe-area-inset-bottom,0px))] md:h-full md:pb-0'
-                  : 'mx-auto w-full max-w-7xl px-0 pb-[calc(122px+env(safe-area-inset-bottom,0px))] sm:px-6'
+                  : 'w-full px-0 pb-[calc(122px+env(safe-area-inset-bottom,0px))] sm:px-6'
               }
             >
               <div className={isAiPage ? 'md:h-full' : undefined}>
@@ -2150,8 +2218,8 @@ export const DashboardLayout = () => {
       </div>
 
       {logoPreviewOpen && (
-        <div
-          className="fixed inset-0 z-[80] flex items-center justify-center bg-black/70 px-6 py-10 backdrop-blur-sm"
+        <ModalOverlay
+          className="fixed inset-0 flex items-center justify-center bg-black/70 px-6 py-10 backdrop-blur-sm"
           onClick={() => setLogoPreviewOpen(false)}
           role="dialog"
           aria-modal="true"
@@ -2162,12 +2230,12 @@ export const DashboardLayout = () => {
           >
             <img
               src={logoUrl}
-              alt="Smart Room"
+              alt="โลโก้Smart Room"
               className="mx-auto h-auto max-h-[78vh] w-full rounded-2xl object-contain"
               onError={handleLogoImageError}
             />
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {webToasts.length > 0 && (

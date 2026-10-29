@@ -1,9 +1,11 @@
+import { ModalOverlay } from '../../components/ModalOverlay';
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 import { api } from '../../services/api';
 import { getLastQuizResultKey } from '../../constants/storage';
 import { useAuth } from '../../context/AuthContext';
+import { displayQuizAnswer } from '../../utils/quizAnswers';
 
 interface QuizQuestion {
   id: number;
@@ -16,6 +18,10 @@ interface Quiz {
   id: number;
   title: string;
   description?: string | null;
+  metadata?: {
+    file_name?: string;
+    [key: string]: unknown;
+  } | null;
   questions: QuizQuestion[];
 }
 
@@ -47,9 +53,41 @@ interface AttemptApiResponse {
   answers?: AttemptAnswer[] | { data?: AttemptAnswer[] } | null;
 }
 
+const WINDOWS_1252_REVERSE: Record<string, number> = {
+  '€': 0x80, '‚': 0x82, 'ƒ': 0x83, '„': 0x84, '…': 0x85, '†': 0x86, '‡': 0x87,
+  'ˆ': 0x88, '‰': 0x89, 'Š': 0x8a, '‹': 0x8b, 'Œ': 0x8c, 'Ž': 0x8e,
+  '‘': 0x91, '’': 0x92, '“': 0x93, '”': 0x94, '•': 0x95, '–': 0x96, '—': 0x97,
+  '˜': 0x98, '™': 0x99, 'š': 0x9a, '›': 0x9b, 'œ': 0x9c, 'ž': 0x9e, 'Ÿ': 0x9f,
+};
+
+const repairUtf8Mojibake = (value?: string | null) => {
+  if (typeof value !== 'string' || value === '') return value ?? '';
+
+  // อาการที่พบบ่อยเมื่อ UTF-8 ภาษาไทยถูก decode เป็น Windows-1252/Latin-1
+  // เช่น "ข้อความ" กลายเป็น "à¸‚à¹‰à¸­à¸„à¸§à¸²à¸¡"
+  if (!/[ÃÂà¸à¹]/.test(value)) return value;
+
+  try {
+    const bytes = Uint8Array.from(Array.from(value, char => {
+      const codePoint = char.codePointAt(0) ?? 0;
+      if (codePoint <= 0xff) return codePoint;
+      const windows1252Byte = WINDOWS_1252_REVERSE[char];
+      if (windows1252Byte !== undefined) return windows1252Byte;
+      throw new Error('Character cannot be mapped back to a single byte');
+    }));
+
+    const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    const beforeMarkers = (value.match(/[ÃÂà¸à¹]/g) ?? []).length;
+    const afterMarkers = (decoded.match(/[ÃÂà¸à¹]/g) ?? []).length;
+    return afterMarkers < beforeMarkers ? decoded : value;
+  } catch {
+    return value;
+  }
+};
+
 const stripTrailingEllipsis = (value?: string | null) => {
   if (typeof value !== 'string') return '';
-  return value.replace(/\s*\.\.\.\s*$/, '').trimEnd();
+  return repairUtf8Mojibake(value).replace(/\s*\.\.\.\s*$/, '').trimEnd();
 };
 
 const getVisibleOptions = (options?: string[]) => {
@@ -73,6 +111,11 @@ const normalizeQuizDescription = (value?: string | null) => {
   }
 
   return text;
+};
+
+const quizSourceFileName = (quiz?: Quiz | null) => {
+  const fileName = quiz?.metadata?.file_name;
+  return typeof fileName === 'string' && fileName.trim() !== '' ? fileName.trim() : null;
 };
 
 const normalizeAttemptResult = (payload: AttemptApiResponse | null | undefined): AttemptResult => {
@@ -150,16 +193,24 @@ export const QuizAttemptPage = ({
   const {
     register,
     handleSubmit,
+    reset,
     formState: { isSubmitting }
   } = useForm<Record<string, string>>({});
 
+  const onInvalidSubmit = () => {
+    setSubmitError('กรุณาตอบคำถามที่จำเป็นให้ครบทุกข้อก่อนส่งคำตอบ');
+  };
+
   useEffect(() => {
     if (!quizId) return;
+    let active = true;
+    reset({}); setQuiz(null); setResult(null); setShowModal(false); setSubmitError(null);
     api.get(`/quizzes/${quizId}`).then(res => {
       const payload = res.data?.data ?? res.data;
-      setQuiz(normalizeQuizPayload(payload));
-    });
-  }, [quizId]);
+      if (active) setQuiz(normalizeQuizPayload(payload));
+    }).catch(error => { if (active) setSubmitError(extractErrorMessage(error, 'โหลดแบบฝึกหัดไม่สำเร็จ')); });
+    return () => { active = false; };
+  }, [quizId, reset]);
 
   const onSubmit = async (values: Record<string, string>) => {
     if (!quizId || !quiz) return;
@@ -167,9 +218,23 @@ export const QuizAttemptPage = ({
       setSubmitError('แบบฝึกหัดนี้ยังไม่มีคำถาม กรุณากลับไปสร้างแบบฝึกหัดใหม่อีกครั้ง');
       return;
     }
+
+    const unansweredRequired = (quiz.questions ?? []).filter(question => {
+      if (question.question_type === 'short_answer') return false;
+      const value = values[`question-${question.id}`];
+      return typeof value !== 'string' || value.trim() === '';
+    });
+
+    if (unansweredRequired.length > 0) {
+      setSubmitError(
+        `กรุณาตอบคำถามให้ครบทุกข้อก่อนส่งคำตอบ (ยังไม่ได้ตอบ ${unansweredRequired.length} ข้อ)`
+      );
+      return;
+    }
+
     const payload: AnswerPayload[] = (quiz.questions ?? []).map(question => ({
       question_id: question.id,
-      selected_answer: values[`question-${question.id}`]
+      selected_answer: values[`question-${question.id}`] ?? ''
     }));
     setSubmitError(null);
 
@@ -185,15 +250,6 @@ export const QuizAttemptPage = ({
     }
   };
 
-  const closeResultModal = () => {
-    setShowModal(false);
-    if (embedded) {
-      onClose?.();
-      return;
-    }
-    navigate('/quizzes');
-  };
-
   const closeAttempt = () => {
     if (embedded) {
       onClose?.();
@@ -203,7 +259,7 @@ export const QuizAttemptPage = ({
   };
 
   if (!quiz) {
-    return <p className="text-muted">กำลังโหลดแบบฝึกหัด...</p>;
+    return <p role={submitError ? 'alert' : 'status'} className="text-muted">{submitError || 'กำลังโหลดแบบฝึกหัด...'}</p>;
   }
 
   const hasMultipleChoiceWithoutOptions = (quiz.questions ?? []).some(question => (
@@ -211,7 +267,7 @@ export const QuizAttemptPage = ({
   ));
 
   return (
-    <div className={`mx-auto w-full max-w-7xl space-y-6 ${embedded ? 'pb-2' : 'pb-[calc(124px+env(safe-area-inset-bottom,0px))] lg:pb-8'}`}>
+    <div className={`w-full space-y-6 ${embedded ? 'pb-2' : 'pb-[calc(124px+env(safe-area-inset-bottom,0px))] lg:pb-8'}`}>
       <div className="flex items-center justify-between">
         <button
           type="button"
@@ -223,9 +279,12 @@ export const QuizAttemptPage = ({
       </div>
       <div className="w-full rounded-[32px] border border-muted surface p-5 shadow-glow sm:p-6 lg:p-8">
         <header>
-          <h2 className="text-2xl font-semibold text-[color:var(--text)] sm:text-3xl">{quiz.title}</h2>
+          <h2 className="text-2xl font-semibold text-[color:var(--text)] sm:text-3xl">{repairUtf8Mojibake(quiz.title)}</h2>
           {normalizeQuizDescription(quiz.description) ? (
-            <p className="text-sm text-muted">{normalizeQuizDescription(quiz.description)}</p>
+            <p className="text-sm text-muted">{repairUtf8Mojibake(normalizeQuizDescription(quiz.description))}</p>
+          ) : null}
+          {quizSourceFileName(quiz) ? (
+            <p className="mt-2 break-all text-xs text-muted">ไฟล์ต้นทาง: {repairUtf8Mojibake(quizSourceFileName(quiz))}</p>
           ) : null}
         </header>
         {(quiz.questions ?? []).length === 0 ? (
@@ -238,9 +297,12 @@ export const QuizAttemptPage = ({
             {submitError}
           </div>
         ) : null}
-        <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+        <form onSubmit={handleSubmit(onSubmit, onInvalidSubmit)} className="space-y-6">
           {(quiz.questions ?? []).map((question, index) => {
-            const visibleOptions = getVisibleOptions(question.options);
+            const rawOptions = question.options ?? [];
+            const visibleOptions = rawOptions
+              .map(option => ({ raw: option, display: stripTrailingEllipsis(option) }))
+              .filter(option => option.display !== '');
             const shouldUseTextAnswer = question.question_type === 'short_answer';
 
             return (
@@ -251,16 +313,19 @@ export const QuizAttemptPage = ({
                 </p>
                 {question.question_type === 'multiple_choice' && visibleOptions.length > 0 && (
                   <div className="mt-4 space-y-3 text-sm text-muted">
-                    {visibleOptions.map(option => (
-                      <label key={option} className="flex w-full items-start gap-3 rounded-2xl border border-transparent px-1 py-1 transition hover:border-primary/20 hover:bg-primary/5">
+                    {visibleOptions.map((option, optionIndex) => (
+                      <label key={option.raw} className="flex w-full cursor-pointer items-start gap-3 rounded-2xl border border-muted px-3 py-3 transition hover:border-primary/30 hover:bg-primary/5 has-[:checked]:border-primary has-[:checked]:bg-primary/10">
                         <input
                           type="radio"
-                          value={option}
+                          value={option.raw}
                           className="mt-1 shrink-0"
                           {...register(`question-${question.id}`, { required: true })}
                         />
+                        <span className="shrink-0 font-semibold text-primary">
+                          {String.fromCharCode(97 + optionIndex)}.
+                        </span>
                         <span className="min-w-0 whitespace-pre-wrap break-words text-[color:var(--text)]">
-                          {option}
+                          {option.display}
                         </span>
                       </label>
                     ))}
@@ -303,7 +368,7 @@ export const QuizAttemptPage = ({
       </div>
 
       {result && showModal && (
-        <div className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-900/40 px-4 pb-[calc(8.75rem+env(safe-area-inset-bottom,0px))] pt-10 backdrop-blur sm:items-center sm:pb-8">
+        <ModalOverlay className="fixed inset-0 flex items-end justify-center bg-slate-900/40 px-4 pb-[calc(8.75rem+env(safe-area-inset-bottom,0px))] pt-10 backdrop-blur sm:items-center sm:pb-8">
           <div className="w-full max-w-4xl rounded-3xl border border-muted surface p-5 shadow-glow sm:p-6">
             <div className="flex items-start justify-between">
               <div>
@@ -313,9 +378,6 @@ export const QuizAttemptPage = ({
                   {result.total > 0 ? `(${Math.round((result.score / result.total) * 100)}%)` : ''}
                 </p>
               </div>
-              <button onClick={closeResultModal} className="rounded-full bg-primary/10 px-3 py-1 text-sm text-primary hover:bg-primary/20">
-                ปิด
-              </button>
             </div>
 
             <div className="mt-5 max-h-[46vh] space-y-3 overflow-y-auto pr-2 text-sm text-muted sm:max-h-[60vh]">
@@ -335,10 +397,8 @@ export const QuizAttemptPage = ({
                     {answer.is_correct ? 'คำตอบถูกต้อง' : 'คำตอบไม่ถูกต้อง'}
                   </p>
                   <div className="rounded-xl surface-2 px-3 py-2 text-sm text-muted">
-                    <p className="font-medium">คำตอบของคุณ: {stripTrailingEllipsis(answer.selected_answer) || '-'}</p>
-                    {!answer.is_correct && (
-                      <p className="mt-1 text-emerald-600">คำตอบที่ถูกต้อง: {stripTrailingEllipsis(answer.correct_answer) || '-'}</p>
-                    )}
+                    <p className="font-medium">คำตอบของคุณ: {displayQuizAnswer(stripTrailingEllipsis(answer.selected_answer), answer.question_type)}</p>
+                    <p className="mt-1 text-emerald-600">คำตอบที่ถูกต้อง: {displayQuizAnswer(stripTrailingEllipsis(answer.correct_answer), answer.question_type)}</p>
                   </div>
                   {answer.explanation && (
                     <p className="rounded-xl surface-2 px-3 py-2 text-xs text-muted">
@@ -350,29 +410,7 @@ export const QuizAttemptPage = ({
             </div>
 
             <div className="mt-5 flex flex-col gap-2 sm:flex-row sm:justify-end">
-              <button
-                type="button"
-                onClick={() => {
-                  if (result && quiz) {
-                    localStorage.setItem(
-                      lastResultKey,
-                      JSON.stringify({
-                        quizId: quiz.id,
-                        title: quiz.title,
-                        score: result.score,
-                        total: result.total,
-                        percentage: result.total > 0 ? Math.round((result.score / result.total) * 100) : 0,
-                        answered_at: new Date().toISOString()
-                      })
-                    );
-                  }
-                  setShowModal(false);
-                  navigate('/career-advisor');
-                }}
-                className="w-full rounded-full border border-primary/30 px-5 py-3 text-sm font-semibold text-primary transition hover:bg-primary/10 sm:w-auto"
-              >
-                วิเคราะห์อาชีพจากคะแนนนี้
-              </button>
+
               <button
                 onClick={() => {
                   if (result && quiz) {
@@ -401,7 +439,7 @@ export const QuizAttemptPage = ({
               </button>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
     </div>
   );

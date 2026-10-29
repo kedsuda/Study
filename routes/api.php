@@ -8,6 +8,7 @@ use App\Http\Controllers\API\DashboardController;
 use App\Http\Controllers\API\FileController;
 use App\Http\Controllers\API\GmailController;
 use App\Http\Controllers\API\GoalController;
+use App\Http\Controllers\API\GoalTaskController;
 use App\Http\Controllers\API\LearningStatsController;
 use App\Http\Controllers\API\QuizController;
 use App\Http\Controllers\API\SemesterController;
@@ -81,6 +82,8 @@ Route::post('/subjects/delete', [SubjectController::class, 'destroyById']);
     Route::get('/summary-archives/count', [SubjectArchiveController::class, 'count']);
 
     Route::post('/study-logs/{studyLog}/files', [FileController::class, 'store']);
+    Route::get('/subjects/{subject}/files', [FileController::class, 'index']);
+    Route::get('/files/{file}/download', [FileController::class, 'download']);
     Route::match(['put', 'patch'], '/files/{file}/status', [FileController::class, 'updateStatus']);
     Route::delete('/files/{file}', [FileController::class, 'destroy']);
 
@@ -110,8 +113,14 @@ Route::post('/subjects/delete', [SubjectController::class, 'destroyById']);
     Route::get('/quizzes/{quiz}', [QuizController::class, 'show']);
     Route::delete('/quizzes/{quiz}', [QuizController::class, 'destroy']);
     Route::post('/quizzes/{quiz}/attempts', [QuizController::class, 'submitAttempt']);
+    Route::get('/quizzes/{quiz}/attempts', [QuizController::class, 'attempts']);
 
     Route::get('/goals/summary', [GoalController::class, 'summary']);
+    Route::get('/goals/tasks', [GoalTaskController::class, 'index']);
+    Route::post('/goals/tasks', [GoalTaskController::class, 'store']);
+    Route::post('/goals/tasks/{task}', [GoalTaskController::class, 'update'])->whereNumber('task');
+    Route::post('/goals/tasks/{task}/complete', [GoalTaskController::class, 'complete'])->whereNumber('task');
+    Route::post('/goals/tasks/{task}/delete', [GoalTaskController::class, 'destroy'])->whereNumber('task');
     Route::post('/goals/targets', [GoalController::class, 'upsertTarget']);
     Route::post('/goals/targets/reset', [GoalController::class, 'resetTarget']);
     Route::get('/learning-stats/summary', [LearningStatsController::class, 'summary']);

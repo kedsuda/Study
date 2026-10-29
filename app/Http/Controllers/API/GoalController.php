@@ -706,11 +706,13 @@ class GoalController extends Controller
                 ->keyBy('subject_id');
         }
 
+        $activities = $this->subjectActivities($user, $start, $end, $context);
+
         return $studyRows
             ->keys()
             ->merge($quizRows->keys())
             ->unique()
-            ->map(function ($subjectId) use ($studyRows, $quizRows) {
+            ->map(function ($subjectId) use ($studyRows, $quizRows, $activities) {
                 $study = $studyRows->get($subjectId);
                 $quiz = $quizRows->get($subjectId);
 
@@ -722,11 +724,50 @@ class GoalController extends Controller
                     'study_minutes' => (int) ($study->study_minutes ?? 0),
                     'quiz_sets' => (int) ($quiz->quiz_sets ?? 0),
                     'question_count' => (int) ($quiz->question_count ?? 0),
+                    'activities' => $activities->get($subjectId, collect())->values()->all(),
                 ];
             })
             ->sortByDesc(fn ($item) => $item['activity_count'])
             ->values()
             ->all();
+    }
+
+    private function subjectActivities(User $user, Carbon $start, Carbon $end, array $context)
+    {
+        $activities = collect();
+        if (Schema::hasTable('study_logs')) {
+            $query = DB::table('study_logs')
+                ->join('subjects', 'study_logs.subject_id', '=', 'subjects.id')
+                ->where('subjects.user_id', $user->id)
+                ->whereBetween('study_logs.log_date', [$start->toDateTimeString(), $end->toDateTimeString()]);
+            $this->applySubjectContext($query, $context);
+
+            $activities = $query->select('study_logs.*')->get()->map(fn ($log) => [
+                'id' => 'study-'.$log->id,
+                'subject_id' => (int) $log->subject_id,
+                'type' => $log->log_type ?? 'study',
+                'title' => $log->title ?: 'บันทึกการเรียน',
+                'date' => $log->log_date,
+                'duration_minutes' => $log->duration_minutes === null ? null : (int) $log->duration_minutes,
+            ]);
+        }
+
+        if (Schema::hasTable('quiz_attempts') && Schema::hasTable('quizzes')) {
+            $quizzes = $this->baseQuizQuery($user, $start, $end, $context)
+                ->select('quiz_attempts.id', 'quiz_attempts.created_at', 'quiz_attempts.score', 'quiz_attempts.passed', 'quizzes.subject_id', 'quizzes.title')
+                ->get()->map(fn ($attempt) => [
+                    'id' => 'quiz-'.$attempt->id,
+                    'subject_id' => (int) $attempt->subject_id,
+                    'type' => 'quiz',
+                    'title' => $attempt->title ?: 'แบบทดสอบ',
+                    'date' => $attempt->created_at,
+                    'score' => (int) $attempt->score,
+                    'passed' => (bool) $attempt->passed,
+                ]);
+            $activities = $activities->concat($quizzes);
+        }
+
+        return $activities->sortByDesc('date')->groupBy('subject_id');
     }
 
     private function baseQuizQuery(User $user, Carbon $start, Carbon $end, array $context)

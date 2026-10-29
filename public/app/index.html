@@ -2,13 +2,24 @@
 <html lang="th">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" href="/img/admin.png" />
+    <link rel="icon" type="image/png" href="/651998018/smartgood/public/app/img/admin.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Smart Learning Tracker</title>
-    <script type="module" crossorigin src="/assets/index-GV1kOOve.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-5jYJngay.css">
+    <script>
+      // Apply the saved theme before the first paint.
+      (() => {
+        let theme;
+        try { theme = localStorage.getItem('smart-classroom-theme'); } catch {}
+        if (theme !== 'dark' && theme !== 'light') {
+          theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.classList.add('theme-' + theme);
+      })();
+    </script>
+    <script type="module" crossorigin src="/651998018/smartgood/public/app/assets/index-BopVyfZk.js"></script>
+    <link rel="stylesheet" crossorigin href="/651998018/smartgood/public/app/assets/index-Dlg9_mDa.css">
   </head>
-  <body class="bg-slate-950 text-slate-100">
-    <div id="root"></div>
+  <body>
+    <div id="root"></div>
   </body>
 </html>

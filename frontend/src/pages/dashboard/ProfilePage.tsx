@@ -159,7 +159,7 @@ export const ProfilePage = () => {
   const initial = (user.name || user.email || 'U').trim().charAt(0).toUpperCase();
 
   return (
-    <div className="mx-auto w-full max-w-[760px] space-y-5 pb-10 text-[color:var(--text)]">
+    <div className="w-full space-y-5 pb-10 text-[color:var(--text)]">
       <section className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-5 shadow-[0_16px_36px_rgba(0,0,0,0.14)] sm:p-6">
         <div className="flex items-center gap-4">
           <div

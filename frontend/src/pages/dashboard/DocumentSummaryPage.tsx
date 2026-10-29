@@ -1,3 +1,6 @@
+import { ModalOverlay } from '../../components/ModalOverlay';
+import { ExpandableText } from '../../components/ExpandableText';
+import { useSharedSemesterSelection, useAcademicSearchParams } from '../../hooks/useAcademicSelection';
 // DocumentSummaryPage.tsx
 import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
@@ -13,7 +16,8 @@ import { useSemesterOptions } from '../../hooks/useSemesterOptions';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { VoiceSummaryPage } from './VoiceSummaryPage';
 import { subscribeSubjectsUpdated } from '../../utils/subjectSync';
-import { resolveStudyFileUrl, uploadStudyFileToSupabase } from '../../utils/studyFiles';
+import { resolveStudyFileUrl } from '../../utils/localStudyFiles';
+import { SubjectDocumentPicker } from '../../components/SubjectDocumentPicker';
 
 type DocumentSummaryResult = {
   summary?: string;
@@ -46,6 +50,7 @@ type SavedSummary = {
 
 type ArchivedSummary = {
   id: number;
+  source_type?: SummarySource;
   original_subject_id?: number;
   subject_name?: string;
   period?: SummaryCategory | null;
@@ -329,9 +334,10 @@ const extractPdfInBrowser = async (file: File) => {
       .filter(Boolean)
       .join(' ');
 
-    if (pageText) {
-      pages.push(pageText);
-    } else if (ocrImages.length < 12) {
+    const brokenGlyphs = (pageText.match(/[\u25a0\u25a1\ufffd]/g) ?? []).length;
+    if (pageText && brokenGlyphs < Math.max(3, pageText.length * 0.05)) {
+      pages.push(`หน้า ${pageNumber}: ${pageText}`);
+    } else {
       const unscaledViewport = page.getViewport({ scale: 1 });
       const scale = Math.min(2, 1600 / Math.max(1, unscaledViewport.width));
       const viewport = page.getViewport({ scale });
@@ -387,14 +393,31 @@ const formatSummaryDate = (value?: string) => {
   if (!value) return '';
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
-  return parsed.toLocaleDateString('th-TH');
+  return new Intl.DateTimeFormat('th-TH', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  }).format(parsed);
 };
 
 const normalizeAudioSummarySource = (value: unknown): Extract<SummarySource, 'audio-file' | 'live-audio'> =>
   String(value ?? '').trim().toLowerCase() === 'record' ? 'live-audio' : 'audio-file';
 
+const summarySourceLabels: Record<SummarySource, string> = {
+  'document-file': 'สรุปจากไฟล์',
+  'audio-file': 'ไฟล์เสียง',
+  'live-audio': 'สรุปจากเสียงสด',
+};
+
+const normalizeSummarySource = (value: unknown): SummarySource | undefined =>
+  value === 'document-file' || value === 'audio-file' || value === 'live-audio' ? value : undefined;
+
 const extractErrorMessage = (error: any, fallback: string) => {
   const message = error?.response?.data?.message;
+  const rawMessage = typeof message === 'string' ? message : error?.message;
+  if (typeof rawMessage === 'string' && /SQLSTATE\[|\bSQL:\s|\bUnknown column\b/i.test(rawMessage)) {
+    return fallback;
+  }
   if (typeof message === 'string' && message.trim() !== '') {
     return message;
   }
@@ -424,7 +447,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   
   // UI State
   const [inputMode, setInputMode] = useState<'document' | 'audio'>('document');
-  const [activeHistoryTab, setActiveHistoryTab] = useState<'saved' | 'original' | 'archived'>('saved');
+  const [activeHistoryTab, setActiveHistoryTab] = useState<'saved' | 'original' | 'archived'>('archived');
 
   const subjectFetchClients = useMemo(() => {
     const isDev = import.meta.env.DEV;
@@ -472,8 +495,20 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   const [isDragging, setIsDragging] = useState(false);
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
   const [subjects, setSubjects] = useState<SubjectOption[]>([]);
-  const [selectedSemesterKey, setSelectedSemesterKey] = useState<string>('all');
-  const [selectedSubjectId, setSelectedSubjectId] = useState('');
+  const semesterFilterOptions = useSemesterOptions();
+  const [selectedSemesterKey, setSelectedSemesterKey] = useSharedSemesterSelection(semesterFilterOptions);
+  const [archiveParams, setArchiveParams] = useAcademicSearchParams();
+  const selectedSubjectId = archiveParams.get('subject') ?? '';
+  const setSelectedSubjectId = (value: string) => {
+    setArchiveParams(previous => {
+      const next = new URLSearchParams(previous);
+      if (value) next.set('subject', value);
+      else next.delete('subject');
+      return next;
+    });
+  };
+  const archiveYear = archiveParams.get('academic_year') ?? '';
+  const archiveSemester = archiveParams.get('semester') ?? '';
   const [selectedMood, setSelectedMood] = useState('');
   const [isMoodDropdownOpen, setIsMoodDropdownOpen] = useState(false);
   const [dbStatus, setDbStatus] = useState<string | null>(null);
@@ -481,6 +516,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   const [dbFileUrl, setDbFileUrl] = useState<string | null>(null);
   const [dbFileName, setDbFileName] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const savedUploadRef = useRef<{ file: File; subjectId: string } | null>(null);
   const [, setDbLogTitle] = useState<string | null>(null);
   const [, setDbLogId] = useState<number | null>(null);
   const [dbSubjectId, setDbSubjectId] = useState<number | null>(null);
@@ -491,6 +527,9 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   const [savedSummaries, setSavedSummaries] = useState<SavedSummary[]>([]);
   const [summaryPeriod, setSummaryPeriod] = useState<SummaryPeriod>('all');
   const [savedSummaryPage, setSavedSummaryPage] = useState(1);
+  useEffect(() => {
+    if (isArchivePage) setSavedSummaryPage(1);
+  }, [isArchivePage, archiveYear, archiveSemester, selectedSubjectId]);
   const [saveSummaryPeriod, setSaveSummaryPeriod] = useState<SummaryCategory>('daily');
   const [isSavingSummary, setIsSavingSummary] = useState(false);
   const [isResultSectionCollapsed, setIsResultSectionCollapsed] = useState(false);
@@ -509,11 +548,16 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     () => subjects.find(item => String(item.id) === selectedSubjectId) ?? null,
     [subjects, selectedSubjectId]
   );
-  const semesterFilterOptions = useSemesterOptions();
+
   const semesterFilteredSubjects = useMemo(() => {
+    if (isArchivePage) return subjects.filter(subject =>
+      (!archiveYear || subject.academic_year === Number(archiveYear)) &&
+      (!archiveSemester || subject.semester === Number(archiveSemester))
+    );
     if (selectedSemesterKey === 'all') return subjects;
+    if (selectedSemesterKey.startsWith('year:')) return subjects.filter(subject => String(subject.academic_year) === selectedSemesterKey.slice(5));
     return subjects.filter(subject => buildSemesterFilterKey(subject) === selectedSemesterKey);
-  }, [subjects, selectedSemesterKey]);
+  }, [subjects, selectedSemesterKey, isArchivePage, archiveYear, archiveSemester]);
   const selectedSubjectName = useMemo(
     () => selectedSubject?.name ?? null,
     [selectedSubject]
@@ -521,6 +565,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   const archiveDisplaySummaries = archivedSummaries;
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const historySectionRef = useRef<HTMLElement | null>(null);
   const moodDropdownRef = useRef<HTMLDivElement | null>(null);
   const saveSummaryPeriodRef = useRef<SummaryCategory>('daily');
   const selectedMoodOption = useMemo(
@@ -575,24 +620,9 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     setSubjects(list);
 
     if (isArchivePage) {
-      setSelectedSubjectId('');
       return;
     }
 
-    const storedId = localStorage.getItem(lastSubjectKey);
-    if (storedId && list.some(subject => String(subject.id) === storedId)) {
-      setSelectedSubjectId(storedId);
-      return;
-    }
-
-    if (list[0]?.id) {
-      const fallbackId = String(list[0].id);
-      setSelectedSubjectId(fallbackId);
-      localStorage.setItem(lastSubjectKey, fallbackId);
-    } else {
-      setSelectedSubjectId('');
-      localStorage.removeItem(lastSubjectKey);
-    }
   };
 
   useEffect(() => {
@@ -633,21 +663,9 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     };
   }, [lastSubjectKey, isArchivePage, subjectFetchClients]);
 
-  useEffect(() => {
-    if (semesterFilterOptions.length === 0) return;
-    const exists = semesterFilterOptions.some(option => option.key === selectedSemesterKey);
-    if (!exists) {
-      setSelectedSemesterKey(semesterFilterOptions[0].key);
-    }
-  }, [selectedSemesterKey, semesterFilterOptions]);
 
   useEffect(() => {
-    if (isArchivePage) {
-      if (selectedSubjectId && !semesterFilteredSubjects.some(item => String(item.id) === selectedSubjectId)) {
-        setSelectedSubjectId('');
-      }
-      return;
-    }
+    if (isArchivePage || subjects.length === 0) return;
 
     if (selectedSubjectId && semesterFilteredSubjects.some(item => String(item.id) === selectedSubjectId)) {
       return;
@@ -690,11 +708,20 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
               const sourceFile = fileId
                 ? files.find((file: any) => normalizeSummaryId(file?.id) === fileId)
                 : null;
+              const fileName =
+                typeof sourceFile?.original_name === 'string' && sourceFile.original_name.trim() !== ''
+                  ? sourceFile.original_name.trim()
+                  : typeof summaryItem?.metadata?.file_name === 'string' && summaryItem.metadata.file_name.trim() !== ''
+                    ? summaryItem.metadata.file_name.trim()
+                    : title;
               const period = normalizeSummaryPeriod(summaryItem?.metadata?.period, title);
               items.push({
                 id: normalizedId,
                 content,
-                title,
+                // The study-log title is only a label (for example
+                // "สรุปเอกสาร: ..."). Display the actual source filename
+                // whenever this summary came from an uploaded document.
+                title: fileName,
                 created_at: summaryItem?.created_at ?? log.created_at,
                 period,
                 subject_name: subject?.name,
@@ -782,6 +809,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
               normalizeSummaryId(item?.original_subject_id) ?? fallbackSubjectId ?? undefined,
             subject_name: fallbackSubjectName,
             period: normalizeSummaryPeriod(item?.metadata?.period ?? item?.period, item?.name),
+            source_type: normalizeSummarySource(item?.source_type),
             name: typeof item?.name === 'string' ? item.name : '',
             description: typeof item?.description === 'string' ? item.description : '',
             color: typeof item?.color === 'string' ? item.color : null,
@@ -843,12 +871,13 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     return `${selectedFile.name} · ${formatFileSize(selectedFile.size)}`;
   }, [selectedFile]);
 
+  const activeSummaryText = summary || savedSummary?.content || '';
   const summarySaveSignature = useMemo(() => {
-    const summaryText = summary?.trim();
-    const subjectKey = dbSubjectId || Number(selectedSubjectId) || 'none';
+    const summaryText = activeSummaryText.trim();
+    const subjectKey = Number(selectedSubjectId) || subjects[0]?.id || 'none';
     if (!summaryText) return null;
     return `${subjectKey}::${summaryText}`;
-  }, [summary, dbSubjectId, selectedSubjectId]);
+  }, [activeSummaryText, selectedSubjectId, subjects]);
 
   const isSummarySaved = Boolean(summarySaveSignature && summarySaveSignature === savedSummarySignature);
   const canSaveSummary = Boolean(summarySaveSignature) && !isSummarySaved && !isSavingSummary;
@@ -877,6 +906,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       archiveDisplaySummaries.map(item => ({
         id: item.id,
         content: item.description,
+        source_type: item.source_type,
         title: item.name,
         created_at: item.archived_at,
         period: item.period ?? normalizeSummaryPeriod(undefined, item.name),
@@ -920,13 +950,15 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   const filteredSummaries = useMemo(() => {
     const subjectFiltered =
       isArchivePage && selectedSubjectId
-        ? summarySource.filter(item => item.original_subject_id === Number(selectedSubjectId))
-        : summarySource;
+        ? summarySource.filter(item => item.original_subject_id === Number(selectedSubjectId) && semesterFilteredSubjects.some(subject => subject.id === item.original_subject_id))
+        : isArchivePage && (archiveYear || archiveSemester)
+          ? summarySource.filter(item => semesterFilteredSubjects.some(subject => subject.id === item.original_subject_id))
+          : summarySource;
     const periodFiltered = summaryPeriod === 'all'
       ? subjectFiltered
       : subjectFiltered.filter(item => item.period === summaryPeriod);
     return periodFiltered;
-  }, [summarySource, summaryPeriod, isArchivePage, selectedSubjectId]);
+  }, [summarySource, summaryPeriod, isArchivePage, selectedSubjectId, archiveYear, archiveSemester, semesterFilteredSubjects]);
   
   const savedSummaryPageSize = 10;
   const totalSavedSummaryPages = Math.max(1, Math.ceil(filteredSummaries.length / savedSummaryPageSize));
@@ -939,25 +971,25 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     const semesterSubjectIds = new Set(semesterFilteredSubjects.map(subject => subject.id));
     const subjectFiltered =
       selectedSubjectId
-        ? archivedItems.filter(item => item.original_subject_id === Number(selectedSubjectId))
-        : isArchivePage && selectedSemesterKey !== 'all'
+        ? archivedItems.filter(item => item.original_subject_id === Number(selectedSubjectId) && semesterSubjectIds.has(item.original_subject_id))
+        : isArchivePage && (archiveYear || archiveSemester)
           ? archivedItems.filter(item => item.original_subject_id != null && semesterSubjectIds.has(item.original_subject_id as number))
           : archivedItems;
     if (summaryPeriod === 'all') return subjectFiltered;
     return subjectFiltered.filter(item => item.period === summaryPeriod);
-  }, [archivedItems, isArchivePage, selectedSemesterKey, selectedSubjectId, semesterFilteredSubjects, summaryPeriod]);
+  }, [archivedItems, isArchivePage, archiveYear, archiveSemester, selectedSubjectId, semesterFilteredSubjects, summaryPeriod]);
   
-  const activeSummaryText = summary || savedSummary?.content || '';
   const activeSummarySource =
     currentSummarySource ??
     savedSummary?.source_type ??
     (inputMode === 'audio' ? 'audio-file' : 'document-file');
   const activeSummarySourceLabel =
-    activeSummarySource === 'document-file' ? 'สรุปจากไฟล์' : 'ผลการสรุปจากเสียง';
-  // A document result must clearly state that its source is an uploaded file,
-  // even when a previously saved summary is still selected in the history.
+    summarySourceLabels[activeSummarySource];
   const activeSummaryTitle =
-    activeSummarySource === 'document-file' ? activeSummarySourceLabel : savedSummary?.title ?? activeSummarySourceLabel;
+    savedSummary?.title ??
+    (activeSummarySource === 'document-file'
+      ? dbFileName ?? selectedFile?.name ?? activeSummarySourceLabel
+      : activeSummarySourceLabel);
   const hasResultContent = activeSummaryText.trim() !== '';
   const savedCountLabel = savedSummaries.length > 99 ? '99+' : String(savedSummaries.length);
   const archiveCountLabel = filteredArchivedSummaries.length > 99 ? '99+' : String(filteredArchivedSummaries.length);
@@ -1023,12 +1055,14 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
         const res = await api.post(`/subjects/${fallbackSubjectId}/summary-archives`, {
           name: target.title ?? 'สรุปเอกสาร',
           description: target.content,
+          source_type: target.source_type,
         });
         const payload = res.data?.data ?? res.data;
         const archiveId = normalizeSummaryId(payload?.id);
         if (archiveId) {
           const nextArchive: ArchivedSummary = {
             id: archiveId,
+            source_type: normalizeSummarySource(payload?.source_type) ?? target.source_type,
             original_subject_id: normalizeSummaryId(payload?.original_subject_id) ?? undefined,
             name: typeof payload?.name === 'string' ? payload.name : target.title ?? 'สรุปเอกสาร',
             description: typeof payload?.description === 'string' ? payload.description : target.content,
@@ -1177,17 +1211,17 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   };
 
   const safeDownloadName = (value?: string | null) => {
-    const cleaned = (value || 'สรุปที่เก็บถาวร')
+    const cleaned = (value || 'บันทึกสรุป')
       .replace(/[\\/:*?"<>|]+/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
-    return `${cleaned || 'สรุปที่เก็บถาวร'}.pdf`;
+    return `${cleaned || 'บันทึกสรุป'}.pdf`;
   };
 
   const downloadSummaryItem = async (item: SavedSummary) => {
     if (typeof document === 'undefined') return;
 
-    const title = item.title?.trim() || 'สรุปที่เก็บถาวร';
+    const title = item.title?.trim() || 'บันทึกสรุป';
     const subject = item.subject_name?.trim() || '';
     const period = item.period ? summaryCategoryLabels[item.period] : '';
     const createdAt = item.created_at ? formatSummaryDate(item.created_at) : '';
@@ -1201,7 +1235,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     container.style.padding = '48px';
     container.style.background = '#ffffff';
     container.style.color = '#111827';
-    container.style.fontFamily = '"TH Sarabun New", "Sarabun", "Leelawadee UI", Tahoma, sans-serif';
+    container.style.fontFamily = 'Sarabun, Tahoma, "Leelawadee UI", sans-serif';
     container.style.lineHeight = '1.7';
 
     const heading = document.createElement('h1');
@@ -1235,6 +1269,8 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     document.body.appendChild(container);
 
     try {
+      await document.fonts.load('15px Sarabun', item.content || 'สรุปรายงาน');
+      await document.fonts.ready;
       const canvas = await html2canvas(container, {
         backgroundColor: '#ffffff',
         scale: 2,
@@ -1275,7 +1311,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     }
 
     setEditingArchive(archive);
-    setArchiveEditTitle(archive.name || item.title || 'สรุปที่เก็บถาวร');
+    setArchiveEditTitle(archive.name || item.title || 'บันทึกสรุป');
     setArchiveEditDescription(archive.description || item.content || '');
     setGeneralError(null);
   };
@@ -1328,13 +1364,13 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
           : current
       );
       setSummary(current => (savedSummary?.id === editingArchiveId ? updatedArchive.description : current));
-      setStatusText('แก้ไขสรุปที่เก็บถาวรเรียบร้อยแล้ว');
+      setStatusText('แก้ไขบันทึกสรุปเรียบร้อยแล้ว');
       window.dispatchEvent(new Event('slt:archive-refresh'));
       setEditingArchive(null);
       setArchiveEditTitle('');
       setArchiveEditDescription('');
     } catch (error) {
-      setGeneralError(extractErrorMessage(error, 'แก้ไขสรุปที่เก็บถาวรไม่สำเร็จ'));
+      setGeneralError(extractErrorMessage(error, 'แก้ไขบันทึกสรุปไม่สำเร็จ'));
     } finally {
       setSavingArchiveEdit(false);
     }
@@ -1346,6 +1382,10 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   };
 
   const handleFileSelected = (file: File) => {
+    if (!selectedSubjectId) {
+      setGeneralError('กรุณาเลือกรายวิชาก่อนเลือกไฟล์ เพื่อจัดเก็บไฟล์ให้ถูกวิชา');
+      return;
+    }
     if (!isAllowedFile(file)) {
       setGeneralError('รองรับเฉพาะไฟล์ PDF, DOC, DOCX หรือ TXT เท่านั้น');
       setStatusText('ไฟล์ที่อัปโหลดไม่รองรับ กรุณาเลือกไฟล์ใหม่');
@@ -1537,10 +1577,11 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
   };
 
   const handleSaveSummary = async () => {
-    const summaryText = summary?.trim();
+    if (isSavingSummary) return;
+    const summaryText = activeSummaryText.trim();
     if (!summaryText) {
       setGeneralError('ยังไม่มีสรุปให้บันทึก');
-      setStatusText('กรุณาสรุปเอกสารก่อนบันทึก');
+      setStatusText('กรุณาสร้างสรุปก่อนบันทึก');
       return;
     }
     const summaryTextForStorage = summaryText;
@@ -1564,18 +1605,21 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       const periodLabel = summaryCategoryLabels[selectedPeriod];
       const fallbackTitle =
         savedSummary?.title?.trim() ||
-        stripExtension(selectedFile?.name ?? '').trim() ||
-        (activeSummarySource === 'document-file' ? 'สรุปเอกสาร' : 'สรุปจากเสียง');
+        (activeSummarySource === 'document-file'
+          ? dbFileName?.trim() || selectedFile?.name.trim() || 'สรุปเอกสาร'
+          : summarySourceLabels[activeSummarySource]);
 
       const archiveResponse = await api.post(`/subjects/${archiveSubjectId}/summary-archives`, {
         name: `${periodLabel}: ${fallbackTitle}`,
         description: summaryTextForStorage,
         period: selectedPeriod,
+        source_type: activeSummarySource,
       });
       const archivePayload = archiveResponse.data?.data ?? archiveResponse.data;
       const archiveId = normalizeSummaryId(archivePayload?.id) ?? Date.now();
       const nextArchive: ArchivedSummary = {
         id: archiveId,
+        source_type: normalizeSummarySource(archivePayload?.source_type) ?? activeSummarySource,
         original_subject_id: normalizeSummaryId(archivePayload?.original_subject_id) ?? Number(archiveSubjectId),
         subject_name:
           typeof archivePayload?.subject_name === 'string'
@@ -1593,18 +1637,23 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       };
       setArchivedSummaries(prev => [nextArchive, ...prev.filter(item => item.id !== archiveId)]);
       setSavedSummarySignature(`${archiveSubjectId}::${summaryText}`);
+      setSummaryPeriod('all');
+      setSavedSummaryPage(1);
+      setActiveHistoryTab('archived');
       window.dispatchEvent(new Event('slt:archive-refresh'));
-      setStatusText('บันทึกสรุปไปยังสรุปที่เก็บถาวรเรียบร้อยแล้ว');
+      setStatusText('บันทึกสรุปไปยังบันทึกสรุปเรียบร้อยแล้ว');
+      requestAnimationFrame(() => {
+        historySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
     } catch (error) {
-      setDbError(extractErrorMessage(error, 'บันทึกสรุปไปยังสรุปที่เก็บถาวรไม่สำเร็จ'));
+      setDbError(extractErrorMessage(error, 'บันทึกสรุปไปยังบันทึกสรุปไม่สำเร็จ'));
     } finally {
       setIsSavingSummary(false);
     }
   };
 
   const saveFileToDatabase = async (file: File) => {
-    const fallbackSubjectId = subjects[0] ? String(subjects[0].id) : '';
-    const subjectId = selectedSubjectId || fallbackSubjectId;
+    const subjectId = selectedSubjectId;
 
     if (!subjectId) {
       setDbError('กรุณาเลือกวิชาเพื่อบันทึกไฟล์ลงฐานข้อมูล');
@@ -1612,10 +1661,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       return;
     }
 
-    if (!selectedSubjectId && fallbackSubjectId) {
-      setSelectedSubjectId(fallbackSubjectId);
-      localStorage.setItem(lastSubjectKey, fallbackSubjectId);
-    }
+    if (savedUploadRef.current?.file === file && savedUploadRef.current.subjectId === subjectId) return;
 
     setIsSaving(true);
     setDbStatus('กำลังบันทึกไฟล์ลงฐานข้อมูล...');
@@ -1624,6 +1670,26 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
     setDbFileName(null);
 
     try {
+      // Re-selecting the same document after a page reload should reuse its attachment.
+      const logsResponse = await api.get(`/subjects/${subjectId}/study-logs`);
+      const existingLogs = logsResponse.data?.data ?? logsResponse.data;
+      let currentDigest: string | null = null;
+      for (const log of (Array.isArray(existingLogs) ? existingLogs : [])) {
+        const attachments = log.files?.data ?? log.files ?? [];
+        for (const attachment of (Array.isArray(attachments) ? attachments : [])) {
+          if (attachment.original_name !== file.name || Number(attachment.file_size) !== file.size) continue;
+          const digest = async (blob: Blob) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', await blob.arrayBuffer()))).join(',');
+          currentDigest ??= await digest(file);
+          const storedBlob = (await api.get(`/files/${attachment.id}/download`, { responseType: 'blob' })).data as Blob;
+          if (await digest(storedBlob) !== currentDigest) continue;
+          savedUploadRef.current = { file, subjectId };
+          setDbLogId(log.id); setDbSubjectId(Number(subjectId));
+          setDbFileName(attachment.original_name);
+          setDbFileUrl(resolveStudyFileUrl(attachment.file_path, assetBaseURL));
+          setDbStatus('ใช้ไฟล์เดิมที่บันทึกไว้ในรายวิชาแล้ว');
+          return;
+        }
+      }
       const titleBase = stripExtension(file.name).trim() || file.name;
       const logPayload = {
         title: `สรุปเอกสาร: ${titleBase}`,
@@ -1647,45 +1713,17 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       setDbLogTitle(logPayload.title);
 
       let fileResponse;
-      let publicFileUrl: string | null = null;
-      let usedLocalUpload = false;
-
-      try {
-        const uploaded = await uploadStudyFileToSupabase({
-          file,
-          userId: user?.id,
-          subject: {
-            id: Number(subjectId),
-            name: selectedSubject?.name ?? file.name,
-            semester: selectedSubject?.semester,
-            academic_year: selectedSubject?.academic_year,
-          },
-        });
-
-        fileResponse = await api.post(`/study-logs/${logId}/files`, {
-          original_name: file.name,
-          storage_path: uploaded.storagePath,
-          file_type: uploaded.fileType,
-          mime_type: file.type || null,
-          file_size: file.size,
-        });
-        publicFileUrl = uploaded.publicUrl;
-      } catch (storageError) {
-        console.warn('supabase upload failed, falling back to local storage', storageError);
-        setDbStatus('Supabase ใช้งานไม่ได้ กำลังบันทึกไฟล์ลงระบบของเว็บแทน...');
-        usedLocalUpload = true;
-
-        const uploadForm = new FormData();
-        uploadForm.append('file', file, file.name);
-        fileResponse = await api.post(`/study-logs/${logId}/files`, uploadForm);
-      }
+      const uploadForm = new FormData();
+      uploadForm.append('file', file, file.name);
+      fileResponse = await api.post(`/study-logs/${logId}/files`, uploadForm);
 
       const fileData = fileResponse.data?.data ?? fileResponse.data;
+      savedUploadRef.current = { file, subjectId };
       setDbFileName(fileData?.original_name ?? file.name);
       if (fileData?.file_path) {
-        setDbFileUrl(publicFileUrl ?? resolveStudyFileUrl(fileData.file_path, assetBaseURL));
+        setDbFileUrl(resolveStudyFileUrl(fileData.file_path, assetBaseURL));
       }
-      setDbStatus(usedLocalUpload ? 'บันทึกไฟล์ลงระบบของเว็บเรียบร้อยแล้ว' : 'บันทึกไฟล์ลงฐานข้อมูลเรียบร้อยแล้ว');
+      setDbStatus('บันทึกไฟล์ลงระบบของเว็บเรียบร้อยแล้ว');
     } catch (error) {
       setDbStatus(null);
       setDbError(extractErrorMessage(error, 'บันทึกไฟล์ลงฐานข้อมูลไม่สำเร็จ'));
@@ -1711,8 +1749,9 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       }
     }
 
-    if (browserExtractedText.trim().length < 20 && browserOcrImages.length > 0) {
+    if (browserOcrImages.length > 0) {
       try {
+        const readablePages = browserExtractedText;
         const ocrTextParts: string[] = [];
         for (let start = 0; start < browserOcrImages.length; start += 3) {
           const imageBatch = browserOcrImages.slice(start, start + 3);
@@ -1725,7 +1764,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
           const batchText = String(ocrResult.data?.text ?? '').trim();
           if (batchText) {
             ocrTextParts.push(batchText);
-            browserExtractedText = ocrTextParts.join('\n\n').trim();
+            browserExtractedText = [readablePages, ...ocrTextParts].filter(Boolean).join('\n\n').trim();
           }
         }
       } catch (ocrError) {
@@ -1745,11 +1784,17 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
 
     try {
       setStatusText('กำลังสรุปเนื้อหาจากไฟล์...');
-      const [summaryResult, extractResult] = await Promise.allSettled([
-        postDocumentData<DocumentSummaryResult>(summaryEndpoint, summaryForm),
+      const [extractResult] = await Promise.allSettled([
         browserExtractedText.trim().length >= 20
           ? Promise.resolve({ data: { text: browserExtractedText } } as { data: DocumentExtractResult })
           : postDocumentData<DocumentExtractResult>(extractEndpoint, extractForm)
+      ]);
+      if (extractResult.status === 'fulfilled' && extractResult.value.data?.text?.trim()) {
+        summaryForm.delete('file');
+        summaryForm.set('text', extractResult.value.data.text);
+      }
+      const [summaryResult] = await Promise.allSettled([
+        postDocumentData<DocumentSummaryResult>(summaryEndpoint, summaryForm),
       ]);
 
       let hasSuccess = false;
@@ -1778,7 +1823,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
         const extractedText = typeof payload?.text === 'string' ? payload.text : '';
         if (extractedText.trim() !== '') {
           extractTextValue = extractedText;
-          setOriginalText(prev => (prev && prev.trim() !== '' ? prev : extractedText));
+          setOriginalText(extractedText);
           hasSuccess = true;
         }
       } else {
@@ -1812,7 +1857,9 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       }
 
       if (hasSuccess) {
-        setStatusText('สรุปเสร็จแล้ว! ตรวจสอบต้นฉบับและสรุปได้ทันที');
+        setStatusText(summaryFailureMessage || summaryTextValue === ''
+          ? 'แสดงข้อความย่อจากต้นฉบับแล้ว เนื่องจาก AI ยังสรุปไม่สำเร็จ สามารถลองสร้างสรุปอีกครั้งได้'
+          : `สรุปจากไฟล์ ${file.name} เสร็จแล้ว ตรวจสอบเทียบกับต้นฉบับได้ทันที`);
         document.getElementById('result-section')?.scrollIntoView({ behavior: 'smooth' });
       } else {
         setGeneralError(summaryFailureMessage || extractFailureMessage || 'เกิดข้อผิดพลาดระหว่างการสรุปเอกสาร');
@@ -1856,6 +1903,10 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       return;
     }
 
+    if (!selectedSubjectId) {
+      setGeneralError('กรุณาเลือกรายวิชาก่อนสร้างสรุป');
+      return;
+    }
     if (isLoading || isSaving) {
       return;
     }
@@ -1885,14 +1936,14 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
         </pre>
       </div>
 
-      <div className={`max-w-7xl mx-auto relative z-10 space-y-8 print:hidden ${embedded ? 'px-0 pb-0 pt-0' : 'px-4 pb-4 pt-2 md:p-8'}`}>
+      <div className={`relative z-10 w-full space-y-8 print:hidden ${embedded ? 'px-0 pb-0 pt-0' : 'px-4 pb-4 pt-2 md:p-8'}`}>
         <style>{`
           .doc-summary-page::before {
             content: "";
             position: absolute;
             inset: 0;
             pointer-events: none;
-            background: #ffffff;
+            background: var(--bg);
           }
           .doc-summary-header,
           .doc-summary-card {
@@ -1903,12 +1954,13 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
             box-shadow: 0 24px 58px rgba(15, 23, 42, 0.10) !important;
             backdrop-filter: blur(24px);
           }
-          .dark .doc-summary-header,
-          .dark .doc-summary-card {
+          .theme-dark .doc-summary-header,
+          .theme-dark .doc-summary-card {
             background:
-              linear-gradient(145deg, rgba(15,23,42,0.78), rgba(15,23,42,0.54)),
-              var(--surface) !important;
-            border-color: rgba(255,255,255,0.10) !important;
+              radial-gradient(circle at 90% 10%, rgba(var(--accent-rgb),0.20), transparent 40%),
+              var(--panel-bg) !important;
+            color: var(--text);
+            border-color: var(--border) !important;
             box-shadow: 0 24px 58px rgba(0,0,0,0.28) !important;
           }
           .doc-summary-card {
@@ -1924,7 +1976,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
               linear-gradient(145deg, rgba(var(--accent-rgb),0.08), rgba(255,255,255,0.58)) !important;
             border-color: rgba(var(--accent-rgb),0.24) !important;
           }
-          .dark .doc-upload-zone {
+          .theme-dark .doc-upload-zone {
             background:
               linear-gradient(145deg, rgba(var(--accent-rgb),0.16), rgba(15,23,42,0.46)) !important;
           }
@@ -1948,7 +2000,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
             background:
               linear-gradient(180deg, rgba(255,255,255,0.80), rgba(248,250,252,0.74)) !important;
           }
-          .dark .doc-result-panel {
+          .theme-dark .doc-result-panel {
             background:
               linear-gradient(180deg, rgba(15,23,42,0.58), rgba(2,6,23,0.38)) !important;
           }
@@ -1968,9 +2020,10 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
             font-size: 12px;
             font-weight: 700;
           }
-          .dark .doc-summary-chip {
-            background: rgba(255,255,255,0.06);
-            border-color: rgba(255,255,255,0.10);
+          .theme-dark .doc-summary-chip {
+            background: var(--surface);
+            border-color: var(--border);
+            color: var(--text);
           }
           @media (max-width: 640px) {
             .doc-summary-header {
@@ -2035,7 +2088,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                 Smart Summary
               </span>
               <h1 className="text-2xl font-bold tracking-wide text-[color:var(--text)] md:text-3xl">
-                {isArchivePage ? 'วิชาเก็บถาวร' : 'สรุปเนื้อหาด้วย AI'}
+                {isArchivePage ? 'สรุปที่บันทึกไว้' : 'สรุปเนื้อหา'}
               </h1>
               <p className="mt-1 max-w-2xl text-sm leading-6 text-[color:var(--muted)]">
               
@@ -2048,7 +2101,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
               {selectedSubjectName ?? 'ยังไม่เลือกวิชา'}
             </span>
             <span className="doc-summary-chip">{savedCountLabel} สรุป</span>
-            <span className="doc-summary-chip">{archiveCountLabel} เก็บถาวร</span>
+            <span className="doc-summary-chip">สรุปที่บันทึกไว้ {archiveCountLabel} รายการ</span>
           </div>
         </header>
         )}
@@ -2161,7 +2214,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                 aria-pressed={inputMode === 'document'}
                 className={`flex-1 flex items-center justify-center space-x-2 border py-2.5 rounded-lg text-sm font-semibold transition-all ${
                   inputMode === 'document'
-                    ? 'text-slate-900 shadow'
+                    ? 'text-[color:var(--on-accent)] shadow'
                     : 'border-transparent text-slate-500 dark:text-slate-200 hover:bg-white/25 dark:hover:bg-white/10 hover:text-slate-800 dark:hover:text-white'
                 }`}
                 style={
@@ -2169,7 +2222,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                     ? {
                         background: 'var(--accent)',
                         borderColor: 'var(--accent)',
-                        color: '#ffffff'
+                        color: 'var(--on-accent)'
                       }
                     : undefined
                 }
@@ -2183,7 +2236,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                 aria-pressed={inputMode === 'audio'}
                 className={`flex-1 flex items-center justify-center space-x-2 border py-2.5 rounded-lg text-sm font-semibold transition-all ${
                   inputMode === 'audio'
-                    ? 'text-slate-900 shadow'
+                    ? 'text-[color:var(--on-accent)] shadow'
                     : 'border-transparent text-slate-500 dark:text-slate-200 hover:bg-white/25 dark:hover:bg-white/10 hover:text-slate-800 dark:hover:text-white'
                 }`}
                 style={
@@ -2191,7 +2244,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                     ? {
                         background: 'var(--accent)',
                         borderColor: 'var(--accent)',
-                        color: '#ffffff'
+                        color: 'var(--on-accent)'
                       }
                     : undefined
                 }
@@ -2305,6 +2358,10 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
             {/* Main Input Area (แยกโหมดเอกสาร และ โหมดไฟล์เสียง) */}
             {inputMode === 'document' ? (
               <>
+                <SubjectDocumentPicker subjectId={selectedSubjectId} disabled={isLoading || isSaving} onSelect={(file) => {
+                  handleFileSelected(file);
+                  savedUploadRef.current = { file, subjectId: selectedSubjectId };
+                }} />
                 {/* Upload Dropzone (ของเอกสาร) */}
                 <div 
                   onDrop={handleDrop}
@@ -2516,6 +2573,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
 
         {/* History / Archives */}
         <section
+          ref={historySectionRef}
           className="doc-summary-card doc-summary-card-history rounded-3xl p-6 shadow-[0_24px_60px_rgba(15,23,42,0.08)] dark:shadow-2xl"
           style={{
               background: 'var(--surface)',
@@ -2539,6 +2597,15 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
               <p className="text-xs text-[color:var(--muted)]">แสดงผลแบบการ์ด 10 รายการต่อหน้า</p>
             </div>
 
+            {isArchivePage && (
+              <div className="min-w-0 flex-1 sm:self-center">
+                <p className="text-xs text-[color:var(--muted)]">วิชา</p>
+                <p className="mt-1 break-words text-lg font-semibold text-[color:var(--text)]">
+                  {selectedSubjectName ?? (selectedSubjectId ? 'กำลังโหลดชื่อวิชา...' : 'ทุกวิชา')}
+                </p>
+              </div>
+            )}
+
             {/* History Tabs */}
             <div
               className="doc-history-tabs flex space-x-1 p-1 rounded-xl overflow-x-auto scrollbar-hide backdrop-blur-md"
@@ -2549,7 +2616,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
             >
              {[ 
                  { id: 'original', label: 'ข้อความต้นฉบับ', icon: '📄', count: undefined },
-                 { id: 'archived', label: 'สรุปที่เก็บถาวร', icon: '📦', count: filteredArchivedSummaries.length }
+                 { id: 'archived', label: 'บันทึกสรุป', icon: '📦', count: filteredArchivedSummaries.length }
                ].filter(tab => !isArchivePage || tab.id === 'archived').map((tab) => (
                  <button
                    key={tab.id}
@@ -2579,37 +2646,6 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
           </div>
 
           <div className="mt-6">
-            {isArchivePage && (
-              <div className="mb-5 grid gap-3 md:grid-cols-2">
-                <div className="space-y-2">
-                  <label className="text-xs font-semibold text-[color:var(--muted)]">ภาคเรียน</label>
-                  <select
-                    value={selectedSemesterKey}
-                    onChange={event => setSelectedSemesterKey(event.target.value)}
-                    className="w-full rounded-xl px-4 py-3 text-sm text-slate-800 outline-none dark:text-white"
-                    style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
-                  >
-                    {semesterFilterOptions.map(option => (
-                      <option key={option.key} value={option.key}>{option.label}</option>
-                    ))}
-                  </select>
-                </div>
-                <div className="space-y-2">
-                  <label className="text-xs font-semibold text-[color:var(--muted)]">วิชา</label>
-                  <select
-                    value={selectedSubjectId}
-                    onChange={event => setSelectedSubjectId(event.target.value)}
-                    className="w-full rounded-xl px-4 py-3 text-sm text-slate-800 outline-none dark:text-white"
-                    style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
-                  >
-                    {semesterFilteredSubjects.map(subject => (
-                      <option key={subject.id} value={subject.id}>{subject.name}</option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            )}
-            
             {/* Filter Pills for Saved Tab */}
             {(activeHistoryTab === 'saved' || activeHistoryTab === 'archived') && (
               <div className="flex space-x-2 mb-4 overflow-x-auto pb-2 scrollbar-hide">
@@ -2694,9 +2730,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                                </div>
                              </div>
 
-                             <p className="whitespace-pre-wrap text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
-                               {item.content}
-                             </p>
+                             <ExpandableText text={item.content} className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed" />
 
                              <div className="flex flex-wrap items-center gap-2 mt-2 pt-3 border-t border-slate-200 dark:border-white/10">
                                <button
@@ -2739,7 +2773,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                                    color: '#ffffff'
                                  }}
                                >
-                                 {isAlreadyArchived(item) ? 'บันทึกถาวรแล้ว' : 'บันทึกถาวร'}
+                                 {isAlreadyArchived(item) ? 'บันทึกแล้ว' : 'บันทึก'}
                                </button>
                                <button
                                  type="button"
@@ -2810,7 +2844,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                  {filteredArchivedSummaries.length === 0 ? (
                     <div className="doc-empty-state bg-white/40 dark:bg-black/10 border border-white/60 dark:border-white/10 rounded-xl p-8 flex flex-col items-center justify-center text-center backdrop-blur-sm">
                       <span className="text-4xl text-slate-400 mb-3">📦</span>
-                      <p className="text-slate-600 dark:text-slate-300 text-sm">ยังไม่มีสรุปที่เก็บถาวร</p>
+                      <p className="text-slate-600 dark:text-slate-300 text-sm">ยังไม่มีบันทึกสรุป</p>
                     </div>
                  ) : (
                     <div className="grid gap-4 md:grid-cols-2">
@@ -2834,7 +2868,15 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                                    <div className="flex items-center gap-2">
                                      <h4 className="text-sm font-bold text-amber-800 dark:text-amber-200">{item.title ?? 'สรุปเอกสาร'}</h4>
                                    </div>
+                                   <p className="mt-1 text-sm font-medium text-slate-700 dark:text-slate-300 break-words">
+                                     วิชา: {item.subject_name?.trim() || subjectNameById.get(item.original_subject_id ?? 0) || 'ไม่ระบุวิชา'}
+                                   </p>
                                    <div className="flex items-center gap-2 mt-1">
+                                      {item.source_type && (
+                                         <span className="text-[10px] text-slate-600 dark:text-slate-300 border border-slate-300 dark:border-white/20 px-1.5 py-0.5 rounded-md bg-white/50 dark:bg-white/5">
+                                           {summarySourceLabels[item.source_type]}
+                                         </span>
+                                      )}
                                       {item.period && (
                                          <span className="text-[10px] text-slate-600 dark:text-slate-300 border border-slate-300 dark:border-white/20 px-1.5 py-0.5 rounded-md bg-white/50 dark:bg-white/5">
                                            {summaryCategoryLabels[item.period]}
@@ -2847,21 +2889,9 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                                  </div>
                                </div>
 
-                               <p className="whitespace-pre-wrap text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
-                                 {item.content}
-                               </p>
+                               <ExpandableText text={item.content} className="text-sm text-slate-700 dark:text-slate-300 leading-relaxed" />
 
                                <div className="flex flex-wrap items-center gap-2 mt-2 pt-3 border-t border-amber-200 dark:border-amber-400/20">
-                                  <button
-                                    type="button"
-                                    onClick={event => {
-                                      event.stopPropagation();
-                                      viewSavedSummaryItem(item);
-                                    }}
-                                    className="rounded-lg border border-slate-300 dark:border-white/20 bg-white/80 dark:bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 transition hover:bg-white dark:hover:bg-white/10 backdrop-blur-md shadow-sm dark:shadow-none"
-                                  >
-                                    {savedSummary?.id === item.id ? 'ปิดเนื้อหา' : 'ดูเนื้อหา'}
-                                  </button>
                                   <button
                                     type="button"
                                     onClick={event => {
@@ -2894,9 +2924,9 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
                                       event.stopPropagation();
                                       void restoreSummary(item);
                                     }}
-                                    className="rounded-lg border border-sky-300 dark:border-sky-400/30 bg-sky-50 dark:bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-700 dark:text-sky-200 transition hover:bg-sky-100 dark:hover:bg-sky-500/20 backdrop-blur-md shadow-sm dark:shadow-none"
+                                    className="doc-archive-restore rounded-lg border border-sky-300 dark:border-sky-400/30 bg-sky-50 dark:bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-700 dark:text-sky-200 transition hover:bg-sky-100 dark:hover:bg-sky-500/20 backdrop-blur-md shadow-sm dark:shadow-none"
                                   >
-                                    เอาออกจากเก็บถาวร
+                                    เอาออกจากไฟล์เก็บสรุป
                                   </button>
                                </div>
                             </div>
@@ -2913,14 +2943,14 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
       </div>
       </div>
       {editingArchive && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 px-4 py-6 backdrop-blur-sm">
+        <ModalOverlay className="fixed inset-0 flex items-center justify-center bg-slate-950/60 px-4 py-6 backdrop-blur-sm">
           <div
             className="w-full max-w-3xl rounded-2xl p-5 shadow-2xl"
             style={{ background: 'var(--surface)', border: '1px solid var(--border)' }}
           >
             <div className="mb-4 flex items-start justify-between gap-3">
               <div>
-                <h2 className="text-lg font-bold text-[color:var(--text)]">แก้ไขสรุปที่เก็บถาวร</h2>
+                <h2 className="text-lg font-bold text-[color:var(--text)]">แก้ไขบันทึกสรุป</h2>
                 <p className="mt-1 text-xs text-[color:var(--muted)]">
                   {editingArchive.archived_at ? formatSummaryDate(editingArchive.archived_at) : 'รายการเก็บถาวร'}
                 </p>
@@ -3001,7 +3031,7 @@ export const DocumentSummaryPage = ({ embedded = false }: DocumentSummaryPagePro
               </button>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
       <ConfirmDialog
         isOpen={Boolean(confirmState)}

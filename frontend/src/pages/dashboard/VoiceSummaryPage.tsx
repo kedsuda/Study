@@ -1,12 +1,14 @@
+import { useSharedSemesterSelection, useSharedSubjectSelection } from '../../hooks/useAcademicSelection';
 import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { format, isValid, parseISO } from 'date-fns';
 import { th } from 'date-fns/locale';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { api } from '../../services/api';
+import { startLiveTranscription } from '../../utils/liveTranscription';
 import { getLastSubjectKey } from '../../constants/storage';
 import { aiApi } from "../../services/aiApi";
 import { useAuth } from '../../context/AuthContext';
-import { useDefaultSemesterSelection, useSemesterOptions } from '../../hooks/useSemesterOptions';
+import { useSemesterOptions } from '../../hooks/useSemesterOptions';
 import { filterBySemester, toNumberOrNull } from '../../utils/semester';
 import { subscribeSubjectsUpdated } from '../../utils/subjectSync';
 
@@ -300,8 +302,7 @@ export const VoiceSummaryPage = ({
   const [recordedBytes, setRecordedBytes] = useState(0);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [subjects, setSubjects] = useState<SubjectOption[]>([]);
-  const [selectedSemesterKey, setSelectedSemesterKey] = useState('all');
-  const [selectedSubjectId, setSelectedSubjectId] = useState('');
+  const [selectedSubjectId, setSelectedSubjectId] = useSharedSubjectSelection();
   const [analysisType, setAnalysisType] = useState<'summary' | 'career'>('summary');
   const [selectedMood, setSelectedMood] = useState('');
   const [summaryPeriod, setSummaryPeriod] = useState<SummaryPeriod>(() => {
@@ -327,17 +328,16 @@ const [isMoodDropdownOpen, setIsMoodDropdownOpen] = useState(false);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const lastSubjectKey = useMemo(() => getLastSubjectKey(user?.id), [user?.id]);
   const semesterOptions = useSemesterOptions();
-  useDefaultSemesterSelection(semesterOptions, selectedSemesterKey, setSelectedSemesterKey);
+  const [selectedSemesterKey, setSelectedSemesterKey] = useSharedSemesterSelection(semesterOptions);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const speechRecognitionRef = useRef<any>(null);
+  const stopLiveTranscriptionRef = useRef<(() => void) | null>(null);
   const timerRef = useRef<number | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const recordedBytesRef = useRef(0);
   const recorderMimeTypeRef = useRef('audio/webm');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const liveTranscriptRef = useRef('');
-  const committedSpeechTranscriptRef = useRef('');
 
   const filteredSubjects = useMemo(() => filterBySemester(subjects, selectedSemesterKey), [subjects, selectedSemesterKey]);
   const selectableSubjects = useMemo(
@@ -373,14 +373,8 @@ const [isMoodDropdownOpen, setIsMoodDropdownOpen] = useState(false);
         mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
         mediaRecorderRef.current = null;
       }
-      if (speechRecognitionRef.current) {
-        try {
-          speechRecognitionRef.current.stop();
-        } catch {
-          // ignore
-        }
-        speechRecognitionRef.current = null;
-      }
+      stopLiveTranscriptionRef.current?.();
+      stopLiveTranscriptionRef.current = null;
     };
   }, []);
 
@@ -469,25 +463,8 @@ useEffect(() => {
         : [];
       setSubjects(list);
 
-      const storedId = localStorage.getItem(lastSubjectKey);
-      if (storedId && list.some(subject => String(subject.id) === storedId)) {
-        setSelectedSubjectId(storedId);
-        return;
-      }
-
-      if (list[0]?.id) {
-        const fallbackId = String(list[0].id);
-        setSelectedSubjectId(fallbackId);
-        localStorage.setItem(lastSubjectKey, fallbackId);
-        return;
-      }
-
-      setSelectedSubjectId('');
-      localStorage.removeItem(lastSubjectKey);
     } catch (err) {
       setSubjects([]);
-      setSelectedSubjectId('');
-      localStorage.removeItem(lastSubjectKey);
     }
   };
 
@@ -503,6 +480,7 @@ useEffect(() => {
   }, [activeSummaryPeriod]);
 
   useEffect(() => {
+    if (subjects.length === 0) return;
     if (selectedSubjectId && selectableSubjects.some(subject => String(subject.id) === selectedSubjectId)) return;
     const fallback = selectableSubjects[0];
     if (!fallback) {
@@ -661,7 +639,6 @@ useEffect(() => {
 
   const resetLiveTranscript = () => {
     liveTranscriptRef.current = '';
-    committedSpeechTranscriptRef.current = '';
     setLiveTranscript('');
   };
 
@@ -751,6 +728,7 @@ useEffect(() => {
   };
 
   const archiveAudioSummary = async (item: {
+    source_mode: 'record' | 'upload';
     id?: number | null;
     title?: string | null;
     summary?: string | null;
@@ -786,6 +764,7 @@ useEffect(() => {
       const response = await api.post(`/subjects/${selectedSubjectId}/summary-archives`, {
         name: archiveTitle,
         description: content,
+        source_type: item.source_mode === 'record' ? 'live-audio' : 'audio-file',
       });
       const archived = response.data?.data ?? response.data;
       if (!archived?.id) {
@@ -930,57 +909,27 @@ useEffect(() => {
       recorder.start(RECORDING_TIMESLICE_MS);
       mediaRecorderRef.current = recorder;
       resetLiveTranscript();
-      if (SpeechRecognitionCtor) {
-        try {
-          const recognition = new SpeechRecognitionCtor();
-          recognition.lang = 'th-TH';
-          recognition.continuous = true;
-          recognition.interimResults = true;
-          recognition.onresult = (event: any) => {
-            let committed = committedSpeechTranscriptRef.current;
-            const interimParts: string[] = [];
-
-            for (let index = event.resultIndex ?? 0; index < (event.results?.length ?? 0); index += 1) {
-              const result = event.results[index];
-              const transcript = String(result?.[0]?.transcript ?? '').replace(/\s+/g, ' ').trim();
-              if (!transcript) continue;
-
-              if (result.isFinal) {
-                committed = [committed, transcript].filter(Boolean).join(' ');
-              } else {
-                interimParts.push(transcript);
-              }
-            }
-
-            committed = committed.replace(/\s+/g, ' ').trim();
-            committedSpeechTranscriptRef.current = committed;
-            updateLiveTranscript([committed, ...interimParts].filter(Boolean).join(' '));
-          };
-          recognition.onerror = () => {
-            setStatusText('กำลังบันทึกเสียง... (ถอดเสียงเรียลไทม์ใช้งานไม่ได้ชั่วคราว)');
-          };
-          recognition.onend = () => {
-            if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-              try {
-                recognition.start();
-              } catch {
-                // ignore restart errors
-              }
-            }
-          };
-          recognition.start();
-          speechRecognitionRef.current = recognition;
-        } catch {
-          speechRecognitionRef.current = null;
-        }
-      }
+      setStatusText('กำลังบันทึกและถอดเสียงแบบเรียลไทม์... กดอีกครั้งเพื่อหยุดและบันทึก');
+      stopLiveTranscriptionRef.current = startLiveTranscription({
+        stream,
+        mimeType: recorderMimeType,
+        Recognition: SpeechRecognitionCtor,
+        onText: updateLiveTranscript,
+        onStatus: setStatusText,
+        transcribe: async (audio, signal) => {
+          const formData = new FormData();
+          formData.append('file', audio, 'live-preview.' + extensionFromMimeType(audio.type));
+          const response = await api.post('/ai/transcribe/audio', formData, { signal, timeout: 30000 });
+          return String(response.data?.text ?? '');
+        },
+      });
 
       setIsRecording(true);
       setTimer(0);
       setError(null);
       setRecordResult(null);
       setSelectedFileName(null);
-      setStatusText('กำลังบันทึกและถอดเสียงแบบเรียลไทม์... กดอีกครั้งเพื่อหยุดและบันทึก');
+
 
       timerRef.current = window.setInterval(() => {
         setTimer(prev => prev + 1);
@@ -1001,14 +950,8 @@ useEffect(() => {
     if (recorder && recorder.state !== 'inactive') {
       recorder.stop();
     }
-    if (speechRecognitionRef.current) {
-      try {
-        speechRecognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-      speechRecognitionRef.current = null;
-    }
+    stopLiveTranscriptionRef.current?.();
+    stopLiveTranscriptionRef.current = null;
 
     setIsRecording(false);
     setStatusText('กำลังประมวลผลเสียงจากไมโครโฟน...');
@@ -1123,29 +1066,6 @@ useEffect(() => {
       setRecordResult(null);
     } else {
       setUploadResult(null);
-    }
-
-    if (source === 'record' && fallbackTranscript) {
-      try {
-        setStatusText('กำลังสรุปข้อความที่ถอดเสียงแบบเรียลไทม์...');
-        const summary = await summarizeTranscriptLikeDocument(fallbackTranscript);
-        const nextResult = {
-          transcript: fallbackTranscript,
-          summary: summary || buildDocumentStyleSummaryFallback(fallbackTranscript),
-        };
-        setRecordResult(nextResult);
-        finishProcessing();
-        void saveBrowserAudioSummary(nextResult, 'record', 'สรุปจากการอัดสด');
-        onSummaryReady?.({
-          summary: nextResult.summary,
-          transcript: nextResult.transcript,
-          source: 'record',
-        });
-        setStatusText('สรุปจากเสียงสดเรียบร้อยแล้ว');
-        return;
-      } catch {
-        // Continue with audio-file processing if transcript summarization is unavailable.
-      }
     }
 
     const formData = new FormData();
@@ -1401,6 +1321,7 @@ useEffect(() => {
                 onClick={() =>
                   void archiveAudioSummary({
                     id: archiveId,
+                    source_mode: source,
                     title: archiveTitle,
                     summary: data.summary,
                     transcript: data.transcript,
@@ -1458,7 +1379,7 @@ useEffect(() => {
 
   return (
     <div className={`ai-summary-theme voice-summary-page doc-summary-page ${embedded ? 'space-y-6' : 'relative min-h-screen overflow-hidden space-y-6 pb-16 bg-transparent font-sans'}`}>
-      <div className={embedded ? '' : 'relative z-10 mx-auto max-w-7xl space-y-8 px-4 pb-4 pt-2 md:p-8'}>
+      <div className={embedded ? '' : 'relative z-10 w-full space-y-8 px-4 pb-4 pt-2 md:p-8'}>
       {!embedded ? (
         <header className="doc-summary-header mb-8 flex flex-col gap-5 md:flex-row md:items-center md:justify-between">
           <div className="flex items-start gap-4">
@@ -1871,7 +1792,7 @@ useEffect(() => {
             ) : null}
             {isRecorderSupported && !isLiveRecognitionSupported ? (
               <div className="mt-4 rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface-2)] p-4 text-sm text-muted">
-                เบราว์เซอร์นี้ยังไม่รองรับถอดเสียงสดระหว่างอัด ระบบจะสรุปให้อัตโนมัติหลังหยุดอัดเสียง
+                เบราว์เซอร์นี้จะถอดเสียงผ่านเซิร์ฟเวอร์ ข้อความจะอัปเดตเป็นช่วงสั้น ๆ ระหว่างอัด
               </div>
             ) : null}
 
@@ -1893,6 +1814,7 @@ useEffect(() => {
                         void archiveAudioSummary({
                           id: -3,
                           title: 'บันทึกการอัดเสียงสด',
+                          source_mode: 'record',
                           summary: liveTranscript,
                           transcript: liveTranscript,
                         })

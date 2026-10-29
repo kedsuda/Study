@@ -1,13 +1,14 @@
+import { ModalOverlay } from '../../components/ModalOverlay';
+import { useSharedSemesterSelection } from '../../hooks/useAcademicSelection';
 
 import axios from 'axios';
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { createPortal } from 'react-dom';
 import { Moon, Palette, Star, Sun, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { api } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
-import { useDefaultSemesterSelection, useSemesterOptions } from '../../hooks/useSemesterOptions';
+import { useSemesterOptions } from '../../hooks/useSemesterOptions';
 import { filterBySemester, toNumberOrNull } from '../../utils/semester';
 import { emitSubjectsUpdated, subscribeSubjectsUpdated } from '../../utils/subjectSync';
 
@@ -113,11 +114,11 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
   const { user, token, loading: authLoading } = useAuth();
   const [recommendations, setRecommendations] = useState<RecommendationCard[]>([]);
   const [subjects, setSubjects] = useState<SubjectOption[]>([]);
-  const [selectedSemesterKey, setSelectedSemesterKey] = useState('all');
   const [semesterMenuOpen, setSemesterMenuOpen] = useState(false);
   const [topSubjects, setTopSubjects] = useState<TopSubject[]>([]);
   const [weakSubjects, setWeakSubjects] = useState<WeakSubject[]>([]);
   const [latestQuiz, setLatestQuiz] = useState<LatestQuizInsight | null>(null);
+  const [quizOverview, setQuizOverview] = useState<{ attempt_count: number; average_score: number | null } | null>(null);
   const [, setInsightsStatus] = useState<'idle' | 'loaded' | 'failed'>('idle');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -131,7 +132,8 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
   const [isThinking, setIsThinking] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [chatRooms, setChatRooms] = useState<ChatRoomMeta[]>([]);
-  const [activeChatRoomId, setActiveChatRoomId] = useState('default');
+  const [activeChatRoomId, setActiveChatRoomId] = useState('');
+  const [loadedChatRoomStorageKey, setLoadedChatRoomStorageKey] = useState<string | null>(null);
   const [chatRoomSearch, setChatRoomSearch] = useState('');
   const [currentTime, setCurrentTime] = useState(() => new Date());
 
@@ -158,17 +160,18 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
   const voiceInputSilenceTimerRef = useRef<number | null>(null);
   const voiceInputAcceptResultsRef = useRef(false);
   const semesterOptions = useSemesterOptions();
-  useDefaultSemesterSelection(semesterOptions, selectedSemesterKey, setSelectedSemesterKey);
+  const [selectedSemesterKey, setSelectedSemesterKey] = useSharedSemesterSelection(semesterOptions);
 
   const userId = user?.id ?? 0;
+  const chatRoomStorageKey = `smartroom-chat-rooms-${userId || 'guest'}`;
   const isAuthenticated = userId > 0;
   const hasAuthToken = Boolean(token);
   const currentAssistantPromptDate = formatAssistantPromptDate(currentTime);
   const currentAssistantPromptWeekday = formatAssistantPromptWeekday(currentTime);
   const currentAssistantPromptTime = formatAssistantPromptTime(currentTime);
   const currentAssistantPromptEndTime = formatAssistantPromptTime(new Date(currentTime.getTime() + 3 * 60 * 60 * 1000));
-  const currentAssistantPromptExample = `เพิ่มวิชา คณิต ${currentAssistantPromptWeekday} วันที่ ${currentAssistantPromptDate} ${currentAssistantPromptTime}-${currentAssistantPromptEndTime} ห้อง 102 ภาคเรียนที่ 1 ปีการศึกษา ${currentTime.toLocaleDateString('th-TH', { year: 'numeric' })}`;
-  const currentAssistantPromptMultipleExample = 'เพิ่มวิชา ประวัติ วันเสาร์ 12:00-13:00 ห้อง 1235 ภาคเรียนที่ 1 ปีการศึกษา 2569\nและ ชีวะ วันอาทิตย์ 12:00-13:00 ห้อง 1235 ภาคเรียนที่ 1 ปีการศึกษา 2569';
+  const currentAssistantPromptExample = `เพิ่มวิชา คณิต ${currentAssistantPromptWeekday} วันที่ ${currentAssistantPromptDate} คาบที่ ${currentAssistantPromptTime}-${currentAssistantPromptEndTime} ห้อง 102 ภาคเรียนที่ 1 ปีการศึกษา ${currentTime.toLocaleDateString('th-TH', { year: 'numeric' })}`;
+  const currentAssistantPromptMultipleExample = 'เพิ่มวิชา โครงสร้างข้อมูลและอัลกอริทึม วันจันทร์ คาบที่ 1-3 ห้อง 4936 ภาคเรียนที่ 1 ปีการศึกษา 2569\nและ วิศวกรรมซอฟต์แวร์ วันอังคาร คาบที่ 5-7 ห้อง 4922 ภาคเรียนที่ 1 ปีการศึกษา 2569';
 
   const activeTheme = useMemo(() => {
     const customHex = '#8b5cf6';
@@ -254,6 +257,7 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
     if (!userId) return;
 
     const loadCareerData = async () => {
+      void api.get('/quizzes/summary').then(response => setQuizOverview(response.data)).catch(() => setQuizOverview(null));
       void fetchInsights();
       await analyzeNow();
     };
@@ -263,17 +267,26 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
+    let savedRooms: ChatRoomMeta[] = [];
     try {
       const raw = window.localStorage.getItem(chatRoomStorageKey);
       const parsed = raw ? (JSON.parse(raw) as ChatRoomMeta[]) : [];
-      const valid = Array.isArray(parsed) ? parsed.filter(room => room && typeof room.id === 'string' && room.id.trim() !== '') : [];
-      if (valid.length > 0) { setChatRooms(valid); setActiveChatRoomId(valid[0].id); } else {
-        setChatRooms([{ id: 'default', title: 'แชทหลัก', updated_at: new Date().toISOString() }]); setActiveChatRoomId('default');
-      }
+      savedRooms = Array.isArray(parsed) ? parsed.filter(room => room && typeof room.id === 'string' && room.id.trim() !== '') : [];
     } catch {
-      setChatRooms([{ id: 'default', title: 'แชทหลัก', updated_at: new Date().toISOString() }]); setActiveChatRoomId('default');
+      // A malformed cache should not prevent starting a fresh conversation.
     }
-  }, []); 
+    const newRoom: ChatRoomMeta = {
+      id: `room-${crypto.randomUUID()}`,
+      title: 'แชทใหม่',
+      updated_at: new Date().toISOString(),
+      last_message: '',
+    };
+    setChatRooms([newRoom, ...savedRooms]);
+    setActiveChatRoomId(newRoom.id);
+    resetChatComposerState();
+    setHistoryOpen(false);
+    setLoadedChatRoomStorageKey(chatRoomStorageKey);
+  }, [chatRoomStorageKey, mode]);
 
   useEffect(() => {
     if (mode !== 'home' || typeof window === 'undefined') return;
@@ -324,13 +337,11 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
     return (room.title.toLowerCase().includes(q) || (room.last_message ?? '').toLowerCase().includes(q));
   });
 
-  const chatRoomStorageKey = `smartroom-chat-rooms-${userId || 'guest'}`;
-
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || loadedChatRoomStorageKey !== chatRoomStorageKey) return;
     const worthKeeping = chatRooms.filter(room => !isEmptyChatRoom(room));
     window.localStorage.setItem(chatRoomStorageKey, JSON.stringify(worthKeeping));
-  }, [chatRoomStorageKey, chatRooms]);
+  }, [chatRoomStorageKey, chatRooms, loadedChatRoomStorageKey]);
 
   const upsertChatRoomMeta = (
     roomId: string,
@@ -404,8 +415,8 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
 
   // A timetable entry needs a weekday and a time range.  Keep those fields in
   // every template; otherwise the API can only create an unscheduled subject.
-  const scheduleTemplate = 'เพิ่มวิชา ประวัติ วันเสาร์ 12:00-13:00 ห้อง 1235 ภาคเรียนที่ 1 ปีการศึกษา 2569';
-  const multipleScheduleTemplate = 'เพิ่มวิชา ประวัติ วันเสาร์ 12:00-13:00 ห้อง 1235 ภาคเรียนที่ 1 ปีการศึกษา 2569\nและ ชีวะ วันอาทิตย์ 12:00-13:00 ห้อง 1235 ภาคเรียนที่ 1 ปีการศึกษา 2569';
+  const scheduleTemplate = 'เพิ่มวิชา โครงสร้างข้อมูลและอัลกอริทึม วันจันทร์ คาบที่ 1-3 ห้อง 4936 ภาคเรียนที่ 1 ปีการศึกษา 2569';
+  const multipleScheduleTemplate = 'เพิ่มวิชา โครงสร้างข้อมูลและอัลกอริทึม วันจันทร์ คาบที่ 1-3 ห้อง 4936 ภาคเรียนที่ 1 ปีการศึกษา 2569\nและ วิศวกรรมซอฟต์แวร์ วันอังคาร คาบที่ 5-7 ห้อง 4922 ภาคเรียนที่ 1 ปีการศึกษา 2569';
 
   const deleteChatHistoryFromServer = async (roomId: string) => {
     try {
@@ -418,9 +429,9 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
   };
   
   const quickActions = [
-    { id: 'study-digest', label: 'สรุปการเรียน', to: '/study-digest', iconClassName: 'text-white', tileStyle: { backgroundColor: '#059669' }, icon: (<svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#ffffff" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M5 5h14" /><path d="M5 12h14" /><path d="M5 19h9" /><path d="M18 17v4" /><path d="M16 19h4" /></svg>) }
+    { id: 'document-summary', label: 'สรุปเนื้อหา', to: '/document-summary', iconClassName: 'text-white', tileStyle: { backgroundColor: '#059669' }, icon: (<svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#ffffff" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M5 5h14" /><path d="M5 12h14" /><path d="M5 19h9" /><path d="M18 17v4" /><path d="M16 19h4" /></svg>) }
   ];
-  const storageAction = { id: 'study-storage', label: 'กระเป๋าเก็บไฟล์', to: '/study-storage', iconClassName: 'text-white', tileStyle: { background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)' }, icon: (<svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#ffffff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" /><path d="M10 12h4" /></svg>) };
+  const storageAction = { id: 'study-storage', label: 'ไฟล์ทั้งหมด', to: '/study-storage', iconClassName: 'text-white', tileStyle: { background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)' }, icon: (<svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#ffffff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" /><path d="M10 12h4" /></svg>) };
   const quickActionItems = [...quickActions, storageAction];
   const [smartMenuOffset, setSmartMenuOffset] = useState({ x: 0, y: 0 });
   const [isDraggingSmartMenu, setIsDraggingSmartMenu] = useState(false);
@@ -688,7 +699,7 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
   }, []);
 
   useEffect(() => {
-    if (mode !== 'home' || !hasAuthToken) return;
+    if (mode !== 'home' || !hasAuthToken || !activeChatRoomId || loadedChatRoomStorageKey !== chatRoomStorageKey) return;
     let cancelled = false;
     const loadChatHistory = async () => {
       setChatLoading(true); setChatError(null);
@@ -714,7 +725,7 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
       } finally { if (!cancelled) setChatLoading(false); }
     };
     void loadChatHistory(); return () => { cancelled = true; };
-  }, [activeChatRoomId, hasAuthToken, mode]);
+  }, [activeChatRoomId, hasAuthToken, mode, loadedChatRoomStorageKey, chatRoomStorageKey]);
 
   useEffect(() => {
     if (mode !== 'home' || typeof window === 'undefined') return;
@@ -745,22 +756,21 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
           .smart-home-input-shell { transition: box-shadow .3s ease, border-color .3s ease; }
           .smart-home-input-shell:focus-within { box-shadow: 0 0 0 4px rgba(var(--accent-rgb), 0.15) !important; border-color: var(--accent) !important; }
           @media (max-width: 640px) {
-            .schedule-assistant-message { font-size: 15px; line-height: 1.7rem; }
-            .schedule-helper-text { font-size: 12px; }
-            .schedule-examples { font-size: 12px; line-height: 1.55rem; }
+            .schedule-assistant-message { font-size: 17px; line-height: 1.9rem; }
+            .schedule-helper-text { font-size: 14px; }
+            .schedule-examples { font-size: 14px; line-height: 1.75rem; }
           }
           @media (min-width: 641px) {
-            .schedule-assistant-message { font-size: 15px; line-height: 1.75rem; }
-            .schedule-helper-text { font-size: 12px; }
-            .schedule-examples { font-size: 12.5px; line-height: 1.6rem; }
+            .schedule-assistant-message { font-size: 18px; line-height: 2rem; }
+            .schedule-helper-text { font-size: 15px; }
+            .schedule-examples { font-size: 15px; line-height: 1.9rem; }
           }
         `}</style>
         <div className="absolute inset-0" style={{ background: 'var(--bg)' }} />
         <div className="absolute inset-0" style={{ backgroundImage: 'radial-gradient(rgba(0,0,0,0.03) 1px, transparent 1px)', backgroundSize: '32px 32px' }} />
 
-        {historyOpen && typeof document !== 'undefined' ? createPortal(
-          <div
-            className="fixed inset-0 z-[9999] flex items-stretch justify-center bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.92),_rgba(236,238,255,0.94)_42%,_rgba(225,230,255,0.88)_100%)] backdrop-blur-md md:items-center md:p-4"
+        {historyOpen && typeof document !== 'undefined' ? (<ModalOverlay
+            className="fixed inset-0 flex items-stretch justify-center bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.92),_rgba(236,238,255,0.94)_42%,_rgba(225,230,255,0.88)_100%)] backdrop-blur-md md:items-center md:p-4"
             style={{ background: 'rgba(0,0,0,0.28)' }}
             onClick={() => setHistoryOpen(false)}
             role="dialog"
@@ -780,7 +790,7 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                       <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
                     </button>
                   </div>
-                  <button type="button" onClick={createNewChatRoom} className="mb-4 inline-flex w-full items-center justify-center gap-2 rounded-full px-4 py-3 text-[14px] font-medium transition active:scale-95" style={{ background: 'var(--accent)', color: '#ffffff', boxShadow: '0 4px 14px rgba(var(--accent-rgb),0.25)' }}>
+                  <button type="button" onClick={createNewChatRoom} className="mb-4 inline-flex w-full items-center justify-center gap-2 rounded-full px-4 py-3 text-[14px] font-medium transition active:scale-95" style={{ background: '#000000', color: '#ffffff', boxShadow: '0 4px 14px rgba(0,0,0,0.25)' }}>
                     <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg> เริ่มแชทใหม่
                   </button>
                   <div className="mb-4 flex items-center gap-2 rounded-full border border-black/5 bg-white px-4 py-2.5" style={{ boxShadow: 'var(--shadow-soft)' }}>
@@ -857,9 +867,9 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                           <div key={message.id} className={`group flex items-start gap-3 ${isAssistant ? 'justify-start' : 'justify-end'}`}>
                             {isAssistant ? (<div className="mt-1 grid h-8 w-8 shrink-0 place-items-center rounded-full text-[11px] font-medium" style={{ background: 'var(--accent)', color: '#ffffff' }}>AI</div>) : null}
                             <div className="max-w-[85%] md:max-w-[68%]">
-                              <div className={`relative w-fit min-w-[5rem] rounded-2xl px-4 py-2.5 text-left ${isAssistant ? 'rounded-bl-md border border-black/5 bg-white text-[color:var(--text)] shadow-[var(--shadow-soft)]' : 'ml-auto rounded-br-md'}`} style={isAssistant ? undefined : { background: 'var(--accent)' }}>
+                              <div className={`relative w-fit min-w-[5rem] rounded-2xl px-4 py-2.5 text-left ${isAssistant ? 'rounded-bl-md border border-black/5 bg-white text-[color:var(--text)] shadow-[var(--shadow-soft)]' : 'ml-auto rounded-br-md'}`} style={isAssistant ? undefined : { background: 'rgba(var(--accent-rgb),0.78)' }}>
                                 <p className="whitespace-pre-wrap break-words text-[14px] leading-7 md:text-[15px]">{isAssistant ? normalizeAssistantFallback(message.message) : message.message}</p>
-                                <p className="mt-1.5 text-[10px]" style={isAssistant ? { color: 'var(--muted)' } : { color: 'rgba(255,255,255,0.75)' }}>{formatChatMessageTime(message.created_at)}</p>
+                                <p className="mt-1.5 text-[10px]" style={isAssistant ? { color: 'var(--muted)' } : { color: 'rgba(29,29,31,0.55)' }}>{formatChatMessageTime(message.created_at)}</p>
                               </div>
                             </div>
                           </div>
@@ -883,21 +893,19 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                   {chatError ? (<p className="mx-auto mb-2 max-w-4xl rounded-xl border border-rose-100 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-600">{chatError}</p>) : null}
                   <form onSubmit={handleAssistantSubmit} className="mx-auto flex max-w-4xl items-end gap-2">
                     <div className="flex min-h-[56px] flex-1 items-end rounded-[2rem] border border-white/80 bg-white px-4 py-2 shadow-[0_16px_34px_rgba(15,23,42,0.06)] transition focus-within:border-violet-300 focus-within:ring-4 focus-within:ring-violet-100">
-                      <textarea ref={historyInputRef} value={inputText} onChange={event => setInputText(event.target.value)} placeholder={`เช่น ${currentAssistantPromptExample}`} disabled={isThinking} rows={1} style={{ maxHeight: `${ASSISTANT_INPUT_MAX_HEIGHT}px` }} className="min-h-[28px] flex-1 resize-none overflow-y-auto bg-transparent py-2 text-[15px] leading-7 text-[color:var(--text)] outline-none placeholder:text-[color:var(--muted)]" onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitAssistantPrompt(inputText); } }} />
+                      <textarea ref={historyInputRef} value={inputText} onChange={event => setInputText(event.target.value)} aria-label="ข้อความถึงผู้ช่วย" disabled={isThinking} rows={1} style={{ maxHeight: `${ASSISTANT_INPUT_MAX_HEIGHT}px` }} className="min-h-[28px] flex-1 resize-none overflow-y-auto bg-transparent py-2 text-[15px] leading-7 text-[color:var(--text)] outline-none placeholder:text-[color:var(--muted)]" onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitAssistantPrompt(inputText); } }} />
                       <button type="button" onClick={isListening ? stopVoiceInput : startVoiceInput} disabled={!voiceInputSupported || isThinking} className={`mb-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition disabled:opacity-40 ${isListening ? 'bg-rose-500/10 text-rose-500' : 'text-[color:var(--muted)] hover:bg-slate-100 hover:text-[color:var(--accent)]'}`} aria-label={isListening ? 'หยุดฟังเสียง' : 'พูดเป็นข้อความ'}>
                         <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 10v2a7 7 0 0 0 14 0v-2" /><path d="M12 19v2" /></svg>
                       </button>
                     </div>
-                    <button type="submit" disabled={!canSendChat} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-40" style={{ background: 'var(--accent)', color: '#ffffff', boxShadow: '0 4px 14px rgba(var(--accent-rgb),0.25)' }} aria-label="ส่งข้อความ">
-                      <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 2 11 13" /><path d="M22 2 15 22 11 13 2 9 22 2Z" /></svg>
+                    <button type="submit" disabled={!canSendChat} className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-rose-700 bg-rose-600 text-white shadow-md transition hover:bg-rose-700 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-rose-300 focus-visible:ring-offset-2 active:scale-95 disabled:cursor-not-allowed disabled:border-rose-300 disabled:bg-rose-100 disabled:text-rose-700 disabled:shadow-none" aria-label="ส่งข้อความ" title="ส่งข้อความ">
+                      <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M22 2 11 13" /><path d="M22 2 15 22 11 13 2 9 22 2Z" /></svg>
                     </button>
                   </form>
                 </div>
               </div>
             </div>
-          </div>,
-          document.body
-        ) : null}
+          </ModalOverlay>) : null}
 
         <div className="smart-home-stack schedule-chat-card relative z-10 flex h-full min-h-0 w-full flex-col overflow-hidden">
           <div className="pointer-events-none absolute right-4 top-[178px] hidden w-[220px]">
@@ -919,13 +927,13 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
 
           <div className="relative z-30 flex h-[72px] shrink-0 items-center justify-between gap-3 border-b px-4 sm:px-6 lg:px-10" style={{ borderColor: 'var(--border)' }}>
             <div className="flex items-center gap-3">
-              <div className="grid h-10 w-10 shrink-0 place-items-center rounded-full shadow-md" style={{ background: 'var(--accent)', color: '#ffffff' }}>
+              <div className="grid h-10 w-10 shrink-0 place-items-center rounded-full shadow-md" style={{ background: '#000000', color: '#ffffff' }}>
                 <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="5" y="8" width="14" height="9" rx="4" /><path d="M12 8V5" /><path d="M8.5 12h.01M15.5 12h.01" /><path d="M9.5 16c1.2 1 3.8 1 5 0" /></svg>
               </div>
               <div className="flex flex-col justify-center"><p className="text-[15px] font-semibold leading-tight tracking-wide text-[color:var(--text)]">ผู้ช่วยเพิ่มตารางเรียน</p><p className="mt-0.5 flex items-center gap-1.5 text-[11px] font-medium text-[color:var(--muted)]"><span className="h-1.5 w-1.5 rounded-full bg-green-500 shadow-[0_0_4px_rgba(34,197,94,0.5)]" />ออนไลน์</p></div>
             </div>
             <div className="ml-auto flex items-center gap-3">
-            <button type="button" onClick={createNewChatRoom} className="inline-flex items-center gap-2 whitespace-nowrap rounded-full px-5 py-2.5 text-[14px] font-medium transition-all duration-300 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50" style={{ background: 'var(--accent)', color: '#ffffff', WebkitTextFillColor: '#ffffff', boxShadow: '0 4px 14px rgba(var(--accent-rgb),0.25)' }}>
+            <button type="button" onClick={createNewChatRoom} className="inline-flex items-center gap-2 whitespace-nowrap rounded-full px-5 py-2.5 text-[14px] font-medium transition-all duration-300 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50" style={{ background: '#000000', color: '#ffffff', WebkitTextFillColor: '#ffffff', boxShadow: '0 4px 14px rgba(0,0,0,0.25)' }}>
               <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg> เริ่มแชทใหม่
             </button>
             <button type="button" onClick={() => setHistoryOpen(prev => !prev)} className="inline-flex items-center gap-2 whitespace-nowrap rounded-full border border-white/40 bg-white/60 px-4 py-2.5 text-[14px] font-medium backdrop-blur-md transition-all duration-300 hover:bg-white" style={{ color: 'var(--text)', boxShadow: 'var(--shadow-soft)' }}>
@@ -949,19 +957,19 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                         <span className="whitespace-pre-wrap break-words">{lastUserPrompt}</span>
                       </div>
                     ) : null}
-                    <h2 className={`schedule-assistant-message whitespace-pre-wrap break-words font-normal leading-relaxed text-[color:var(--text)]`}>{assistantMessage}</h2>
-                    <p className="schedule-helper-text mt-4 inline-block rounded-full px-4 py-2 font-medium text-[color:var(--muted)]" style={{ background: 'var(--surface-3)' }}>ระบุชื่อวิชา วันเรียน เวลา ห้อง ภาคเรียน และปีการศึกษาได้เลย</p>
+                    <h2 className={`schedule-assistant-message whitespace-pre-wrap break-words font-medium leading-relaxed text-slate-950`}>{assistantMessage}</h2>
+                    <p className="schedule-helper-text mt-4 inline-block rounded-full px-4 py-2 font-semibold text-slate-900" style={{ background: 'var(--surface-3)' }}>ระบุชื่อวิชา วันเรียน คาบที่ เวลา ห้อง ภาคเรียน และปีการศึกษาได้เลย</p>
                     <details className="group mt-4 text-left">
-                    <summary className="mx-auto inline-flex cursor-pointer list-none items-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] font-medium text-[color:var(--muted)] transition hover:text-[color:var(--accent)]">
+                    <summary className="mx-auto inline-flex cursor-pointer list-none items-center gap-1.5 rounded-full px-3 py-1.5 text-[14px] font-semibold text-slate-900 transition hover:text-[color:var(--accent)]">
                       <span>ดูตัวอย่างคำสั่ง</span>
                       <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 transition group-open:rotate-180" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
                     </summary>
-                    <div className="schedule-examples mt-3 rounded-xl border p-4 font-normal" style={{ borderColor: 'var(--border)', background: 'var(--surface-3)', color: 'var(--muted)' }}>
-                      <p><span className="font-medium text-[color:var(--accent)]">ตัวอย่าง:</span> {currentAssistantPromptExample}</p>
-                      <p className="mt-2 whitespace-pre-wrap"><span className="font-medium text-[color:var(--accent)]">เพิ่มหลายวิชาในครั้งเดียว:</span><br />{currentAssistantPromptMultipleExample}</p>
-                      <p className="mt-2"><span className="font-medium text-[color:var(--accent)]">ลบวิชา:</span> พิมพ์ “ลบวิชา ชื่อวิชา” (ลบได้เมื่อไม่มีข้อมูลอื่นเชื่อมโยงอยู่)</p>
-                      <p className="mt-2"><span className="font-medium text-[color:var(--accent)]">เพิ่มตารางวิชา:</span> คณิตพื้นฐานคณิตศาสตร์</p>
-                      <p><span className="font-medium text-[color:var(--accent)]">ตรวจจากระบบ:</span> พิมพ์ “วิชาไหนอยู่เทอมอะไร”</p>
+                    <div className="schedule-examples mt-3 rounded-xl border p-4 font-medium text-slate-900" style={{ borderColor: 'var(--border)', background: 'var(--surface-3)' }}>
+                      <p><span className="font-semibold text-[color:var(--accent)]">ตัวอย่าง:</span> {currentAssistantPromptExample}</p>
+                      <p className="mt-2 whitespace-pre-wrap"><span className="font-semibold text-[color:var(--accent)]">เพิ่มหลายวิชาในครั้งเดียว:</span><br />{currentAssistantPromptMultipleExample}</p>
+                      <p className="mt-2"><span className="font-semibold text-[color:var(--accent)]">ลบวิชา:</span> พิมพ์ “ลบวิชา ชื่อวิชา” (ลบได้เมื่อไม่มีข้อมูลอื่นเชื่อมโยงอยู่)</p>
+                      <p className="mt-2"><span className="font-semibold text-[color:var(--accent)]">เพิ่มตารางวิชา:</span> คณิตพื้นฐานคณิตศาสตร์</p>
+                      <p><span className="font-semibold text-[color:var(--accent)]">ตรวจจากระบบ:</span> พิมพ์ “วิชาไหนอยู่เทอมอะไร”</p>
                     </div>
                     </details>
                   </>
@@ -981,10 +989,10 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                       ) : null}
                       <div
                         className={`w-fit min-w-[5rem] max-w-[80%] rounded-2xl px-4 py-2.5 text-[15px] leading-7 ${isAssistant ? 'rounded-bl-md border border-black/5 bg-white text-[color:var(--text)] shadow-[var(--shadow-soft)]' : 'rounded-br-md'}`}
-                        style={isAssistant ? undefined : { background: 'var(--accent)', color: '#ffffff' }}
+                        style={isAssistant ? undefined : { background: 'color-mix(in srgb, var(--accent) 68%, white)', color: '#111111' }}
                       >
                         <p className="whitespace-pre-wrap break-words">{isAssistant ? normalizeAssistantFallback(message.message) : message.message}</p>
-                        <p className="mt-1.5 text-[10px]" style={isAssistant ? { color: 'var(--muted)' } : { color: 'rgba(255,255,255,0.75)' }}>{formatChatMessageTime(message.created_at)}</p>
+                        <p className="mt-1.5 text-[10px]" style={isAssistant ? { color: 'var(--muted)' } : { color: 'rgba(17,17,17,0.65)' }}>{formatChatMessageTime(message.created_at)}</p>
                       </div>
                     </div>
                   );
@@ -1003,8 +1011,8 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
             )}
           </div>
 
-          <section className="smart-home-composer relative z-30 shrink-0 border-t px-4 pb-4 pt-3 sm:px-6 sm:pb-5 lg:px-10" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }} ref={attachmentTrayRef}>
-            <div className="relative mx-auto w-full max-w-4xl">
+          <section className="smart-home-composer relative z-30 shrink-0 border-t px-4 pb-4 pt-3 sm:px-6 sm:pb-5 lg:px-10 lg:pb-11" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }} ref={attachmentTrayRef}>
+            <div className="relative mx-auto w-full max-w-6xl">
               <div className={`absolute bottom-full left-0 mb-3 transition-all duration-200 ${attachmentTrayOpen ? 'translate-y-0 opacity-100' : 'pointer-events-none -translate-y-2 opacity-0'}`}>
                 <div className="inline-flex rounded-[1.6rem] px-5 py-4 ring-1" style={{ background: 'color-mix(in srgb, var(--surface) 94%, transparent)', borderColor: 'var(--border)' }}>
                   <div className="flex items-start gap-5">
@@ -1043,32 +1051,30 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                   </button>
                 ))}
                 <button type="button" onClick={() => appendAssistantTemplate(scheduleTemplate)} disabled={isThinking} className="group inline-flex items-center gap-2.5 rounded-full border border-black/5 bg-white px-5 py-2 text-[14px] font-medium text-[color:var(--text)] transition-all duration-300 hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-50" style={{ boxShadow: 'var(--shadow-soft)' }} aria-label="เพิ่มวิชาเดียว">
-                  <svg viewBox="0 0 24 24" className="h-[18px] w-[18px] text-[color:var(--accent)]" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z" /><path d="M14 3v6h6M8 13h8M8 17h5" /></svg><span className="hidden sm:inline">เพิ่มวิชาเดียว</span><span className="sm:hidden">เพิ่มวิชาเดียว</span>
+                  <svg viewBox="0 0 24 24" className="h-5 w-5 shrink-0 text-rose-600" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z" /><path d="M14 3v6h6M8 13h8M8 17h5" /></svg><span className="hidden sm:inline">เพิ่มวิชาเดียว</span><span className="sm:hidden">เพิ่มวิชาเดียว</span>
                 </button>
                 <button type="button" onClick={() => appendAssistantTemplate(multipleScheduleTemplate)} disabled={isThinking} className="group inline-flex items-center gap-2.5 rounded-full border border-black/5 bg-white px-5 py-2 text-[14px] font-medium text-[color:var(--text)] transition-all duration-300 hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-50" style={{ boxShadow: 'var(--shadow-soft)' }} aria-label="เพิ่มหลายวิชา">
-                  <svg viewBox="0 0 24 24" className="h-[18px] w-[18px] text-[color:var(--accent)]" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1" /><rect x="13" y="4" width="7" height="7" rx="1" /><rect x="4" y="13" width="7" height="7" rx="1" /><rect x="13" y="13" width="7" height="7" rx="1" /></svg><span>เพิ่มหลายวิชา</span>
+                  <svg viewBox="0 0 24 24" className="h-5 w-5 shrink-0 text-rose-600" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1" /><rect x="13" y="4" width="7" height="7" rx="1" /><rect x="4" y="13" width="7" height="7" rx="1" /><rect x="13" y="13" width="7" height="7" rx="1" /></svg><span>เพิ่มหลายวิชา</span>
                 </button>
               </div>
               <div className="lg:flex lg:items-end lg:gap-4">
               <form onSubmit={handleAssistantSubmit} className="flex items-end gap-2 sm:gap-4 lg:flex-1">
-                <div className="smart-home-input-shell flex min-h-[60px] flex-1 items-end rounded-[24px] border p-2" style={{ background: 'var(--surface)', borderColor: 'rgba(0,0,0,0.10)', boxShadow: 'var(--shadow-float)' }}>
-                  <button type="button" onClick={() => setAttachmentTrayOpen(prev => !prev)} className="smart-home-tool-button mr-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[color:var(--muted)] transition hover:bg-slate-100" aria-label="แนบไฟล์และเครื่องมือ">
+                <div className="smart-home-input-shell flex min-h-[88px] flex-1 items-end rounded-[28px] border p-3" style={{ background: 'var(--surface)', borderColor: 'rgba(0,0,0,0.10)', boxShadow: 'var(--shadow-float)' }}>
+                  <button type="button" onClick={() => setAttachmentTrayOpen(prev => !prev)} className="smart-home-tool-button mr-1 flex h-12 w-12 shrink-0 items-center justify-center rounded-full text-[color:var(--muted)] transition hover:bg-slate-100" aria-label="แนบไฟล์และเครื่องมือ">
                     {attachmentTrayOpen ? (<svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>) : (<svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>)}
                   </button>
-                  <textarea ref={assistantInputRef} value={inputText} onChange={event => setInputText(event.target.value)} placeholder={currentAssistantPromptExample} disabled={isThinking} rows={1} style={{ maxHeight: `${ASSISTANT_INPUT_MAX_HEIGHT}px` }} className="min-h-[28px] flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1 text-[14px] font-normal leading-7 text-[color:var(--text)] outline-none placeholder:text-[color:var(--muted)]" onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitAssistantPrompt(inputText); } }} />
-                  <button type="button" onClick={() => { if (isListening) { stopVoiceInput(); } else { startVoiceInput(); } }} disabled={!voiceInputSupported || isThinking} className={`smart-home-mic-button ml-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition disabled:cursor-not-allowed disabled:opacity-50 ${isListening ? 'bg-rose-50 text-rose-500' : 'text-[color:var(--muted)] hover:bg-slate-100'}`} aria-label={isListening ? 'หยุดฟังเสียง' : 'พูดเป็นข้อความ'} title={!voiceInputSupported ? 'อุปกรณ์นี้ไม่รองรับการพูดเป็นข้อความ' : isListening ? 'กำลังฟังอยู่' : 'พูดเป็นข้อความ'}>
+                  <textarea ref={assistantInputRef} value={inputText} onChange={event => setInputText(event.target.value)} aria-label="ข้อความถึงผู้ช่วย" disabled={isThinking} rows={2} style={{ maxHeight: `${ASSISTANT_INPUT_MAX_HEIGHT}px` }} className="min-h-[52px] flex-1 resize-none overflow-y-auto bg-transparent px-3 py-2 text-[16px] font-normal leading-7 text-[color:var(--text)] outline-none placeholder:text-[color:var(--muted)]" onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitAssistantPrompt(inputText); } }} />
+                  <button type="button" onClick={() => { if (isListening) { stopVoiceInput(); } else { startVoiceInput(); } }} disabled={!voiceInputSupported || isThinking} className={`smart-home-mic-button ml-1 flex h-12 w-12 shrink-0 items-center justify-center rounded-full transition disabled:cursor-not-allowed disabled:opacity-50 ${isListening ? 'bg-rose-50 text-rose-500' : 'text-[color:var(--muted)] hover:bg-slate-100'}`} aria-label={isListening ? 'หยุดฟังเสียง' : 'พูดเป็นข้อความ'} title={!voiceInputSupported ? 'อุปกรณ์นี้ไม่รองรับการพูดเป็นข้อความ' : isListening ? 'กำลังฟังอยู่' : 'พูดเป็นข้อความ'}>
                     {isListening ? (<span className="relative flex h-3 w-3"><span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-current/35" /><span className="relative inline-flex h-3 w-3 rounded-full bg-current" /></span>) : null}
-                    <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 10v2a7 7 0 0 0 14 0v-2" /><path d="M12 19v2" /></svg>
+                  <svg viewBox="0 0 24 24" className="h-7 w-7" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 10v2a7 7 0 0 0 14 0v-2" /><path d="M12 19v2" /></svg>
                   </button>
                 </div>
-                <button type="submit" disabled={!canSendChat} className="smart-home-send ml-2 flex h-11 w-11 shrink-0 items-center justify-center rounded-full transition active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-300" style={{ background: 'var(--accent)', color: '#ffffff', boxShadow: '0 4px 14px rgba(var(--accent-rgb),0.25)' }}>
-                  <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M22 2 11 13" /><path d="M22 2 15 22 11 13 2 9 22 2Z" /></svg>
+                <button type="submit" disabled={!canSendChat} className="smart-home-send ml-2 flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-rose-700 bg-rose-600 text-white shadow-md transition hover:bg-rose-700 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-rose-300 focus-visible:ring-offset-2 active:scale-95 disabled:cursor-not-allowed disabled:border-rose-300 disabled:bg-rose-100 disabled:text-rose-700 disabled:shadow-none" aria-label="ส่งข้อความ" title="ส่งข้อความ">
+                  <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M22 2 11 13" /><path d="M22 2 15 22 11 13 2 9 22 2Z" /></svg>
                 </button>
               </form>
               </div>
-              <div className="mt-3 text-center">
-                <span className="text-[11px] font-medium text-[color:var(--muted)]">Smart Room อาจแสดงข้อมูลที่ไม่ถูกต้อง โปรดตรวจสอบข้อมูลสำคัญอีกครั้ง</span>
-              </div>
+             
             </div>
           </section>
         </div>
@@ -1086,75 +1092,22 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
   }
 
   return (
-    <div className="relative overflow-hidden pb-16">
+    <div className="relative overflow-hidden pb-4">
       <div className="career-bg-blob career-blob-1" />
       <div className="career-bg-blob career-blob-2" />
       <div className="career-bg-blob career-blob-3" />
 
-      <div className="relative z-10 space-y-6">
+      <div className="relative z-10 space-y-3">
         {!isAuthenticated ? (
-          <div className="career-soft-card p-6 text-center text-muted shadow-soft">
+          <div className="career-soft-card p-4 text-center text-muted shadow-soft">
             กรุณาเข้าสู่ระบบเพื่อดูคำแนะนำอาชีพของคุณ
           </div>
         ) : (
           <>
-            {error ? (<div className="rounded-[2rem] border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-500 shadow-soft">{error}</div>) : null}
-            {info ? (<div className="rounded-[2rem] p-4 text-sm shadow-soft" style={{ border: '1px solid rgba(var(--accent-rgb),0.18)', background: 'rgba(var(--accent-rgb),0.10)', color: 'var(--accent-ink)' }}>{info}</div>) : null}
+            {error ? (<div className="rounded-2xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-500 shadow-soft">{error}</div>) : null}
+            {info ? (<div className="rounded-2xl p-4 text-sm shadow-soft" style={{ border: '1px solid rgba(var(--accent-rgb),0.18)', background: 'rgba(var(--accent-rgb),0.10)', color: 'var(--accent-ink)' }}>{info}</div>) : null}
 
-            <section
-              className="relative overflow-hidden rounded-[2rem] border p-5 shadow-soft md:p-6"
-              style={{
-                borderColor: 'rgba(var(--accent-rgb),0.25)',
-                background: 'linear-gradient(135deg, rgba(var(--accent-rgb),0.16), rgba(var(--accent-rgb),0.06))'
-              }}
-            >
-              <div className="pointer-events-none absolute inset-y-0 right-0 w-32 bg-[radial-gradient(circle_at_center,rgba(var(--accent-rgb),0.08),transparent_72%)]" />
-              <div className="relative z-10">
-                <div className="inline-flex items-center gap-2 rounded-full bg-[color:rgba(var(--accent-rgb),0.10)] px-3 py-1 text-[11px] font-bold text-[color:var(--accent-ink)] shadow-sm md:text-xs">
-                  <span className="inline-block h-2 w-2 rounded-full bg-[color:var(--accent)]" />
-                  วิเคราะห์จากผลแบบฝึกหัดทั้งหมด
-                </div>
-                {lastUpdated ? (
-                  <div className="mt-3 flex flex-wrap gap-2 text-[11px] font-semibold text-[color:var(--muted)] md:text-xs">
-                    <span className="rounded-full border px-3 py-1" style={{ borderColor: 'rgba(var(--accent-rgb),0.18)', background: 'rgba(var(--accent-rgb),0.07)' }}>
-                      อัปเดตล่าสุด {lastUpdated}
-                    </span>
-                    {analysisProvider ? (
-                      <span className="rounded-full border px-3 py-1" style={{ borderColor: 'rgba(var(--accent-rgb),0.18)', background: 'rgba(var(--accent-rgb),0.07)' }}>
-                        AI: {analysisProvider}
-                      </span>
-                    ) : null}
-                  </div>
-                ) : null}
-
-                <div className="mt-4 flex items-start justify-between gap-4">
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm leading-6 text-slate-500 md:text-base">เส้นทางอาชีพที่เหมาะกับคุณ</p>
-                    <h2 className={`mt-1 text-2xl font-black leading-tight tracking-[-0.03em] md:text-5xl ${recommendationTone.title}`}>
-                      {primaryRecommendation?.title ?? 'ยังไม่มีข้อมูลเพียงพอ'}
-                    </h2>
-                  </div>
-                  <div className="hidden h-16 w-16 shrink-0 items-center justify-center rounded-[1.4rem] border border-white/80 bg-white/85 text-[color:rgba(var(--accent-rgb),0.28)] shadow-sm sm:flex">
-                    <svg viewBox="0 0 24 24" className="h-8 w-8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M8 7V6a4 4 0 0 1 8 0v1" /><path d="M4 9a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" /><path d="M12 12h.01" /></svg>
-                  </div>
-                </div>
-
-                <div className="mt-5 flex items-center gap-3 md:gap-4">
-                  <div className={`h-3 flex-1 overflow-hidden rounded-full ${recommendationTone.track}`}>
-                    <div className={`h-full rounded-full ${recommendationTone.fill}`} style={{ width: `${primaryRecommendation?.score ?? 0}%` }} />
-                  </div>
-                  <span className={`w-20 shrink-0 text-xs font-medium leading-5 md:w-24 md:text-sm ${recommendationTone.label}`}>
-                    ระดับความเหมาะสม {primaryRecommendation ? `${primaryRecommendation.score}%` : '--'}
-                  </span>
-                </div>
-
-                <p className="mt-5 max-w-2xl text-sm leading-6 text-[color:var(--muted)] md:text-base md:leading-7">
-                  {primaryRecommendation?.reason ?? 'ระบบจะวิเคราะห์จากผลแบบฝึกหัดทั้งหมดที่ทำเสร็จ เพื่อแนะนำสายอาชีพที่เหมาะกับคุณ'}
-                </p>
-              </div>
-            </section>
-
-            <section className="rounded-[1.75rem] border p-4 shadow-soft md:p-5" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
+            <section className="rounded-xl border p-4 shadow-soft md:p-3" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
               <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
                 <div className="flex items-center gap-4 w-full md:w-auto">
                   <label className="text-muted font-semibold whitespace-nowrap">ภาคเรียน</label>
@@ -1162,7 +1115,7 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                     <button
                       type="button"
                       onClick={() => setSemesterMenuOpen(open => !open)}
-                      className="flex w-full cursor-pointer items-center justify-between rounded-xl border px-4 py-3 text-left text-sm text-[color:var(--text)] outline-none transition focus:border-[color:var(--accent)] focus:ring-4 focus:ring-[color:rgba(var(--accent-rgb),0.10)]"
+                      className="flex w-full cursor-pointer items-center justify-between rounded-xl border px-3 py-2 text-left text-sm text-[color:var(--text)] outline-none transition focus:border-[color:var(--accent)] focus:ring-4 focus:ring-[color:rgba(var(--accent-rgb),0.10)]"
                       style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
                       aria-haspopup="listbox"
                       aria-expanded={semesterMenuOpen}
@@ -1193,7 +1146,7 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                 </div>
 
                 <div className="flex flex-col items-stretch gap-2 md:items-end">
-                  <button type="button" onClick={analyzeNow} disabled={loading} className="inline-flex w-full items-center justify-center gap-2 rounded-xl px-6 py-3 font-bold shadow-[0_12px_24px_rgba(var(--accent-rgb),0.24)] transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-70 md:w-auto" style={{ background: 'var(--accent)', color: 'var(--on-accent)', WebkitTextFillColor: 'var(--on-accent)' }}>
+                  <button type="button" onClick={analyzeNow} disabled={loading} className="inline-flex w-full items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-bold shadow-[0_12px_24px_rgba(var(--accent-rgb),0.24)] transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-70 md:w-auto" style={{ background: 'var(--accent)', color: 'var(--on-accent)', WebkitTextFillColor: 'var(--on-accent)' }}>
                     <svg viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" /><path d="M16 16h5v5" /></svg>
                     {loading ? 'กำลังวิเคราะห์ด้วย AI...' : 'วิเคราะห์ใหม่ด้วย AI'}
                   </button>
@@ -1207,19 +1160,19 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
             </section>
 
             {recommendations.length === 0 ? (
-              <section className="rounded-[2rem] border p-6 text-center shadow-soft md:p-10" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
+              <section className="rounded-2xl border p-4 text-center shadow-soft md:p-5" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
                 <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-[color:rgba(var(--accent-rgb),0.10)] text-[color:var(--accent-ink)]">
                   <svg viewBox="0 0 24 24" className="h-8 w-8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" /><path d="M9 12h6M12 9v6" /></svg>
                 </div>
-                <h2 className="mt-5 text-2xl font-bold text-[color:var(--text)]">ยังไม่มีข้อมูลเพียงพอสำหรับแนะนำอาชีพ</h2>
+                <h2 className="mt-3 text-base font-bold text-[color:var(--text)]">ยังไม่มีข้อมูลเพียงพอสำหรับแนะนำอาชีพ</h2>
                 <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-[color:var(--muted)]">ทำแบบฝึกหัดในรายวิชาต่าง ๆ ให้เสร็จ ระบบจะนำทุกผลลัพธ์มาวิเคราะห์ความถนัดและแนะนำสายอาชีพที่เหมาะกับคุณ</p>
               </section>
             ) : (
-            <div className="rounded-[2rem] border p-4 md:p-6" style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}>
-              <div className="grid grid-cols-1 gap-6 xl:grid-cols-[2fr_1fr]">
-                <div className="flex flex-col gap-6">
+            <div className="rounded-2xl border p-4 md:p-3" style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}>
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_220px]">
+                <div className="flex flex-col gap-4">
                   <section
-                    className="relative overflow-hidden rounded-[40px] border p-7 md:min-h-[520px] md:p-10"
+                    className="relative overflow-hidden rounded-2xl border p-4  md:p-5"
                     style={{
                       borderColor: 'rgba(var(--accent-rgb),0.25)',
                       background: 'linear-gradient(135deg, rgba(var(--accent-rgb),0.16), rgba(var(--accent-rgb),0.06))',
@@ -1235,55 +1188,56 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                     <div className="pointer-events-none absolute right-14 bottom-[22%] grid grid-cols-4 gap-3 opacity-60">
                       {Array.from({ length: 12 }).map((_, index) => (<span key={`dot-${index}`} className="h-2 w-2 rounded-full bg-white/85" />))}
                     </div>
-                    <div className="absolute right-7 top-7 hidden h-[132px] w-[132px] items-center justify-center rounded-[34px] border-4 border-white/80 bg-white/55 text-5xl shadow-[0_20px_40px_rgba(var(--accent-rgb),0.18)] md:flex">💼</div>
+                    <div className="absolute right-7 top-4 hidden h-8 w-8 shrink-0 items-center justify-center rounded-2xl border-2 border-white/80 bg-white/55 text-3xl shadow-[0_20px_40px_rgba(var(--accent-rgb),0.18)] md:flex">💼</div>
 
                     <div className="relative z-10">
-                      <div className="inline-flex items-center gap-2 rounded-[1.75rem] border border-white/90 bg-white px-5 py-4 text-sm font-semibold text-[color:var(--accent-ink)] shadow-[0_10px_25px_rgba(var(--accent-rgb),0.10)] md:text-[1.05rem]">✨ สรุปคำแนะนำ</div>
-                      <p className="mt-10 text-lg leading-none text-[color:var(--muted)] md:mt-14 md:text-[1.7rem]">เส้นทางอาชีพที่เหมาะกับคุณ</p>
-                      <h2 className={`mt-3 text-4xl font-black leading-[0.98] tracking-[-0.04em] md:text-6xl ${recommendationTone.title}`}>{primaryRecommendation?.title ?? 'ยังไม่มีข้อมูลเพียงพอ'}</h2>
+                      {analysisProvider ? <p className="mb-2 pr-12 text-xs text-[color:var(--muted)]">AI: {analysisProvider}</p> : null}
+                      <div className="inline-flex items-center gap-2 rounded-xl border border-white/90 bg-white px-3 py-1.5 text-sm font-semibold text-[color:var(--accent-ink)] shadow-[0_10px_25px_rgba(var(--accent-rgb),0.10)] md:text-sm">✨ สรุปคำแนะนำ</div>
+                      <p className="mt-4 text-sm leading-6 text-[color:var(--muted)] md:mt-4 md:text-sm">เส้นทางอาชีพที่เหมาะกับคุณ</p>
+                      <h2 className={`mt-3 text-2xl font-black leading-snug tracking-[-0.03em] md:text-3xl ${recommendationTone.title}`}>{primaryRecommendation?.title ?? 'ยังไม่มีข้อมูลเพียงพอ'}</h2>
 
-                      <div className="mt-10 flex items-center gap-4 md:mt-14 md:gap-6">
-                        <div className={`h-4 md:h-5 flex-1 overflow-hidden rounded-full border border-white/90 ${recommendationTone.track} shadow-[inset_0_1px_0_rgba(255,255,255,0.9)]`}>
+                      <div className="mt-4 flex items-center gap-4 md:mt-4 md:gap-4">
+                        <div className={`h-2.5 flex-1 overflow-hidden rounded-full border border-white/90 ${recommendationTone.track} shadow-[inset_0_1px_0_rgba(255,255,255,0.9)]`}>
                           <div className={`h-full rounded-full ${recommendationTone.fill} shadow-[0_0_0_1px_rgba(255,255,255,0.35),inset_0_0_0_1px_rgba(255,255,255,0.35)]`} style={{ width: `${primaryRecommendation?.score ?? 0}%` }} />
                         </div>
-                        <span className="whitespace-nowrap text-sm font-medium text-[color:var(--accent-ink)] md:text-[1.05rem]">ระดับความเหมาะสม {primaryRecommendation ? `${primaryRecommendation.score}%` : '--'}</span>
+                        <span className="whitespace-nowrap text-sm font-medium text-[color:var(--accent-ink)] md:text-sm">ระดับความเหมาะสม {primaryRecommendation ? `${primaryRecommendation.score}%` : '--'}</span>
                       </div>
 
-                      <p className="mt-10 max-w-[880px] text-sm leading-relaxed text-[color:var(--muted)] md:mt-14 md:text-[1.15rem] md:leading-relaxed">{primaryRecommendation?.reason ?? 'ระบบจะวิเคราะห์จากผลแบบฝึกหัดทั้งหมดที่ทำเสร็จ เพื่อแนะนำสายอาชีพที่เหมาะกับคุณ'}</p>
+                      <p className="mt-4 max-w-[880px] text-sm leading-relaxed text-[color:var(--muted)] md:mt-4 md:text-sm md:leading-relaxed">{primaryRecommendation?.reason ?? 'ระบบจะวิเคราะห์จากผลแบบฝึกหัดทั้งหมดที่ทำเสร็จ เพื่อแนะนำสายอาชีพที่เหมาะกับคุณ'}</p>
                     </div>
                   </section>
 
-                  <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-                    <section className="rounded-[30px] border border-white/70 bg-white/60 p-6 backdrop-blur-2xl shadow-[0_10px_40px_rgba(120,130,255,.08)]">
+                  <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                    <section className="rounded-2xl border border-white/70 bg-white/60 p-4 backdrop-blur-2xl shadow-[0_10px_40px_rgba(120,130,255,.08)]">
                       <div className="flex items-start justify-between gap-3">
                         <div className="flex gap-3">
-                          <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-violet-100 text-xl text-violet-600">✦</div>
+                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl bg-violet-100 text-xl text-violet-600">✦</div>
                           <div>
-                            <h3 className="text-2xl font-bold text-slate-800">ทักษะที่ควรเริ่มพัฒนาก่อน</h3>
+                            <h3 className="text-base font-bold text-slate-800">ทักษะที่ควรเริ่มพัฒนาก่อน</h3>
                        
                           </div>
                         </div>
-                        <button type="button" className="flex h-10 w-10 items-center justify-center rounded-2xl bg-white text-xl shadow">›</button>
+                        <button type="button" className="flex h-7 w-7 shrink-0 items-center justify-center rounded-2xl bg-white text-xl shadow">›</button>
                       </div>
-                      <div className="mt-8 flex flex-wrap gap-3">
+                      <div className="mt-3 flex flex-wrap gap-3">
                         {prioritizedSkills.length ? (
-                          prioritizedSkills.slice(0, 6).map(skill => (<span key={`skill-${skill}`} className="rounded-2xl border border-violet-100 bg-violet-50 px-5 py-3 font-medium text-violet-600">{skill}</span>))
+                          prioritizedSkills.slice(0, 6).map(skill => (<span key={`skill-${skill}`} className="rounded-2xl border border-violet-100 bg-violet-50 px-3 py-1.5 text-sm font-medium text-violet-600">{skill}</span>))
                         ) : (<span className="text-sm text-slate-500">ยังไม่มีข้อมูลทักษะแนะนำ</span>)}
                       </div>
                     </section>
 
-                    <section className="rounded-[30px] border border-white/70 bg-white/60 p-6 backdrop-blur-2xl shadow-[0_10px_40px_rgba(120,130,255,.08)]">
+                    <section className="rounded-2xl border border-white/70 bg-white/60 p-4 backdrop-blur-2xl shadow-[0_10px_40px_rgba(120,130,255,.08)]">
                       <div className="flex items-start justify-between gap-3">
                         <div className="flex gap-3">
-                          <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-cyan-100 text-xl text-cyan-600">📈</div>
+                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl bg-cyan-100 text-xl text-cyan-600">📈</div>
                           <div>
-                            <h3 className="text-2xl font-bold text-slate-800">วิชาที่ AI ใช้อ้างอิง</h3>
+                            <h3 className="text-base font-bold text-slate-800">วิชาที่ AI ใช้อ้างอิง</h3>
                           
                           </div>
                         </div>
-                        <div className="rounded-2xl border bg-white px-4 py-2 text-slate-600">ข้อมูลจริง</div>
+                        <div className="rounded-2xl border bg-white px-2 py-1 text-xs text-slate-600">ข้อมูลจริง</div>
                       </div>
-                      <div className="mt-6 rounded-2xl border bg-white/45 p-5" style={{ borderColor: 'rgba(148,163,184,.22)' }}>
+                      <div className="mt-3 rounded-2xl border bg-white/45 p-2" style={{ borderColor: 'rgba(148,163,184,.22)' }}>
                         {primaryRecommendation?.subjects ? (
                           <div className="flex flex-wrap gap-3">
                             {primaryRecommendation.subjects.split(',').map(subject => subject.trim()).filter(Boolean).map(subject => (
@@ -1292,21 +1246,21 @@ export const CareerAdvisorPage = ({ mode = 'career' }: CareerAdvisorPageProps) =
                           </div>
                         ) : (<p className="text-sm text-slate-500">ยังไม่มีรายวิชาที่ AI ใช้อ้างอิงในคำแนะนำล่าสุด</p>)}
                       </div>
-                      <div className="mt-4 inline-flex rounded-2xl border border-cyan-100 bg-cyan-50 px-5 py-3 text-slate-700">
+                      <div className="mt-4 inline-flex rounded-2xl border border-cyan-100 bg-cyan-50 px-3 py-1.5 text-sm text-slate-700">
                         {primaryRecommendation?.subjects ? `AI อ้างอิงจากวิชา ${primaryRecommendation.subjects}` : 'ระบบจะแสดงรายวิชาที่ AI ใช้อ้างอิงเมื่อวิเคราะห์สำเร็จ'}
                       </div>
                     </section>
                   </div>
                 </div>
 
-                <aside className="rounded-[34px] border border-white/70 bg-white/60 p-6 backdrop-blur-2xl shadow-[0_10px_40px_rgba(120,130,255,.08)]">
-                  <h3 className="text-2xl font-bold text-violet-600">✦ ควิซล่าสุด</h3>
-                  <div className="mt-5 flex items-end justify-between gap-4">
+                <aside className="rounded-2xl border border-white/70 bg-white/60 p-4 backdrop-blur-2xl shadow-[0_10px_40px_rgba(120,130,255,.08)]">
+                  <h3 className="text-base font-bold text-violet-600">✦ ภาพรวมผลการเรียน</h3>
+                  <div className="mt-3 flex items-end justify-between gap-4">
                     <div>
-                      <p className="text-slate-500">คะแนนควิซล่าสุด</p>
-                      <p className="mt-1 text-slate-400">ผ่านไป {latestQuiz ? 1 : 0} ควิซ</p>
+                      <p className="text-slate-500">คะแนนเฉลี่ยจากทุกครั้งที่ทำข้อสอบ</p>
+                      <p className="mt-1 text-slate-400">ทำแล้ว {quizOverview?.attempt_count ?? 0} ครั้ง · วิเคราะห์รวมทุกรายวิชา</p>
                     </div>
-                    <div className="text-5xl font-bold text-violet-600">{latestQuiz?.percentage ?? 0}%</div>
+                    <div className="text-3xl font-bold text-violet-600">{quizOverview?.average_score != null ? `${quizOverview.average_score}%` : '—'}</div>
                   </div>
                 </aside>
               </div>
@@ -1466,8 +1420,8 @@ export const ColorPicker = ({ initialHex = '#8b5cf6', onChange, onClose }: { ini
   const indicatorY = Math.sin(angleRad) * hsv.s * 50;
 
   return (
-    <div
-      className="fixed inset-0 z-[10000] flex items-center justify-center p-4 backdrop-blur-[18px]"
+    <ModalOverlay
+      className="fixed inset-0 flex items-center justify-center p-4 backdrop-blur-[18px]"
       style={{
         background: 'radial-gradient(circle at top, rgba(244,232,255,0.84) 0%, rgba(255,255,255,0.96) 32%, rgba(226,236,255,0.92) 100%)',
       }}
@@ -1578,7 +1532,7 @@ export const ColorPicker = ({ initialHex = '#8b5cf6', onChange, onClose }: { ini
           </div>
         </div>
       </div>
-    </div>
+    </ModalOverlay>
   );
 };
 

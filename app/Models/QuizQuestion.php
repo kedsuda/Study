@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use JsonException;
+use App\Support\ThaiText;
 
 class QuizQuestion extends Model
 {
@@ -36,7 +37,56 @@ class QuizQuestion extends Model
             return null;
         }
 
-        return is_array($decoded) ? $decoded : null;
+        if (! is_array($decoded)) {
+            return null;
+        }
+
+        $options = $this->hasAnswerIndexOption($decoded) ? array_slice($decoded, 1) : $decoded;
+
+        $context = (string) ($this->attributes['question_text'] ?? '');
+        return array_map(static fn ($option) => is_string($option) ? ThaiText::repair($option, $context) : $option, $options);
+    }
+
+    public function getCorrectAnswerAttribute($value): mixed
+    {
+        $options = json_decode($this->attributes['options'] ?? 'null', true);
+
+        if (is_array($options) && $this->hasAnswerIndexOption($options)) {
+            return ThaiText::repair($options[(int) $value], (string) ($this->attributes['question_text'] ?? ''));
+        }
+
+        return is_string($value) ? ThaiText::repair($value, (string) ($this->attributes['question_text'] ?? '')) : $value;
+    }
+
+    public function getQuestionTextAttribute($value): mixed
+    {
+        return is_string($value) ? ThaiText::repair($value) : $value;
+    }
+
+    public function getExplanationAttribute($value): mixed
+    {
+        return is_string($value) ? ThaiText::repair($value) : $value;
+    }
+
+    private function hasAnswerIndexOption(array $options): bool
+    {
+        $answer = trim((string) ($this->attributes['correct_answer'] ?? ''));
+        if ($this->question_type !== 'multiple_choice'
+            || ! preg_match('/^[1-9][0-9]*$/', $answer)
+            || (string) ($options[0] ?? '') !== $answer
+            || ! isset($options[(int) $answer])
+            || count($options) < 3) {
+            return false;
+        }
+
+        // Legacy quizzes prepended an answer index to otherwise textual options.
+        foreach (array_slice($options, 1) as $option) {
+            if (! is_string($option) || is_numeric(trim($option))) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     public function setOptionsAttribute($value): void
@@ -86,7 +136,7 @@ class QuizQuestion extends Model
             $value = function_exists('mb_scrub') ? mb_scrub($value, 'UTF-8') : $value;
         }
 
-        return trim($value);
+        return trim(ThaiText::repair($value));
     }
 
     public function quiz()

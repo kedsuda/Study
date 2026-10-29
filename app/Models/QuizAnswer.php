@@ -33,11 +33,13 @@ class QuizAnswer extends Model
         'is_correct',
         'score',
         'metadata',
+        'answered_at',
     ];
 
     protected $casts = [
         'is_correct' => 'boolean',
         'metadata' => 'array',
+        'answered_at' => 'datetime',
     ];
 
     public function question()

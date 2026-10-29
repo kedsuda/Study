@@ -7,6 +7,7 @@ use App\Models\User;
 use Carbon\Carbon;
 use Carbon\CarbonPeriod;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -15,6 +16,11 @@ class LearningStatsController extends Controller
 {
     public function summary(): JsonResponse
     {
+        request()->validate([
+            'subject_id' => ['nullable', 'integer', 'min:1'],
+            'academic_year' => ['nullable', 'integer', 'min:1'],
+            'semester' => ['nullable', 'integer', 'min:1'],
+        ]);
         $user = request()->user();
         $timezone = config('app.timezone', 'Asia/Bangkok');
         $now = Carbon::now($timezone);
@@ -80,6 +86,8 @@ class LearningStatsController extends Controller
             });
         }
 
+        $this->applyAcademicFilter($query);
+
         return $query
             ->select(
                 'study_logs.id',
@@ -124,11 +132,33 @@ class LearningStatsController extends Controller
             )
             ->orderBy('quiz_attempts.created_at');
 
+        $this->applyAcademicFilter($query);
+
         return $query->get()->map(function ($attempt) {
             $totalQuestions = max(0, (int) ($attempt->total_questions ?? 0));
             $score = (int) ($attempt->score ?? 0);
             $attempt->percentage = $totalQuestions > 0 ? round(($score / $totalQuestions) * 100, 1) : null;
             return $attempt;
+        });
+    }
+
+    private function applyAcademicFilter(Builder $query): void
+    {
+        if (request()->filled('subject_id')) {
+            $query->where('subjects.id', (int) request()->query('subject_id'));
+        }
+        if (! request()->filled('academic_year') && ! request()->filled('semester')) {
+            return;
+        }
+
+        $query->whereExists(function (Builder $semester) {
+            $semester->selectRaw('1')->from('semester')
+                ->whereColumn('semester.semester_id', 'subjects.semester_id');
+            foreach (['academic_year', 'semester'] as $field) {
+                if (request()->filled($field)) {
+                    $semester->where('semester.'.$field, (int) request()->query($field));
+                }
+            }
         });
     }
 
@@ -230,15 +260,20 @@ class LearningStatsController extends Controller
                 DB::table('study_logs')
                     ->join('subjects', 'study_logs.subject_id', '=', 'subjects.id')
                     ->where('subjects.user_id', $user->id)
+                    ->tap(fn (Builder $query) => $this->applyAcademicFilter($query))
                     ->pluck('study_logs.log_date')
             );
         }
 
-        if (Schema::hasTable('quiz_attempts')) {
+        if (Schema::hasTable('quiz_attempts') && Schema::hasTable('quizzes') && Schema::hasTable('subjects')) {
             $dates = $dates->merge(
                 DB::table('quiz_attempts')
-                    ->where('user_id', $user->id)
-                    ->selectRaw('DATE(created_at) as activity_date')
+                    ->join('quizzes', 'quiz_attempts.quiz_id', '=', 'quizzes.id')
+                    ->join('subjects', 'quizzes.subject_id', '=', 'subjects.id')
+                    ->where('quiz_attempts.user_id', $user->id)
+                    ->where('subjects.user_id', $user->id)
+                    ->tap(fn (Builder $query) => $this->applyAcademicFilter($query))
+                    ->selectRaw('DATE(quiz_attempts.created_at) as activity_date')
                     ->pluck('activity_date')
             );
         }

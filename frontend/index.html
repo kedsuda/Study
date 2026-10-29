@@ -5,8 +5,19 @@
     <link rel="icon" type="image/png" href="%BASE_URL%img/admin.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Smart Learning Tracker</title>
+    <script>
+      // Apply the saved theme before the first paint.
+      (() => {
+        let theme;
+        try { theme = localStorage.getItem('smart-classroom-theme'); } catch {}
+        if (theme !== 'dark' && theme !== 'light') {
+          theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.classList.add('theme-' + theme);
+      })();
+    </script>
   </head>
-  <body class="bg-slate-950 text-slate-100">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

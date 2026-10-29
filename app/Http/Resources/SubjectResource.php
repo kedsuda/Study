@@ -97,7 +97,7 @@ class SubjectResource extends JsonResource
         $startTime = $this->start_time;
         $endTime = $this->end_time;
 
-        if ($startDate || ! $this->hasCalendarTable()) {
+        if (($startDate && $startTime && $endTime) || ! $this->hasCalendarTable()) {
             return [$startDate, $startTime, $endTime];
         }
 
@@ -107,9 +107,10 @@ class SubjectResource extends JsonResource
         }
 
         $allDay = (bool) (data_get($event->metadata, 'all_day', false));
-        $startDate = $event->start_time?->toDateString();
-        $startTime = $allDay ? null : $event->start_time?->format('H:i:s');
-        $endTime = $allDay ? null : $event->end_time?->format('H:i:s');
+        $timezone = config('app.timezone', 'Asia/Bangkok');
+        $startDate = $startDate ?: $event->start_time?->copy()->shiftTimezone($timezone)->toDateString();
+        $startTime = $startTime ?: ($allDay ? null : $event->start_time?->copy()->shiftTimezone($timezone)->format('H:i:s'));
+        $endTime = $endTime ?: ($allDay ? null : $event->end_time?->copy()->shiftTimezone($timezone)->format('H:i:s'));
 
         return [$startDate, $startTime, $endTime];
     }

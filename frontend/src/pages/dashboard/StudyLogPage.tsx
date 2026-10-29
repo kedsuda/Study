@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useParams } from 'react-router-dom';
+import { Link, useLocation, useParams } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 import { format } from 'date-fns';
 import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker';
 import { BookOpen, Calendar, FileText, LoaderCircle, Send, Sparkles } from 'lucide-react';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
+import { ExpandableText } from '../../components/ExpandableText';
 import { api, assetBaseURL } from '../../services/api';
 import { getLastSubjectKey } from '../../constants/storage';
 import { useAppAlert } from '../../context/AppAlertContext';
 import { useAuth } from '../../context/AuthContext';
-import { downloadStudyFileBlob, isSupabaseStudyFilePath, resolveStudyFileUrl, uploadStudyFileToSupabase } from '../../utils/studyFiles';
+import { downloadStudyFileBlob, isSupabaseStudyFilePath, resolveStudyFileUrl } from '../../utils/localStudyFiles';
 
 interface Subject {
   id: number;
@@ -174,6 +175,7 @@ export const StudyLogPage = () => {
   const { user } = useAuth();
   const { success, error } = useAppAlert();
   const { subjectId } = useParams();
+  const [, setSharedSubjectId] = useSharedSubjectSelection();
   const location = useLocation();
   const [subject, setSubject] = useState<Subject | null>(null);
   const [logs, setLogs] = useState<StudyLog[]>([]);
@@ -194,8 +196,9 @@ export const StudyLogPage = () => {
   useEffect(() => {
     if (subjectId) {
       localStorage.setItem(lastSubjectKey, subjectId);
+      setSharedSubjectId(subjectId);
     }
-  }, [subjectId, lastSubjectKey]);
+  }, [subjectId, lastSubjectKey, setSharedSubjectId]);
   const {
     register,
     handleSubmit,
@@ -262,38 +265,10 @@ export const StudyLogPage = () => {
   };
 
   const uploadFile = async (logId: number, file: File) => {
-    if (!subject) {
-      error('ไม่พบข้อมูลวิชา');
-      return;
-    }
-
     try {
-      let response;
-      try {
-        const uploaded = await uploadStudyFileToSupabase({
-          file,
-          userId: user?.id,
-          subject: {
-            id: subject.id,
-            name: subject.name,
-            semester: subject.semester,
-            academic_year: subject.academic_year,
-          },
-        });
-
-        response = await api.post<StudyFile>(`/study-logs/${logId}/files`, {
-          original_name: file.name,
-          storage_path: uploaded.storagePath,
-          file_type: uploaded.fileType,
-          mime_type: file.type || null,
-          file_size: file.size,
-        });
-      } catch (storageError) {
-        console.warn('supabase upload failed, falling back to local storage', storageError);
-        const uploadForm = new FormData();
-        uploadForm.append('file', file, file.name);
-        response = await api.post<StudyFile>(`/study-logs/${logId}/files`, uploadForm);
-      }
+      const uploadForm = new FormData();
+      uploadForm.append('file', file, file.name);
+      const response = await api.post<StudyFile>(`/study-logs/${logId}/files`, uploadForm);
 
       const filePayload = (response.data as any)?.data ?? response.data;
       setLogs(prev =>
@@ -449,7 +424,7 @@ export const StudyLogPage = () => {
   }
 
   return (
-    <div className="mx-auto w-full max-w-[1160px] rounded-[2rem] border border-pink-100 bg-white/95 p-5 text-[color:var(--text)] shadow-[0_18px_55px_rgba(236,72,153,0.10)]">
+    <div className="w-full rounded-[2rem] border border-pink-100 bg-white/95 p-5 text-[color:var(--text)] shadow-[0_18px_55px_rgba(236,72,153,0.10)]">
       <section className="relative overflow-hidden rounded-[1.35rem] bg-gradient-to-r from-pink-500 via-pink-400 to-pink-500 px-6 py-5 text-white shadow-[0_20px_45px_rgba(236,72,153,0.24)]">
         <div className="absolute right-6 top-4 hidden text-white/20 sm:block">
           <BookOpen size={86} strokeWidth={1.2} />
@@ -460,7 +435,16 @@ export const StudyLogPage = () => {
           </div>
           <div className="min-w-0">
             <p className="text-[10px] font-bold uppercase tracking-[0.36em] text-white/75">Subject Timeline</p>
-            <h2 className="mt-1 truncate text-2xl font-black leading-tight md:text-3xl">{subject.name}</h2>
+            <div className="mt-1 flex flex-wrap items-center gap-3">
+              <h2 className="min-w-0 truncate text-2xl font-black leading-tight md:text-3xl">{subject.name}</h2>
+              <Link
+                to={`/subjects?edit=${subject.id}`}
+                aria-label={`เปลี่ยนชื่อรายวิชา ${subject.name}`}
+                className="shrink-0 rounded-lg border border-white/40 bg-white/15 px-3 py-1.5 text-xs font-semibold transition hover:bg-white/25 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+              >
+                เปลี่ยนชื่อรายวิชา
+              </Link>
+            </div>
             <p className="mt-1 text-xs font-semibold text-white/90">{subject.description ?? 'ติดตามและบันทึกความก้าวหน้าของคุณได้ที่นี่'}</p>
           </div>
         </div>
@@ -628,9 +612,9 @@ export const StudyLogPage = () => {
                 <h3 className="text-lg font-black text-slate-900">{currentLog.title}</h3>
                 <p className="text-xs font-semibold text-slate-500">{format(new Date(currentLog.log_date), 'EEEE d MMM yyyy')}</p>
               </header>
-              <p className="mt-3 whitespace-pre-line rounded-xl bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-600">
-                {currentLog.note || 'ไม่มีโน้ต'}
-              </p>
+              <div className="mt-3 rounded-xl bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-600">
+                <ExpandableText key={currentLog.id} text={currentLog.note || 'ไม่มีโน้ต'} />
+              </div>
 
               <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(280px,0.9fr),minmax(0,1.1fr)]">
                 <div className="rounded-xl border border-pink-100 bg-white p-4">
@@ -701,7 +685,7 @@ export const StudyLogPage = () => {
                     <div className="mt-3 space-y-2">
                       {currentLog.summaries.map(summary => (
                         <div key={summary.id} className="rounded-xl border border-pink-100 bg-white px-4 py-3 text-sm leading-6 text-slate-700">
-                          <p className="whitespace-pre-line">{summary.content}</p>
+                          <ExpandableText text={summary.content} />
                           <p className="mt-2 text-[11px] font-semibold text-slate-400">
                             {summary.ai_model ? `Model: ${summary.ai_model}` : 'AI summary'}
                           </p>
@@ -732,3 +716,4 @@ export const StudyLogPage = () => {
     </div>
   );
 };
+import { useSharedSubjectSelection } from '../../hooks/useAcademicSelection';

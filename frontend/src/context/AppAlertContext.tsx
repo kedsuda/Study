@@ -42,7 +42,7 @@ export const AppAlertProvider = ({ children }: PropsWithChildren) => {
     <AppAlertContext.Provider value={value}>
       {children}
 
-      <div className="pointer-events-none fixed left-1/2 top-5 z-[90] flex w-[min(92vw,380px)] -translate-x-1/2 flex-col gap-3 sm:top-6">
+      <div className="pointer-events-none fixed left-1/2 top-5 z-[12000] flex w-[min(92vw,380px)] -translate-x-1/2 flex-col gap-3 sm:top-6">
         {alerts.map(alert => (
           <div key={alert.id} className="pointer-events-auto">
             <div

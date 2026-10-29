@@ -16,6 +16,7 @@ import {
   YAxis,
 } from 'recharts';
 import { api } from '../../services/api';
+import { useAcademicSearchParams } from '../../hooks/useAcademicSelection';
 
 type Totals = {
   study_sessions: number;
@@ -154,6 +155,10 @@ const ProgressBar = ({ value, tone = 'bg-gradient-to-r from-indigo-500 to-violet
 );
 
 export const LearningStatsPage = () => {
+  const [academicParams] = useAcademicSearchParams();
+  const academicYear = academicParams.get('academic_year') ?? '';
+  const semester = academicParams.get('semester') ?? '';
+  const subjectId = academicParams.get('subject') ?? '';
   const [stats, setStats] = useState<LearningStats | null>(null);
   const [days, setDays] = useState(14);
   const [loading, setLoading] = useState(false);
@@ -167,7 +172,9 @@ export const LearningStatsPage = () => {
       setLoading(true);
       setError(null);
       setStats(null);
-      const res = await api.get<LearningStats>('/learning-stats/summary', { params: { days: requestedDays } });
+      const res = await api.get<LearningStats>('/learning-stats/summary', {
+        params: { days: requestedDays, academic_year: academicYear || undefined, semester: semester || undefined, subject_id: subjectId || undefined },
+      });
 
       if (requestId !== latestRequestRef.current) return;
       setStats(res.data);
@@ -183,7 +190,8 @@ export const LearningStatsPage = () => {
 
   useEffect(() => {
     void loadStats(days);
-  }, [days]);
+    return () => { latestRequestRef.current += 1; };
+  }, [days, academicYear, semester, subjectId]);
 
   const chartData = useMemo<ChartPoint[]>(
     () =>
@@ -202,12 +210,12 @@ export const LearningStatsPage = () => {
   const chartTickInterval = Math.max(0, Math.ceil(chartData.length / 8) - 1);
 
   return (
-  <div className="relative mx-auto max-w-7xl pb-8 text-slate-800" style={{ fontFamily: "'Kanit', var(--font-body)" }}>
+  <div className="relative w-full pb-8 text-slate-800">
       <section className="relative overflow-hidden rounded-3xl border border-slate-200 bg-white px-5 py-7 text-slate-900 shadow-sm sm:px-8 sm:py-8">
         <div className="relative flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
           <div>
           
-            <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">สถิติการเรียน</h1>
+            <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">สถิติการทำข้อสอบ</h1>
        
           </div>
         </div>

@@ -1,3 +1,4 @@
+import { useSharedSemesterSelection, useSharedSubjectSelection } from '../../hooks/useAcademicSelection';
 import { TimePicker } from '../../components/TimePicker';
 import axios from 'axios';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -22,7 +23,7 @@ import {
   markLocalNotificationAsRead,
   updateLocalNotificationTime,
 } from '../../services/localNotifications';
-import { useDefaultSemesterSelection, useSemesterOptions } from '../../hooks/useSemesterOptions';
+import { useSemesterOptions } from '../../hooks/useSemesterOptions';
 import { filterBySemester, toNumberOrNull } from '../../utils/semester';
 import { subscribeSubjectsUpdated } from '../../utils/subjectSync';
 
@@ -178,7 +179,6 @@ export const NotificationPage = () => {
   const { user } = useAuth();
   const [notifications, setNotifications] = useState<StudyNotification[]>([]);
   const [subjects, setSubjects] = useState<Subject[]>([]);
-  const [selectedSemesterKey, setSelectedSemesterKey] = useState('all');
   const [subjectsLoading, setSubjectsLoading] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [createSubjectId, setCreateSubjectId] = useState('');
@@ -192,7 +192,7 @@ export const NotificationPage = () => {
   const [editingDate, setEditingDate] = useState('');
   const [savingId, setSavingId] = useState<number | null>(null);
   const semesterOptions = useSemesterOptions();
-  useDefaultSemesterSelection(semesterOptions, selectedSemesterKey, setSelectedSemesterKey);
+  const [selectedSemesterKey, setSelectedSemesterKey] = useSharedSemesterSelection(semesterOptions);
   const createDatePickerRef = useRef<HTMLInputElement | null>(null);
   const editDatePickerRef = useRef<HTMLInputElement | null>(null);
 
@@ -205,7 +205,9 @@ export const NotificationPage = () => {
   const isStudyNotification = (notification: StudyNotification) =>
     isScheduleTimedNotification(notification) || notification.type === 'subject_reminder';
 
-  const baseNotifications = useMemo(() => notifications, [notifications]);
+  const [selectedSubjectId, setSelectedSubjectId] = useSharedSubjectSelection();
+  useEffect(() => { setCreateSubjectId(selectedSubjectId); }, [selectedSubjectId]);
+  const baseNotifications = useMemo(() => notifications.filter(item => !selectedSubjectId || !item.subject_id || String(item.subject_id) === selectedSubjectId), [notifications, selectedSubjectId]);
   const allNotifications = useMemo(
     () => baseNotifications.filter(isStudyNotification),
     [baseNotifications]
@@ -617,7 +619,7 @@ export const NotificationPage = () => {
   );
 
   return (
-    <div className="mx-auto w-full max-w-6xl space-y-6 pb-14 text-[color:var(--text)]">
+    <div className="w-full space-y-6 pb-14 text-[color:var(--text)]">
       <section className="rounded-[2rem] border border-[color:var(--border)] bg-[color:color-mix(in_srgb,var(--surface)_90%,white_10%)] p-6 shadow-[0_10px_38px_rgba(0,0,0,0.06)] backdrop-blur-xl">
         <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
           <div className="flex items-start gap-3">
@@ -673,7 +675,7 @@ export const NotificationPage = () => {
                   <label className="text-sm text-muted">วิชา</label>
                   <select
                     value={createSubjectId}
-                    onChange={e => setCreateSubjectId(e.target.value)}
+                    onChange={e => { setCreateSubjectId(e.target.value); setSelectedSubjectId(e.target.value); }}
                     className="mt-2 w-full rounded-xl border border-muted surface-2 px-3 py-2 text-sm shadow-sm outline-none focus:border-[color:var(--accent)] focus:ring-2 focus:ring-[color:var(--accent)]/20"
                   >
                     <option value="">เลือกวิชา...</option>

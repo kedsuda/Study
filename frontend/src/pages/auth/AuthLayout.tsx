@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Outlet } from 'react-router-dom';
+import { Sun, Moon } from 'phosphor-react';
+import { useTheme } from '../../context/ThemeContext';
 
 export const AuthLayout = () => {
+  const { theme, setTheme } = useTheme();
   const imageCandidates = useMemo(() => {
     if (typeof window === 'undefined') {
       return ['/img/login.jpg', '/app/img/login.jpg'];
@@ -30,22 +33,16 @@ export const AuthLayout = () => {
   const [imageIndex, setImageIndex] = useState(0);
 
   useEffect(() => {
-    const root = document.documentElement;
     const body = document.body;
-
-    root.classList.remove('theme-dark');
-    body.classList.remove('theme-dark');
-    root.classList.add('theme-light');
-    body.classList.add('theme-light');
+    body.classList.add('user-area');
 
     return () => {
-      root.classList.remove('theme-light');
-      body.classList.remove('theme-light');
+      body.classList.remove('user-area');
     };
   }, []);
 
   return (
-    <div className="min-h-screen bg-[#f5fbff]">
+    <div className="auth-layout min-h-screen bg-[color:var(--bg)]">
       <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[1.02fr_1fr]">
         <div className="relative min-h-[260px] overflow-hidden lg:min-h-screen">
           <img
@@ -62,7 +59,7 @@ export const AuthLayout = () => {
               backgroundImage: 'linear-gradient(to bottom, rgba(2, 6, 23, 0.38), rgba(2, 6, 23, 0.48), rgba(2, 6, 23, 0.68))'
             }}
           />
-          <div className="absolute left-[8%] top-[10%] text-white drop-shadow-[0_8px_24px_rgba(0,0,0,0.18)] lg:left-[12%] lg:top-[9%]">
+          <div className="user-text-inverse absolute left-[8%] top-[10%] text-white drop-shadow-[0_8px_24px_rgba(0,0,0,0.18)] lg:left-[12%] lg:top-[9%]">
             <p className="text-5xl font-bold tracking-tight drop-shadow-[0_4px_12px_rgba(0,0,0,0.18)] sm:text-6xl lg:text-7xl">
               Smart Learning
             </p>
@@ -70,6 +67,16 @@ export const AuthLayout = () => {
         </div>
 
         <div className="relative flex items-center justify-center overflow-hidden bg-white px-6 py-14 md:px-12">
+          <button
+            type="button"
+            onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+            aria-label={theme === 'dark' ? 'เปลี่ยนเป็นโหมดสว่าง' : 'เปลี่ยนเป็นโหมดมืด'}
+            aria-pressed={theme === 'dark'}
+            className="absolute right-5 top-4 z-20 flex items-center gap-2 rounded-full border border-muted surface px-4 py-2 text-sm text-[color:var(--text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
+          >
+            {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
+            {theme === 'dark' ? 'โหมดสว่าง' : 'โหมดมืด'}
+          </button>
           <div className="relative z-10 w-full max-w-[470px]">
             <Outlet />
           </div>

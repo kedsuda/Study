@@ -517,6 +517,26 @@ if ($conn) {
         mysqli_free_result($result);
     }
 
+    // My Goals stores checkbox activities separately from legacy numeric goals.
+    if (admin_table_exists($conn, 'goal_tasks')) {
+        $result = admin_db_query($conn, 'SELECT id, user_id, title, task_date, completed FROM goal_tasks ORDER BY task_date ASC, id ASC');
+        if ($result) {
+            while ($row = mysqli_fetch_assoc($result)) {
+                $learningGoals[] = [
+                    'id' => 'task-' . $row['id'],
+                    'user_id' => $row['user_id'],
+                    'title' => $row['title'],
+                    'target_value' => 1,
+                    'current_value' => (int) !empty($row['completed']),
+                    'status' => !empty($row['completed']) ? 'completed' : 'pending',
+                    'period_start' => $row['task_date'],
+                    'term_key' => admin_term_key_from_date($row['task_date']),
+                ];
+            }
+            mysqli_free_result($result);
+        }
+    }
+
     if (admin_table_exists($conn, 'learning_goal_targets')) {
         $result = admin_db_query($conn, 'SELECT id, user_id, subject_id, period_type, title, target_value, current_value, status, period_start, period_end FROM learning_goal_targets ORDER BY period_start ASC, period_end ASC, id ASC');
         if ($result) {
@@ -538,6 +558,12 @@ if (count($semesterOptions) === 0) {
     }
     foreach ($studyLogs as $log) {
         $key = admin_term_key_from_date($log['log_date']);
+        if ($key !== '') {
+            $fallbackKeys[$key] = true;
+        }
+    }
+    foreach ($learningGoals as $goal) {
+        $key = admin_term_key_from_date($goal['period_start'] ?? '');
         if ($key !== '') {
             $fallbackKeys[$key] = true;
         }
@@ -621,6 +647,12 @@ foreach ($learningGoals as &$goalRow) {
     $targetValue = max(0, (int) ($goalRow['target_value'] ?? 0));
     $currentValue = max(0, (int) ($goalRow['current_value'] ?? 0));
     $progressPercent = $targetValue > 0 ? min(100, (int) round(($currentValue / $targetValue) * 100)) : 0;
+    if (($goalRow['status'] ?? '') === 'completed') {
+        $progressPercent = 100;
+    }
+    if ($progressPercent >= 100) {
+        $goalRow['status'] = 'completed';
+    }
     $goalRow['progress_percent'] = $progressPercent;
     $goalProgressTotal += $progressPercent;
     if (($goalRow['status'] ?? '') === 'completed' || $progressPercent >= 100) {
@@ -1039,7 +1071,7 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 </a>
                 <a href="#" data-nav="goals">
                     <span class="icon purple">🎯</span>
-                    <span class="label">เป้าหมายและความคืบหน้า</span>
+                    <span class="label">ติดตามเป้าหมาย</span>
                 </a>
                 <a href="#" data-nav="settings">
                     <span class="icon gray">⚙️</span>
@@ -1944,14 +1976,14 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                                     <?php
                                     $goalUserId = (string) ($goal['user_id'] ?? '');
                                     $goalSubjectId = (string) ($goal['subject_id'] ?? '');
-                                    $goalTermKey = $subjectTermsById[$goalSubjectId] ?? '';
+                                    $goalTermKey = $goal['term_key'] ?? ($subjectTermsById[$goalSubjectId] ?? admin_term_key_from_date($goal['period_start'] ?? ''));
                                     $goalStatus = (string) ($goal['status'] ?? 'pending');
                                     ?>
-                                    <tr data-id="<?php echo admin_h($goal['id']); ?>" data-term="<?php echo admin_h($goalTermKey); ?>">
+                                    <tr data-id="<?php echo admin_h($goal['id']); ?>" data-term="<?php echo admin_h($goalTermKey); ?>" data-progress="<?php echo (int) $goal['progress_percent']; ?>" data-completed="<?php echo $goalStatus === 'completed' ? '1' : '0'; ?>">
                                         <td data-field="user_id" data-value="<?php echo admin_h($goalUserId); ?>"><?php echo admin_h($usersById[$goalUserId] ?? $goalUserId); ?></td>
                                         <td><?php echo admin_h(($goal['title'] ?? '') !== '' ? $goal['title'] : 'เป้าหมายการเรียน'); ?></td>
                                         <td><?php echo admin_h(admin_format_short_date($goal['period_start'] ?? '')); ?></td>
-                                        <td><?php echo (int) ($goal['target_value'] ?? 0); ?> / <?php echo (int) ($goal['current_value'] ?? 0); ?></td>
+                                        <td><?php echo (int) ($goal['current_value'] ?? 0); ?> / <?php echo (int) ($goal['target_value'] ?? 0); ?></td>
                                         <td><strong><?php echo (int) $goal['progress_percent']; ?>%</strong></td>
                                         <td><span class="status-pill <?php echo $goalStatus === 'completed' ? 'on' : ''; ?>"><?php echo admin_h($goalStatus === 'completed' ? 'สำเร็จ' : ($goalStatus === 'failed' ? 'ไม่สำเร็จ' : 'กำลังดำเนินการ')); ?></span></td>
                                     </tr>
@@ -2386,8 +2418,8 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 showToolbar: true
             },
             goals: {
-                title: 'เป้าหมายและความคืบหน้า',
-                subtitle: 'ติดตามเป้าหมายการเรียนของผู้ใช้แบบอ่านอย่างเดียว',
+                title: 'ติดตามเป้าหมาย',
+                subtitle: 'ดูเป้าหมายและสถานะการทำกิจกรรมของผู้ใช้',
                 panel: 'goals',
                 showToolbar: true
             },
@@ -2583,6 +2615,27 @@ $recentActivities = array_slice($recentActivities, 0, 5);
                 }
                 row.style.display = rowMatchesFilters(row, selectedUser, selectedSemester) ? '' : 'none';
             });
+            if (activePanel.dataset.panel === 'goals') {
+                const visibleGoals = Array.from(rows).filter(row => row.dataset.id && row.style.display !== 'none');
+                const completed = visibleGoals.filter(row => row.dataset.completed === '1').length;
+                const average = visibleGoals.length ? Math.round(visibleGoals.reduce((sum, row) => sum + Number(row.dataset.progress || 0), 0) / visibleGoals.length) : 0;
+                const metrics = activePanel.querySelectorAll('.mini-metric strong');
+                metrics[0].textContent = visibleGoals.length;
+                metrics[1].textContent = completed;
+                metrics[2].textContent = `${average}%`;
+                let emptyRow = table.querySelector('[data-goals-empty]');
+                if (!emptyRow) {
+                    emptyRow = document.createElement('tr');
+                    emptyRow.dataset.goalsEmpty = '1';
+                    const cell = document.createElement('td');
+                    cell.colSpan = 6;
+                    cell.textContent = 'ยังไม่มีข้อมูลเป้าหมายการเรียนตามตัวกรองที่เลือก';
+                    emptyRow.appendChild(cell);
+                    table.querySelector('tbody').appendChild(emptyRow);
+                }
+                rows.forEach(row => { if (!row.dataset.id) row.style.display = 'none'; });
+                emptyRow.style.display = visibleGoals.length ? 'none' : '';
+            }
             refreshDashboardOverview();
         };
 

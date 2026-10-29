@@ -13,8 +13,14 @@ class FileResource extends JsonResource
         $hasStatus = Schema::hasColumn($this->resource->getTable(), 'status');
         $hasArchivedAt = Schema::hasColumn($this->resource->getTable(), 'archived_at');
 
+        $subjectId = $this->studyLog?->subject_id;
+        if (! $subjectId && preg_match('~^study-files/([0-9]+)/~', (string) $this->file_path, $match)) {
+            $subjectId = (int) $match[1];
+        }
+
         return [
             'id' => $this->id,
+            'subject_id' => $subjectId ? (int) $subjectId : null,
             'original_name' => $this->original_name,
             'file_path' => $this->file_path,
             'file_url' => null,

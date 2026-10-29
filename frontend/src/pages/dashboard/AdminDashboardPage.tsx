@@ -181,7 +181,7 @@ export const AdminDashboardPage = () => {
   }
 
   return (
-    <div className="mx-auto max-w-7xl pb-4 text-slate-900" style={{ fontFamily: "'Kanit', var(--font-body)" }}>
+    <div className="w-full pb-4 text-slate-900" style={{ fontFamily: "'Kanit', var(--font-body)" }}>
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold text-slate-950">ขอบเขตผู้ดูแล</h1>

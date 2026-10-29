@@ -12,6 +12,7 @@ use App\Models\Quiz;
 use App\Models\StudyLog;
 use App\Models\Subject;
 use App\Services\AI\AIService;
+use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
 use Illuminate\Http\UploadedFile;
@@ -78,7 +79,8 @@ class QuizController extends Controller
         $usedFallbackQuiz = false;
 
         $data = request()->validate([
-            'file' => ['required', 'file', 'max:51200'],
+            'file' => ['required_without:file_id', 'file', 'max:51200'],
+            'file_id' => ['nullable', 'integer', 'exists:files,id'],
             'title' => ['nullable', 'string', 'max:255'],
             'difficulty' => ['nullable', 'in:easy,medium,hard'],
             'question_types' => ['nullable', 'array'],
@@ -89,17 +91,50 @@ class QuizController extends Controller
 
         /** @var UploadedFile $file */
         $file = request()->file('file');
+        $existingFile = null;
+        if (! empty($data['file_id'])) {
+            $existingFile = FileAttachment::findOrFail($data['file_id']);
+            $this->authorizeSourceFile($existingFile);
+            abort_unless(Storage::disk('public')->exists($existingFile->file_path), 422, 'ไม่พบไฟล์ต้นฉบับที่บันทึกไว้');
+            $file = new UploadedFile(Storage::disk('public')->path($existingFile->file_path),
+                $existingFile->original_name, $existingFile->mime_type, null, true);
+        }
         if (! $this->isAllowedDocument($file?->getClientOriginalExtension())) {
             return response()->json([
                 'message' => 'รองรับเฉพาะไฟล์ PDF, DOC, DOCX หรือ TXT เท่านั้น',
             ], 422);
         }
+        if (! $existingFile) {
+            $digest = hash_file('sha256', $file->getRealPath());
+            $candidates = FileAttachment::where('file_path', 'like', 'study-files/'.$subject->id.'/%')
+                ->where('original_name', $file->getClientOriginalName())->where('file_size', $file->getSize())->get();
+            foreach ($candidates as $candidate) {
+                if (Storage::disk('public')->exists($candidate->file_path)
+                    && hash_file('sha256', Storage::disk('public')->path($candidate->file_path)) === $digest) {
+                    $existingFile = $candidate;
+                    break;
+                }
+            }
+        }
 
+        // Always try to read the uploaded file first.  The browser-supplied
+        // extraction is only a fallback for PDFs that the server cannot read
+        // (for example image-only PDFs).  Previously it was used first, so a
+        // stale client extraction could create questions from another file.
+        $browserExtractedText = trim((string) ($data['extracted_text'] ?? ''));
+        $text = '';
+        $textSource = 'uploaded_file';
         try {
-            $text = trim((string) ($data['extracted_text'] ?? ''));
-            if ($text === '') {
+            try {
                 $extract = $this->aiService->extractDocumentText($file);
                 $text = trim((string) ($extract['text'] ?? ''));
+            } catch (\Throwable $extractionError) {
+                if ($browserExtractedText === '') {
+                    throw $extractionError;
+                }
+
+                $text = $browserExtractedText;
+                $textSource = 'browser_pdf_fallback';
             }
 
             if ($text === '') {
@@ -108,21 +143,36 @@ class QuizController extends Controller
 
             $quizDto = $this->aiService->generateQuizFromText($subject, $text, $data);
         } catch (\Throwable $e) {
-            $bestEffortText = $this->aiService->extractDocumentTextBestEffort($file);
+            // Browser/OCR extraction may succeed for PDFs the local parser cannot read.
+            // Keep that source when question generation fails after extraction.
+            $bestEffortText = $text !== '' ? $text : $this->aiService->extractDocumentTextBestEffort($file);
+            // Never generate questions from only the subject or file name: every
+            // generated question must be grounded in text extracted from the
+            // document the learner selected.
             if (! is_string($bestEffortText) || trim($bestEffortText) === '') {
                 return response()->json([
-                    'message' => 'ระบบยังอ่านเนื้อหาจริงจากไฟล์นี้ไม่ได้ จึงยังไม่สร้างแบบฝึกหัด กรุณาใช้ไฟล์ DOCX, TXT หรือ PDF ที่คัดลอกข้อความได้',
+                    'message' => 'ระบบอ่านเนื้อหาจาก PDF ที่เลือกไม่ได้ จึงยังไม่สร้างแบบฝึกหัดเพื่อป้องกันคำถามที่ไม่ตรงกับไฟล์ กรุณาอัปโหลด PDF ต้นฉบับที่เปิดอ่านได้ หรือแปลงเป็น DOCX/TXT',
                 ], 422);
             }
-            $quizDto = $this->aiService->generateFallbackQuizFromDocument($subject, $file, $data, $e->getMessage(), $bestEffortText);
+            try {
+            $quizDto = $this->aiService->generateFallbackQuizFromDocument(
+                $subject,
+                $file,
+                $data,
+                $e->getMessage(),
+                $bestEffortText
+            );
+            } catch (\Throwable $fallbackError) {
+                return response()->json(['message' => $fallbackError->getMessage()], 422);
+            }
             $usedFallbackQuiz = true;
         }
 
-        $storedPath = $file->store('study-files/'.$subject->id, 'public');
+        $storedPath = $existingFile?->file_path ?? $file->store('study-files/'.$subject->id, 'public');
 
         try {
-            $quiz = DB::transaction(function () use ($subject, $file, $storedPath, $quizDto) {
-                $fileRecord = FileAttachment::create([
+            $quiz = DB::transaction(function () use ($subject, $file, $storedPath, $quizDto, $textSource, $existingFile) {
+                $fileRecord = $existingFile ?? FileAttachment::create([
                     // The uploaded document is a quiz asset; it must not create
                     // a study log or appear in the study-summary menu.
                     'study_log_id' => null,
@@ -137,6 +187,7 @@ class QuizController extends Controller
                     'source' => 'document',
                     'file_id' => $fileRecord->id,
                     'file_name' => $file->getClientOriginalName(),
+                    'source_text_origin' => $textSource,
                 ]);
 
                 $quiz = $subject->quizzes()->create([
@@ -153,7 +204,7 @@ class QuizController extends Controller
                 return $quiz;
             });
         } catch (\Throwable $e) {
-            Storage::disk('public')->delete($storedPath);
+            if (! $existingFile) Storage::disk('public')->delete($storedPath);
             return response()->json([
                 'message' => $e->getMessage() ?: 'บันทึกข้อสอบจากไฟล์ไม่สำเร็จ',
             ], 422);
@@ -270,6 +321,10 @@ class QuizController extends Controller
         $data = $request->validated();
         $user = $request->user();
 
+        return DB::transaction(function () use ($quiz, $data, $user) {
+        $questionIds = $quiz->questions()->pluck('id')->map(fn ($id) => (int) $id)->all();
+        $submittedIds = array_map(fn ($answer) => (int) $answer['question_id'], $data['answers']);
+        abort_if(count($submittedIds) !== count(array_unique($submittedIds)) || array_diff($submittedIds, $questionIds), 422, 'คำตอบมีข้อซ้ำหรือไม่ได้อยู่ในแบบฝึกหัดนี้');
         $result = $this->aiService->gradeQuiz($quiz, $user, $data['answers']);
         $percentage = $result['total'] > 0 ? ($result['score'] / $result['total']) * 100 : 0;
 
@@ -284,12 +339,7 @@ class QuizController extends Controller
                 'updated_at' => now(),
             ];
 
-            try {
-                DB::table('quiz_attempts')->insert($attemptPayload);
-            } catch (\Throwable) {
-                $attemptPayload['answers'] = '[]';
-                DB::table('quiz_attempts')->insert($attemptPayload);
-            }
+            DB::table('quiz_attempts')->insert($attemptPayload);
         }
 
         return response()->json([
@@ -297,6 +347,43 @@ class QuizController extends Controller
             'total' => $result['total'],
             'answers' => QuizAnswerResource::collection($result['answers']),
         ]);
+        });
+    }
+
+    public function attempts(Quiz $quiz): JsonResponse
+    {
+        $this->authorizeQuiz($quiz);
+        if (! Schema::hasTable('quiz_attempts')) {
+            return response()->json([]);
+        }
+        return response()->json(DB::table('quiz_attempts')
+            ->where('quiz_id', $quiz->id)->where('user_id', request()->user()->id)
+            ->orderByDesc('id')->get()->map(function ($attempt) {
+                $answers = json_decode((string) $attempt->answers, true) ?: [];
+                return [
+                    'id' => $attempt->id, 'score' => (int) $attempt->score,
+                    'total' => count($answers), 'answers' => $answers,
+                    'answered_at' => Carbon::parse($attempt->created_at, config('app.timezone', 'UTC'))->toIso8601String(),
+                ];
+            }));
+    }
+
+    private function authorizeSourceFile(FileAttachment $file): void
+    {
+        // The library includes all of the learner's subjects. The document's
+        // owner must be checked independently of the destination quiz subject.
+        $sourceSubjectId = $file->study_log_id
+            ? StudyLog::withoutGlobalScopes()->whereKey($file->study_log_id)->value('subject_id')
+            : null;
+        if (! $sourceSubjectId && preg_match('~^study-files/([0-9]+)/[^/\\\\]+$~', (string) $file->file_path, $match)) {
+            $sourceSubjectId = (int) $match[1];
+        }
+
+        $sourceSubject = $sourceSubjectId
+            ? Subject::withoutGlobalScope('user')->find($sourceSubjectId)
+            : null;
+        abort_unless($sourceSubject, 403, 'ไม่สามารถตรวจสอบเจ้าของไฟล์เอกสารได้');
+        $this->authorizeSubject($sourceSubject);
     }
 
     private function authorizeSubject(Subject $subject): void
@@ -570,8 +657,12 @@ class QuizController extends Controller
         $normalized = [
             'source' => isset($metadata['source']) ? $this->cleanUtf8Text($metadata['source']) : null,
             'difficulty' => isset($metadata['difficulty']) ? $this->cleanUtf8Text($metadata['difficulty']) : null,
+            'question_count' => isset($metadata['question_count']) ? (int) $metadata['question_count'] : null,
             'file_id' => isset($metadata['file_id']) ? (int) $metadata['file_id'] : null,
             'study_log_id' => isset($metadata['study_log_id']) ? (int) $metadata['study_log_id'] : null,
+            'source_text_origin' => isset($metadata['source_text_origin'])
+                ? $this->cleanUtf8Text($metadata['source_text_origin'])
+                : null,
         ];
 
         if (! empty($metadata['requested_types']) && is_array($metadata['requested_types'])) {
@@ -675,6 +766,7 @@ class QuizController extends Controller
                 'explanation' => $this->cleanUtf8Text($question?->explanation ?? ''),
                 'question_text' => $this->cleanUtf8Text($question?->question_text ?? ''),
                 'question_type' => $this->cleanUtf8Text($question?->question_type ?? ''),
+                'options' => $question?->options,
             ];
         }, $answers));
     }

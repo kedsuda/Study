@@ -54,10 +54,21 @@ export const buildSemesterOptions = <T extends SemesterSubjectLike>(subjects: T[
     return (a.semester ?? 0) - (b.semester ?? 0);
   });
 
-  return ordered;
+  return [
+    { key: 'all', label: 'ทุกปีการศึกษา' },
+    ...Array.from(new Set(ordered.map(option => option.academic_year).filter((year): year is number => !!year)))
+      .map(year => ({ key: `year:${year}`, label: `ปีการศึกษา ${year}`, academic_year: year })),
+    ...ordered,
+  ];
 };
 
 export const filterBySemester = <T extends SemesterSubjectLike>(subjects: T[], semesterKey: string) => {
   if (!semesterKey || semesterKey === 'all') return subjects;
+  if (semesterKey.startsWith('year:')) {
+    return subjects.filter(subject => String(subject.academic_year) === semesterKey.slice(5));
+  }
+  if (semesterKey.startsWith('sy:')) {
+    return subjects.filter(subject => `sy:${subject.semester}-${subject.academic_year}` === semesterKey);
+  }
   return subjects.filter(subject => getSemesterKey(subject) === semesterKey);
 };

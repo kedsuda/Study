@@ -6,6 +6,11 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
 
   const apiTarget = env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:8000';
+  // API requests may deliberately target Laravel's front controller
+  // (`.../index.php`), but static uploads live beside it in `/storage`.
+  // Forwarding `/storage` to the front controller turns a file request into
+  // the SPA HTML document, which can then be mistakenly used as quiz text.
+  const assetTarget = env.VITE_ASSET_URL || apiTarget.replace(/\/index\.php\/?$/, '');
   const legacyTarget = env.VITE_LEGACY_PROXY_TARGET;
   const base = env.VITE_BASE || './';
   const hmrHost = env.VITE_HMR_HOST?.trim();
@@ -16,6 +21,15 @@ export default defineConfig(({ mode }) => {
       changeOrigin: true,
       secure: false,
     },
+  };
+
+  // Keep local uploaded files on the Vite origin during development. Without
+  // this proxy, requests from :5173 to Apache's /storage directory are blocked
+  // by the browser's CORS policy when selecting a file from the study bag.
+  proxy['/storage'] = {
+    target: assetTarget,
+    changeOrigin: true,
+    secure: false,
   };
 
   if (legacyTarget) {

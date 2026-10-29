@@ -4,9 +4,11 @@ namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
 use App\Models\Semester;
+use App\Models\Subject;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Throwable;
 
 class SemesterController extends Controller
@@ -16,13 +18,38 @@ class SemesterController extends Controller
         $this->middleware('auth:sanctum');
     }
 
-    public function index(): JsonResponse
+    public function index(Request $request): JsonResponse
     {
         if (! $this->hasTableSafe((new Semester())->getTable())) {
             return response()->json([]);
         }
 
+        $userId = $request->user()->id;
+        $subjectTable = (new Subject())->getTable();
+        $hasSubjects = $this->hasTableSafe($subjectTable) && Schema::hasColumn($subjectTable, 'semester_id');
+        $hasMemberships = $this->hasTableSafe('user_semesters');
+
+        if (! $hasSubjects && ! $hasMemberships) {
+            return response()->json([]);
+        }
+
         $semesters = Semester::query()
+            ->where(function ($query) use ($userId, $subjectTable, $hasSubjects, $hasMemberships) {
+                if ($hasSubjects) {
+                    $query->whereExists(function ($subjects) use ($userId, $subjectTable) {
+                        $subjects->selectRaw('1')->from($subjectTable)
+                            ->whereColumn($subjectTable.'.semester_id', 'semester.semester_id')
+                            ->where($subjectTable.'.user_id', $userId);
+                    });
+                }
+                if ($hasMemberships) {
+                    $query->orWhereExists(function ($memberships) use ($userId) {
+                        $memberships->selectRaw('1')->from('user_semesters')
+                            ->whereColumn('user_semesters.semester_id', 'semester.semester_id')
+                            ->where('user_semesters.user_id', $userId);
+                    });
+                }
+            })
             ->orderBy('semester')
             ->orderBy('academic_year')
             ->get();
@@ -75,6 +102,12 @@ class SemesterController extends Controller
             }
         }
 
+        // Semester definitions may be shared; membership belongs to the authenticated user.
+        DB::table('user_semesters')->insertOrIgnore([
+            'user_id' => $request->user()->id,
+            'semester_id' => $semester->semester_id,
+        ]);
+
         return response()->json([
             'semester_id' => (int) $semester->semester_id,
             'semester' => (int) $semester->semester,
@@ -84,21 +117,10 @@ class SemesterController extends Controller
 
     private function hasTableSafe(string $table): bool
     {
-        static $cache = [];
-        if (array_key_exists($table, $cache)) {
-            return $cache[$table];
-        }
-
         try {
-            $exists = DB::selectOne(
-                'SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1',
-                [$table]
-            ) !== null;
-        } catch (Throwable $error) {
-            $exists = false;
+            return Schema::hasTable($table);
+        } catch (Throwable) {
+            return false;
         }
-
-        $cache[$table] = $exists;
-        return $exists;
     }
 }

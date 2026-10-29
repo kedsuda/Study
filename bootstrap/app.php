@@ -26,6 +26,7 @@ return Application::configure(basePath: dirname(__DIR__))
             'throttle' => \Illuminate\Routing\Middleware\ThrottleRequests::class,
             'verified' => \Illuminate\Auth\Middleware\EnsureEmailIsVerified::class,
             'require.bearer' => \App\Http\Middleware\RequireBearerToken::class,
+            'admin' => \App\Http\Middleware\EnsureAdmin::class,
         ]);
     })
     ->withProviders([
@@ -35,6 +36,10 @@ return Application::configure(basePath: dirname(__DIR__))
         SanctumServiceProvider::class,
     ])
     ->withExceptions(function (Exceptions $exceptions) {
-        // Add custom exception handling hooks here when needed.
+        // API consumers must receive an authentication response, never a web-login redirect.
+        $exceptions->shouldRenderJsonWhen(
+            fn (\Illuminate\Http\Request $request, \Throwable $exception) =>
+                $request->is('api/*') || $request->expectsJson()
+        );
     })
     ->create();

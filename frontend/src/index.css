@@ -1,14 +1,50 @@
-@import url('https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600&family=Sarabun:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700&display=swap');
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+/* Calendar labels share the surface theme, including WebKit text painting. */
+.calendar-grid-text {
+  color: var(--text) !important;
+  -webkit-text-fill-color: currentColor !important;
+}
+
+.calendar-grid-text :where(span) {
+  -webkit-text-fill-color: currentColor !important;
+}
+
+.theme-dark .calendar-grid-text {
+  color: #ffffff !important;
+}
+
+.calendar-grid-text.bg-primary {
+  color: var(--on-accent, #ffffff) !important;
+}
+
+.sidebar-menu-link {
+  border: 1px solid transparent;
+}
+
+.sidebar-menu-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.sidebar-menu-link[aria-current='page'] {
+  border-color: rgba(var(--accent-rgb), 0.65);
+  border-radius: 16px;
+  background: rgba(var(--accent-rgb), 0.28);
+  box-shadow: inset 4px 0 0 var(--accent);
+  font-weight: 700;
+}
+
 :root {
   color-scheme: light;
-  /* Thai Sarabun New is used when installed; Sarabun is the web-font fallback. */
-  --font-body: 'Kanit', 'Sarabun', 'Leelawadee UI', Tahoma, sans-serif;
-  --font-display: 'Kanit', 'Sarabun', 'Leelawadee UI', Tahoma, sans-serif;
+  /* User-facing screens use Thai Sarabun New; Sarabun keeps Thai text readable
+     on devices where the system font is unavailable. */
+  --font-body: 'TH Sarabun New', 'Sarabun', 'Leelawadee UI', Tahoma, sans-serif;
+  --font-display: 'TH Sarabun New', 'Sarabun', 'Leelawadee UI', Tahoma, sans-serif;
   --bg: #fbfbfd;
   --text: #1d1d1f;
   /* Text color for "accent/gradient" surfaces in light theme.
@@ -47,6 +83,8 @@
 
 .theme-dark {
   color-scheme: dark;
+  --glass-bg: rgba(15, 20, 27, 0.9);
+  --shadow-float: 0 8px 32px rgba(0, 0, 0, 0.4);
   --bg: #0d1117;
   --text: #e5e7eb;
   /* Text color for "accent/gradient" surfaces in dark theme. */
@@ -163,6 +201,8 @@ a:hover {
 .mobile-bottom-nav__label {
   display: block;
   white-space: nowrap;
+  color: #fff !important;
+  -webkit-text-fill-color: #fff;
 }
 
 .mobile-bottom-nav__label.is-active {
@@ -208,6 +248,8 @@ a:hover {
   .mobile-bottom-nav__label {
     display: block !important;
     bottom: 9px !important;
+    color: #fff !important;
+    -webkit-text-fill-color: #fff;
     font-size: 10px !important;
     font-weight: 700;
     line-height: 1.1 !important;
@@ -512,7 +554,7 @@ a:hover {
 
 /* Theme overrides for legacy Tailwind utility classes */
 .text-primary {
-  color: var(--accent) !important;
+  color: var(--accent-ink) !important;
 }
 
 .text-primaryDark {
@@ -832,7 +874,7 @@ a:hover {
 .text-sky-600,
 .text-sky-500,
 .text-teal-600 {
-  color: var(--accent) !important;
+  color: var(--accent-ink) !important;
 }
 
 .bg-amber-50,
@@ -970,6 +1012,7 @@ a:hover {
 }
 
 .theme-dark .text-slate-800,
+.theme-dark .text-slate-950,
 .theme-dark .text-slate-900 {
   color: var(--text) !important;
 }
@@ -1154,10 +1197,8 @@ a:hover {
 }
 
 .theme-dark .doc-summary-page {
-  background:
-    radial-gradient(920px circle at -8% -15%, rgba(59, 130, 246, 0.16), transparent 48%),
-    radial-gradient(860px circle at 110% -8%, rgba(37, 99, 235, 0.14), transparent 44%),
-    #030816;
+  background: var(--bg);
+  color: var(--text);
 }
 
 .theme-dark .doc-summary-page .max-w-5xl {
@@ -1181,8 +1222,8 @@ a:hover {
 }
 
 .theme-dark .doc-summary-page .doc-summary-card {
-  background: #141b2e !important;
-  border: 1px solid rgba(98, 120, 163, 0.32) !important;
+  background: var(--surface) !important;
+  border: 1px solid var(--border) !important;
   box-shadow: 0 24px 58px rgba(0, 0, 0, 0.42) !important;
 }
 
@@ -1222,17 +1263,16 @@ a:hover {
   border-color: rgba(112, 135, 175, 0.36) !important;
 }
 
-.theme-dark .doc-summary-page .doc-input-toggle button.bg-white {
-  background: #f8fafc !important;
-  color: #0b1428 !important;
+.theme-dark .doc-summary-page .doc-input-toggle button[aria-pressed="true"] {
+  background: var(--accent) !important;
+  color: var(--on-accent) !important;
   box-shadow: 0 8px 18px rgba(0, 0, 0, 0.25) !important;
 }
 
-.theme-dark .doc-summary-page .doc-input-toggle button:not(.bg-white) {
+.theme-dark .doc-summary-page .doc-input-toggle button[aria-pressed="false"] {
   color: #b8c6e2 !important;
 }
 
-.theme-dark .doc-summary-page .doc-input-toggle button,
 .theme-dark .doc-summary-page .doc-history-tabs button {
   color: #dbe8ff !important;
 }
@@ -1390,13 +1430,61 @@ a:hover {
 }
 
 .theme-dark .doc-summary-page .doc-archive-card {
-  background: #2a2415 !important;
-  border-color: rgba(245, 181, 74, 0.42) !important;
+  background: #161b24 !important;
+  border-color: #526078 !important;
 }
 
 .theme-dark .doc-summary-page .doc-archive-card:hover {
-  background: #33291a !important;
-  border-color: rgba(252, 197, 94, 0.52) !important;
+  background: #1c2430 !important;
+  border-color: #94a3b8 !important;
+}
+
+/* Keep archive content legible above the shared muted-text overrides. */
+.theme-dark .doc-summary-page .doc-archive-card p,
+.theme-dark .doc-summary-page .doc-archive-card span {
+  color: #e2e8f0 !important;
+}
+
+.theme-dark .doc-summary-page .doc-archive-card h4 {
+  color: #ffffff !important;
+  overflow-wrap: anywhere;
+}
+
+.theme-dark .doc-summary-page .doc-archive-card .whitespace-pre-wrap {
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+
+.theme-dark .doc-summary-page .doc-archive-card .border-t {
+  border-color: #475569 !important;
+}
+
+.theme-dark .doc-summary-page .doc-archive-card button {
+  background: #273449 !important;
+  border-color: #64748b !important;
+  color: #f8fafc !important;
+}
+
+.theme-dark .doc-summary-page .doc-archive-card button:hover {
+  background: #354761 !important;
+  border-color: #94a3b8 !important;
+}
+
+.theme-dark .doc-summary-page .doc-archive-card .doc-archive-restore {
+  background: #0c4a6e !important;
+  border-color: #38bdf8 !important;
+  color: #f0f9ff !important;
+}
+
+.theme-dark .doc-summary-page .doc-archive-card .doc-archive-restore:hover {
+  background: #075985 !important;
+  border-color: #7dd3fc !important;
+}
+
+.theme-dark .doc-summary-page .doc-archive-card:focus-visible,
+.theme-dark .doc-summary-page .doc-archive-card button:focus-visible {
+  outline: 2px solid #7dd3fc;
+  outline-offset: 3px;
 }
 
 .mobile-screen {
@@ -1672,4 +1760,95 @@ a:hover {
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+/* User screens, including dialogs portalled to body. Keep dark mode's ink.
+   Text fill also covers page-local/inline colors without recoloring icons,
+   chart series, or decorative shapes that use currentColor. */
+body.user-area:not(.theme-dark) {
+  --text: #111111;
+  --muted: #111111;
+  --user-text-fill: #111111;
+}
+
+body.user-area:not(.theme-dark) :where(*):not(svg, svg *):not([style*='-webkit-text-fill-color']) {
+  -webkit-text-fill-color: var(--user-text-fill) !important;
+}
+
+/* Light panels nested inside a colored section return to black text. */
+body.user-area:not(.theme-dark) :is(.card, .surface, .surface-2, .surface-3, .bg-white) {
+  --user-text-fill: #111111;
+}
+
+/* Preserve contrasting labels on filled actions, avatars and hero sections. */
+body.user-area:not(.theme-dark) :is(
+  .btn-primary, .bg-primary, .bg-accent,
+  .bg-gradient-to-r, .bg-gradient-to-br, .bg-gradient-to-b,
+  button.text-white, a.text-white,
+  [class*='bg-'].text-white,
+  [style*='color: var(--on-accent)']
+) {
+  --user-text-fill: var(--on-accent, #ffffff);
+}
+
+/* Explicit inverse text for content over photographs or dark surfaces. */
+body.user-area:not(.theme-dark) .user-text-inverse {
+  --user-text-fill: #ffffff;
+}
+
+body.user-area:not(.theme-dark) :is(input, textarea)::placeholder {
+  color: #111111 !important;
+  -webkit-text-fill-color: #111111 !important;
+  opacity: 1;
+}
+
+body.user-area:not(.theme-dark) svg {
+  -webkit-text-fill-color: currentColor;
+}
+
+body.user-area:not(.theme-dark) svg :is(text, tspan) {
+  fill: var(--user-text-fill);
+  -webkit-text-fill-color: var(--user-text-fill);
+}
+/* Third-party dialogs must also clear the shared modal and navigation layers. */
+div.swal2-container {
+  z-index: 13000;
+}
+
+/* Theme-aware dialogs and authentication details. */
+.theme-dark .swal2-popup {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.theme-dark .swal2-title,
+.theme-dark .swal2-html-container {
+  color: var(--text);
+}
+
+.theme-dark .auth-layout .bg-\[\#F8F9FA\] {
+  background-color: var(--surface-2);
+}
+
+.theme-dark .auth-layout .text-\[\#E5F5FF\] {
+  color: var(--surface-3);
+}
+
+.theme-dark .auth-layout input:checked {
+  background-color: var(--accent) !important;
+}
+
+.theme-dark .hover\:bg-slate-50:hover,
+.theme-dark .hover\:bg-slate-100:hover,
+.theme-dark .hover\:bg-gray-50:hover {
+  background-color: var(--surface-3) !important;
+}
+
+.theme-dark * {
+  scrollbar-color: rgba(148, 163, 184, 0.4) transparent;
+}
+
+.theme-dark *::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.4);
 }

@@ -1,3 +1,4 @@
+import { ModalOverlay } from '../../components/ModalOverlay';
 import { BookOpen, Calendar, CheckCircle2, LoaderCircle, Mic, Paperclip, Sparkles, Square, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -5,9 +6,12 @@ import Swal from 'sweetalert2';
 import saveIcon from '../../img/savel.png';
 import { api, assetBaseURL } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
-import { downloadStudyFileBlob, isSupabaseStudyFilePath, resolveStudyFileUrl, uploadStudyFileToSupabase } from '../../utils/studyFiles';
+import { useSharedSemesterSelection, useSharedSubjectSelection } from '../../hooks/useAcademicSelection';
+import { useSemesterOptions } from '../../hooks/useSemesterOptions';
+import { filterBySemester, type SemesterSubjectLike } from '../../utils/semester';
+import { downloadStudyFileBlob, isSupabaseStudyFilePath, resolveStudyFileUrl } from '../../utils/localStudyFiles';
 
-type SubjectOption = {
+type SubjectOption = SemesterSubjectLike & {
   id: number;
   name: string;
 };
@@ -125,11 +129,19 @@ const summarizeStoredDocumentFile = async (file: StudyFile) => {
 export const StudyCapturePage = () => {
   const navigate = useNavigate();
   const { user } = useAuth();
-  const [subjects, setSubjects] = useState<SubjectOption[]>([]);
+  const [allSubjects, setSubjects] = useState<SubjectOption[]>([]);
+  const semesterOptions = useSemesterOptions();
+  const [semesterKey] = useSharedSemesterSelection(semesterOptions);
+  const [selectedSubjectId, setSelectedSubjectId] = useSharedSubjectSelection();
+  const subjects = useMemo(() => filterBySemester(allSubjects, semesterKey), [allSubjects, semesterKey]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
-  const [todayLogs, setTodayLogs] = useState<Array<StudyLogEntry & { subjectName: string; subjectId: number }>>([]);
+  const [allTodayLogs, setTodayLogs] = useState<Array<StudyLogEntry & { subjectName: string; subjectId: number }>>([]);
+  const todayLogs = useMemo(() => {
+    const subjectIds = new Set(subjects.map(subject => subject.id));
+    return allTodayLogs.filter(log => subjectIds.has(log.subjectId) && (!selectedSubjectId || String(log.subjectId) === selectedSubjectId));
+  }, [allTodayLogs, subjects, selectedSubjectId]);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [voiceInputSupported, setVoiceInputSupported] = useState(false);
   const [activeVoiceField, setActiveVoiceField] = useState<'title' | 'note' | null>(null);
@@ -248,7 +260,10 @@ export const StudyCapturePage = () => {
       const nextSubjects: SubjectOption[] = payload
         .map((item: any) => ({
           id: Number(item.id),
-          name: String(item.name ?? item.subject_name ?? '')
+          name: String(item.name ?? item.subject_name ?? ''),
+          semester_id: item.semester_id,
+          semester: item.semester,
+          academic_year: item.academic_year,
         }))
         .filter((item: SubjectOption) => Number.isFinite(item.id) && item.name.trim() !== '');
 
@@ -287,6 +302,14 @@ export const StudyCapturePage = () => {
   useEffect(() => {
     void loadData();
   }, [today]);
+
+  useEffect(() => {
+    setForm(previous => selectedSubjectId && subjects.some(subject => String(subject.id) === selectedSubjectId)
+      ? { ...previous, subjectId: selectedSubjectId }
+      : subjects.some(subject => String(subject.id) === previous.subjectId)
+      ? previous
+      : { ...previous, subjectId: subjects[0] ? String(subjects[0].id) : '' });
+  }, [subjects, selectedSubjectId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -330,28 +353,6 @@ export const StudyCapturePage = () => {
       if (Number.isFinite(logId) && selectedFiles.length > 0) {
         const uploadResults = await Promise.allSettled(
           selectedFiles.map(async file => {
-            try {
-              const uploaded = await uploadStudyFileToSupabase({
-                file,
-                userId: user?.id,
-                subject: {
-                  id: selectedSubject?.id,
-                  name: selectedSubject?.name,
-                },
-              });
-
-              await api.post(`/study-logs/${logId}/files`, {
-                original_name: file.name,
-                storage_path: uploaded.storagePath,
-                file_type: uploaded.fileType,
-                mime_type: file.type || null,
-                file_size: file.size,
-              });
-              return;
-            } catch (storageError) {
-              console.warn('supabase upload failed, falling back to local storage', storageError);
-            }
-
             const uploadForm = new FormData();
             uploadForm.append('file', file, file.name);
             await api.post(`/study-logs/${logId}/files`, uploadForm);
@@ -491,7 +492,7 @@ export const StudyCapturePage = () => {
   return (
     <div className="space-y-5 pb-1 text-[color:var(--text)]" style={{ background: 'var(--bg-gradient)' }}>
       {saving ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 backdrop-blur-sm">
+        <ModalOverlay className="fixed inset-0 flex items-center justify-center bg-slate-950/30 backdrop-blur-sm">
           <div className="flex min-w-[220px] flex-col items-center gap-3 rounded-[1.75rem] bg-white px-6 py-7 text-center shadow-[0_24px_60px_rgba(15,23,42,0.18)]">
             <div className="flex h-14 w-14 items-center justify-center rounded-full bg-sky-50 text-sky-600">
               <LoaderCircle size={28} className="animate-spin" />
@@ -501,7 +502,7 @@ export const StudyCapturePage = () => {
               <p className="mt-1 text-xs text-slate-500">โปรดรอสักครู่ ระบบกำลังบันทึกข้อมูลและอัปโหลดไฟล์</p>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       ) : null}
 
       <section className="rounded-b-[2.15rem] border-b px-5 pb-7 pt-2 sm:px-6" style={{ borderColor: 'var(--border)', background: 'var(--surface)', boxShadow: 'var(--shadow-soft)' }}>
@@ -542,7 +543,7 @@ export const StudyCapturePage = () => {
               <label className="mb-1.5 block text-xs font-bold text-[color:var(--text)]">วิชาที่เรียน</label>
               <select
                 value={form.subjectId}
-                onChange={event => setForm(prev => ({ ...prev, subjectId: event.target.value }))}
+                onChange={event => { setSelectedSubjectId(event.target.value); setForm(prev => ({ ...prev, subjectId: event.target.value })); }}
                 className="w-full rounded-xl border px-4 py-3 text-sm text-[color:var(--text)] outline-none transition focus:border-sky-500"
                 style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
               >
